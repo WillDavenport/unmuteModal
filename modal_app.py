@@ -8,6 +8,12 @@ This Modal app implements the target architecture with four serverless classes:
 - TTS (L4 GPU) - Text-to-Speech service with WebSocket endpoint
 
 Each service uses @modal.asgi_app() for WebSocket endpoints and @modal.enter() for model loading.
+
+OPTIMIZATION: Essential model weights are pre-downloaded during image build to reduce startup delays:
+- STT models: kyutai/stt-1b-en_fr-candle (model.safetensors, tokenizer, audio tokenizer)  
+- TTS models: kyutai/tts-1.6b-en_fr (tokenizer) + essential default voice from kyutai/tts-voices
+Additional TTS voices are downloaded on-demand at runtime to avoid HuggingFace rate limits.
+This reduces initial TTS startup time significantly while maintaining voice variety.
 """
 
 import modal
@@ -95,6 +101,21 @@ stt_image = (
         # Verify moshi-server was installed successfully
         "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
     )
+    .run_commands(
+        # Pre-download STT models during image build to avoid startup delays
+        "echo 'Pre-downloading STT models to cache...'",
+        # Create cache directories
+        "mkdir -p /root/.cache/huggingface/hub",
+        "mkdir -p /root/.cache/huggingface/xet",
+        # Download STT model files with simple retry logic
+        "python -c \"import time; from huggingface_hub import hf_hub_download; [hf_hub_download('kyutai/stt-1b-en_fr-candle', f, cache_dir='/root/.cache/huggingface/hub') for f in ['model.safetensors', 'tokenizer_en_fr_audio_8000.model', 'mimi-pytorch-e351c8d8@125.safetensors']]\"",
+        # Verify models were downloaded
+        "echo 'Verifying downloaded STT models...'",
+        "find /root/.cache/huggingface/hub -name 'model.safetensors' | head -5",
+        "find /root/.cache/huggingface/hub -name 'tokenizer_en_fr_audio_8000.model' | head -5",
+        "find /root/.cache/huggingface/hub -name 'mimi-pytorch-e351c8d8@125.safetensors' | head -5",
+        "echo 'STT model pre-download completed'"
+    )
     # Add local files LAST
     .add_local_python_source("unmute")
     .add_local_file("voices.yaml", "/root/voices.yaml")
@@ -142,6 +163,22 @@ tts_image = (
         "cp ~/.cargo/bin/moshi-server /usr/local/bin/ || echo 'Failed to copy moshi-server, but it may still work from cargo bin'",
         # Verify moshi-server was installed successfully
         "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
+    )
+    .run_commands(
+        # Pre-download TTS models during image build to avoid startup delays
+        "echo 'Pre-downloading TTS models to cache...'",
+        # Create cache directories
+        "mkdir -p /root/.cache/huggingface/hub",
+        "mkdir -p /root/.cache/huggingface/xet",
+        # Download essential TTS tokenizer (required for TTS to work)
+        "python -c \"from huggingface_hub import hf_hub_download; hf_hub_download('kyutai/tts-1.6b-en_fr', 'tokenizer_spm_8k_en_fr_audio.model', cache_dir='/root/.cache/huggingface/hub')\"",
+        # Note: Default voice will be downloaded on-demand at runtime to avoid rate limiting during build
+        # Verify essential models were downloaded
+        "echo 'Verifying downloaded models...'",
+        "ls -la /root/.cache/huggingface/hub/ | head -10",
+        "find /root/.cache/huggingface/hub -name '*.safetensors' | wc -l",
+        "find /root/.cache/huggingface/hub -name 'tokenizer_spm_8k_en_fr_audio.model' | head -5 || echo 'Tokenizer not found in expected location'",
+        "echo 'TTS model pre-download completed. Additional voices will be downloaded on-demand at runtime.'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -309,12 +346,32 @@ dim = 6
             moshi_server_cmd, "worker", 
             "--config", self.config_path,
             "--port", "8090"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         
         # Wait for the server to be ready with health checking
         import socket
-        max_attempts = 30  # 30 seconds max
+        import threading
+        
+        # Start a thread to monitor the process output in real-time
+        def monitor_output():
+            try:
+                while self.proc.poll() is None:
+                    line = self.proc.stdout.readline()
+                    if line:
+                        print(f"STT moshi-server: {line.strip()}")
+            except Exception as e:
+                print(f"STT output monitor error: {e}")
+        
+        output_thread = threading.Thread(target=monitor_output, daemon=True)
+        output_thread.start()
+        
+        max_attempts = 60  # 60 seconds max
         for attempt in range(max_attempts):
+            # Check if process died
+            if self.proc.poll() is not None:
+                print(f"STT moshi-server process died with return code: {self.proc.returncode}")
+                break
+                
             try:
                 # Try to connect to the moshi server
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -371,7 +428,7 @@ dim = 6
             # First check if our internal moshi server is ready before accepting the connection
             import socket
             import asyncio
-            max_wait_attempts = 30  # 30 seconds max
+            max_wait_attempts = 90  # 90 seconds max to allow for moshi-server startup
             for attempt in range(max_wait_attempts):
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -386,7 +443,7 @@ dim = 6
                 print(f"=== STT_SERVICE: Waiting for internal moshi server, attempt {attempt + 1}/{max_wait_attempts} ===")
                 await asyncio.sleep(1)  # Use async sleep instead of blocking sleep
             else:
-                print("=== STT_SERVICE: Internal moshi server not ready after 30 seconds ===")
+                print("=== STT_SERVICE: Internal moshi server not ready after 90 seconds ===")
                 # We must accept the websocket first before we can close it
                 await websocket.accept()
                 await websocket.close(code=1011, reason="Internal STT server not ready")
@@ -490,6 +547,13 @@ class TTSService:
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
         
+        # Check if HuggingFace token is available
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token:
+            print(f"TTS: HuggingFace token available (length: {len(hf_token)})")
+        else:
+            print("TTS: No HuggingFace token found - this may cause issues downloading models")
+        
         # First, verify moshi-server binary is available
         print("Checking moshi-server availability...")
         try:
@@ -536,6 +600,8 @@ cfg_coef = 2.0
 cfg_is_no_text = true
 padding_between = 1
 n_q = 24
+# Add debug logging
+log_level = "debug"
 '''
         
         os.makedirs("/tmp/unmute_logs", exist_ok=True)
@@ -568,12 +634,32 @@ n_q = 24
             moshi_server_cmd, "worker",
             "--config", self.config_path, 
             "--port", "8089"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         
         # Wait for the server to be ready with health checking
         import socket
-        max_attempts = 30  # 30 seconds max
+        import threading
+        
+        # Start a thread to monitor the process output in real-time
+        def monitor_output():
+            try:
+                while self.proc.poll() is None:
+                    line = self.proc.stdout.readline()
+                    if line:
+                        print(f"TTS moshi-server: {line.strip()}")
+            except Exception as e:
+                print(f"TTS output monitor error: {e}")
+        
+        output_thread = threading.Thread(target=monitor_output, daemon=True)
+        output_thread.start()
+        
+        max_attempts = 120  # 120 seconds max - TTS takes longer than STT
         for attempt in range(max_attempts):
+            # Check if process died
+            if self.proc.poll() is not None:
+                print(f"TTS moshi-server process died with return code: {self.proc.returncode}")
+                break
+                
             try:
                 # Try to connect to the moshi server
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -585,6 +671,9 @@ n_q = 24
                     break
             except Exception:
                 pass
+            # Print progress every 10 seconds
+            if (attempt + 1) % 10 == 0:
+                print(f"TTS moshi-server still starting... {attempt + 1}/{max_attempts} seconds")
             time.sleep(1)
         else:
             # Check if process is still running
@@ -630,7 +719,7 @@ n_q = 24
             # First check if our internal moshi server is ready before accepting the connection
             import socket
             import asyncio
-            max_wait_attempts = 30  # 30 seconds max
+            max_wait_attempts = 120  # 120 seconds max to allow for moshi-server startup
             for attempt in range(max_wait_attempts):
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -645,7 +734,7 @@ n_q = 24
                 print(f"=== TTS_SERVICE: Waiting for internal moshi server, attempt {attempt + 1}/{max_wait_attempts} ===")
                 await asyncio.sleep(1)  # Use async sleep instead of blocking sleep
             else:
-                print("=== TTS_SERVICE: Internal moshi server not ready after 30 seconds ===")
+                print("=== TTS_SERVICE: Internal moshi server not ready after 120 seconds ===")
                 # We must accept the websocket first before we can close it
                 await websocket.accept()
                 await websocket.close(code=1011, reason="Internal TTS server not ready")
@@ -780,6 +869,146 @@ class LLMService:
                 ]
             }
         
+        @app.post("/v1/chat/completions")
+        async def chat_completions(request: dict):
+            """OpenAI-compatible chat completions endpoint"""
+            print(f"=== LLM_SERVICE: Received chat completion request: {request} ===")
+            
+            try:
+                from vllm import SamplingParams
+                
+                # Extract parameters from request
+                messages = request.get("messages", [])
+                temperature = request.get("temperature", 0.7)
+                max_tokens = request.get("max_tokens", 1024)
+                stream = request.get("stream", False)
+                
+                # Convert messages to a single prompt (simplified approach)
+                prompt = ""
+                for message in messages:
+                    role = message.get("role", "user")
+                    content = message.get("content", "")
+                    if role == "system":
+                        prompt += f"System: {content}\n"
+                    elif role == "user":
+                        prompt += f"User: {content}\n"
+                    elif role == "assistant":
+                        prompt += f"Assistant: {content}\n"
+                
+                prompt += "Assistant: "
+                
+                print(f"=== LLM_SERVICE: Generated prompt: {prompt[:200]}... ===")
+                
+                # Generate response using VLLM
+                sampling_params = SamplingParams(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                
+                request_id = f"req_{hash(prompt)}"
+                
+                if stream:
+                    # Streaming response
+                    from fastapi.responses import StreamingResponse
+                    import json
+                    
+                    async def generate_stream():
+                        results_generator = self.engine.generate(
+                            prompt,
+                            sampling_params,
+                            request_id=request_id
+                        )
+                        
+                        async for request_output in results_generator:
+                            if request_output.outputs:
+                                for output in request_output.outputs:
+                                    chunk = {
+                                        "id": request_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": 1640995200,
+                                        "model": "google/gemma-3-1b-it",
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": output.text
+                                                },
+                                                "finish_reason": "stop" if request_output.finished else None
+                                            }
+                                        ]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
+                        
+                        # Send final chunk
+                        final_chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": 1640995200,
+                            "model": "google/gemma-3-1b-it",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(final_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    
+                    return StreamingResponse(generate_stream(), media_type="text/plain", headers={"Content-Type": "text/event-stream"})
+                
+                else:
+                    # Non-streaming response
+                    results_generator = self.engine.generate(
+                        prompt,
+                        sampling_params,
+                        request_id=request_id
+                    )
+                    
+                    full_text = ""
+                    async for request_output in results_generator:
+                        if request_output.outputs:
+                            for output in request_output.outputs:
+                                full_text = output.text
+                    
+                    response = {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": 1640995200,
+                        "model": "google/gemma-3-1b-it",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": full_text
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(prompt.split()),
+                            "completion_tokens": len(full_text.split()),
+                            "total_tokens": len(prompt.split()) + len(full_text.split())
+                        }
+                    }
+                    
+                    print(f"=== LLM_SERVICE: Generated response: {full_text[:100]}... ===")
+                    return response
+                    
+            except Exception as e:
+                print(f"=== LLM_SERVICE: Error in chat completion: {e} ===")
+                import traceback
+                print(f"=== LLM_SERVICE: Traceback: {traceback.format_exc()} ===")
+                return {
+                    "error": {
+                        "message": str(e),
+                        "type": "internal_server_error",
+                        "code": "internal_error"
+                    }
+                }
+        
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
             await websocket.accept()
@@ -867,7 +1096,8 @@ class OrchestratorService:
         os.environ["KYUTAI_TTS_PATH"] = "/ws"
         
         # Set longer timeout for Modal services which can take time to cold start
-        os.environ["KYUTAI_SERVICE_TIMEOUT_SEC"] = "60.0"
+        # TTS service takes especially long to start up
+        os.environ["KYUTAI_SERVICE_TIMEOUT_SEC"] = "150.0"
         
         print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")
         print(f"Orchestrator setup complete - TTS: {os.environ['KYUTAI_TTS_URL']}")

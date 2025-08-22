@@ -294,8 +294,21 @@ class TextToSpeech(ServiceWithStartup):
 
         try:
             async for message_bytes in self.websocket:
-                message_dict = msgpack.unpackb(cast(Any, message_bytes))
-                message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
+                # Handle different protocols for Modal vs local services
+                if "modal.run" in self.tts_instance:
+                    # For Modal services, we might get raw moshi-server protocol messages
+                    # Try to parse as msgpack first, but handle raw bytes gracefully
+                    try:
+                        message_dict = msgpack.unpackb(cast(Any, message_bytes))
+                        message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
+                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError) as e:
+                        # Skip messages that can't be unpacked as msgpack (likely raw audio data)
+                        logger.debug(f"Skipping non-msgpack message from Modal service: {len(message_bytes)} bytes, error: {e}")
+                        continue
+                else:
+                    # For local services, expect msgpack format
+                    message_dict = msgpack.unpackb(cast(Any, message_bytes))
+                    message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
 
                 if isinstance(message, TTSAudioMessage):
                     # Use `yield message` if you want to to release the audio

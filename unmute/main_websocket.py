@@ -420,13 +420,9 @@ async def receive_loop(
     print("=== RECEIVE_LOOP: Starting receive loop ===")
     opus_reader = sphn.OpusStreamReader(SAMPLE_RATE)
     wait_for_first_opus = True
-    message_count = 0
     while True:
         try:
-            print(f"=== RECEIVE_LOOP: Waiting for message #{message_count + 1} ===")
             message_raw = await websocket.receive_text()
-            message_count += 1
-            print(f"=== RECEIVE_LOOP: Received message #{message_count}: {message_raw[:100]}... ===")
         except WebSocketDisconnect as e:
             print(f"=== RECEIVE_LOOP: WebSocket disconnected: {e.code=} {e.reason=} ===")
             logger.info(
@@ -447,6 +443,7 @@ async def receive_loop(
         try:
             message: ora.ClientEvent = ClientEventAdapter.validate_json(message_raw)
         except json.JSONDecodeError as e:
+            print(f"=== RECEIVE_LOOP: Invalid JSON: {e} ===")
             await emit_queue.put(
                 ora.Error(
                     error=ora.ErrorDetails(
@@ -457,6 +454,7 @@ async def receive_loop(
             )
             continue
         except ValidationError as e:
+            print(f"=== RECEIVE_LOOP: ValidationError: {e} ===")
             await emit_queue.put(
                 ora.Error(
                     error=ora.ErrorDetails(
