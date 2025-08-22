@@ -184,6 +184,25 @@ class STTService:
         
         print("Setting up STT Service...")
         
+        # First, verify moshi-server binary is available
+        print("Checking moshi-server availability...")
+        try:
+            result = subprocess.run(["which", "moshi-server"], 
+                                  capture_output=True, text=True, timeout=10)
+            print(f"moshi-server location: {result.stdout.strip()}")
+            if result.returncode != 0:
+                print("moshi-server not found in PATH")
+        except Exception as e:
+            print(f"Failed to check moshi-server location: {e}")
+        
+        # Check if Rust environment is available
+        try:
+            result = subprocess.run(["rustc", "--version"], 
+                                  capture_output=True, text=True, timeout=10)
+            print(f"Rust version: {result.stdout.strip()}")
+        except Exception as e:
+            print(f"Rust not available: {e}")
+        
         # Create temporary config file for STT
         config_content = '''
 static_dir = "./static/"
@@ -242,14 +261,59 @@ dim = 6
             self.config_path = f.name
         
         # Start moshi-server as a background process
+        print("Starting STT moshi-server...")
+        print(f"Config file: {self.config_path}")
+        
+        # Debug: print the config content
+        with open(self.config_path, 'r') as f:
+            config_content = f.read()
+            print("STT Config content:")
+            print(config_content)
+        
         self.proc = subprocess.Popen([
             "moshi-server", "worker", 
             "--config", self.config_path,
             "--port", "8090"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        # Wait a bit for the server to start
-        time.sleep(5)
+        # Wait for the server to be ready with health checking
+        import socket
+        max_attempts = 30  # 30 seconds max
+        for attempt in range(max_attempts):
+            try:
+                # Try to connect to the moshi server
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                result = sock.connect_ex(('127.0.0.1', 8090))
+                sock.close()
+                if result == 0:
+                    print(f"STT moshi-server ready after {attempt + 1} seconds")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            # Check if process is still running
+            if self.proc.poll() is not None:
+                stdout, stderr = self.proc.communicate()
+                print(f"STT moshi-server failed to start. Return code: {self.proc.returncode}")
+                print(f"STT moshi-server stdout: {stdout}")
+                print(f"STT moshi-server stderr: {stderr}")
+                
+                # Try to get more debug info
+                print("Checking moshi-server binary...")
+                try:
+                    version_result = subprocess.run(["moshi-server", "--version"], 
+                                                  capture_output=True, text=True, timeout=10)
+                    print(f"moshi-server version: {version_result.stdout}")
+                    if version_result.stderr:
+                        print(f"moshi-server version stderr: {version_result.stderr}")
+                except Exception as e:
+                    print(f"Failed to get moshi-server version: {e}")
+                
+                raise RuntimeError(f"STT moshi-server process died during startup with return code {self.proc.returncode}")
+            else:
+                print("STT moshi-server taking longer than expected to start, continuing anyway...")
         
         print("STT model loaded successfully")
     
@@ -273,10 +337,21 @@ dim = 6
             try:
                 # Connect to the local moshi server and proxy messages
                 import websockets
-                async with websockets.connect(
-                    "ws://localhost:8090/api/asr-streaming",
-                    extra_headers={"kyutai-api-key": "public_token"}
-                ) as moshi_ws:
+                try:
+                    moshi_connection = await websockets.connect(
+                        "ws://localhost:8090/api/asr-streaming",
+                        additional_headers={"kyutai-api-key": "public_token"}
+                    )
+                except ConnectionRefusedError as e:
+                    print(f"STT: Failed to connect to internal moshi server: {e}")
+                    await websocket.close(code=1011, reason="Internal STT server not ready")
+                    return
+                except Exception as e:
+                    print(f"STT: Unexpected error connecting to moshi server: {e}")
+                    await websocket.close(code=1011, reason="Internal STT server error")
+                    return
+                
+                async with moshi_connection as moshi_ws:
                     # Proxy messages between client and moshi server
                     async def client_to_moshi():
                         try:
@@ -329,6 +404,25 @@ class TTSService:
         
         print("Setting up TTS Service...")
         
+        # First, verify moshi-server binary is available
+        print("Checking moshi-server availability...")
+        try:
+            result = subprocess.run(["which", "moshi-server"], 
+                                  capture_output=True, text=True, timeout=10)
+            print(f"moshi-server location: {result.stdout.strip()}")
+            if result.returncode != 0:
+                print("moshi-server not found in PATH")
+        except Exception as e:
+            print(f"Failed to check moshi-server location: {e}")
+        
+        # Check if Rust environment is available
+        try:
+            result = subprocess.run(["rustc", "--version"], 
+                                  capture_output=True, text=True, timeout=10)
+            print(f"Rust version: {result.stdout.strip()}")
+        except Exception as e:
+            print(f"Rust not available: {e}")
+        
         # Create temporary config file for TTS
         config_content = '''
 static_dir = "./static/"
@@ -361,14 +455,59 @@ n_q = 24
             self.config_path = f.name
         
         # Start moshi-server as a background process
+        print("Starting TTS moshi-server...")
+        print(f"Config file: {self.config_path}")
+        
+        # Debug: print the config content
+        with open(self.config_path, 'r') as f:
+            config_content = f.read()
+            print("TTS Config content:")
+            print(config_content)
+        
         self.proc = subprocess.Popen([
             "moshi-server", "worker",
             "--config", self.config_path, 
             "--port", "8089"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        # Wait a bit for the server to start
-        time.sleep(5)
+        # Wait for the server to be ready with health checking
+        import socket
+        max_attempts = 30  # 30 seconds max
+        for attempt in range(max_attempts):
+            try:
+                # Try to connect to the moshi server
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                result = sock.connect_ex(('127.0.0.1', 8089))
+                sock.close()
+                if result == 0:
+                    print(f"TTS moshi-server ready after {attempt + 1} seconds")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            # Check if process is still running
+            if self.proc.poll() is not None:
+                stdout, stderr = self.proc.communicate()
+                print(f"TTS moshi-server failed to start. Return code: {self.proc.returncode}")
+                print(f"TTS moshi-server stdout: {stdout}")
+                print(f"TTS moshi-server stderr: {stderr}")
+                
+                # Try to get more debug info
+                print("Checking moshi-server binary...")
+                try:
+                    version_result = subprocess.run(["moshi-server", "--version"], 
+                                                  capture_output=True, text=True, timeout=10)
+                    print(f"moshi-server version: {version_result.stdout}")
+                    if version_result.stderr:
+                        print(f"moshi-server version stderr: {version_result.stderr}")
+                except Exception as e:
+                    print(f"Failed to get moshi-server version: {e}")
+                
+                raise RuntimeError(f"TTS moshi-server process died during startup with return code {self.proc.returncode}")
+            else:
+                print("TTS moshi-server taking longer than expected to start, continuing anyway...")
             
         print("TTS model loaded successfully")
     
@@ -392,10 +531,21 @@ n_q = 24
             try:
                 # Connect to the local moshi server and proxy messages
                 import websockets
-                async with websockets.connect(
-                    "ws://localhost:8089/api/tts_streaming",
-                    extra_headers={"kyutai-api-key": "public_token"}
-                ) as moshi_ws:
+                try:
+                    moshi_connection = await websockets.connect(
+                        "ws://localhost:8089/api/tts_streaming",
+                        additional_headers={"kyutai-api-key": "public_token"}
+                    )
+                except ConnectionRefusedError as e:
+                    print(f"TTS: Failed to connect to internal moshi server: {e}")
+                    await websocket.close(code=1011, reason="Internal TTS server not ready")
+                    return
+                except Exception as e:
+                    print(f"TTS: Unexpected error connecting to moshi server: {e}")
+                    await websocket.close(code=1011, reason="Internal TTS server error")
+                    return
+                
+                async with moshi_connection as moshi_ws:
                     # Proxy messages between client and moshi server
                     async def client_to_moshi():
                         try:
