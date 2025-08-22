@@ -64,6 +64,14 @@ stt_image = (
     .pip_install(
         "torch>=2.1.0",
         "torchaudio>=2.1.0",
+        "safetensors>=0.4.0",
+        "transformers>=4.35.0",
+        "tokenizers>=0.15.0",
+        # Moshi Python package and dependencies for moshi-server
+        "moshi>=0.2.8",
+        "huggingface_hub>=0.19.0",
+        "sentencepiece>=0.2.0",
+        "einops>=0.8.0",
     )
     .run_commands(
         # Set environment variables for building
@@ -76,16 +84,16 @@ stt_image = (
         "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
         "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
         "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
-        # Clone moshi repo and try multiple approaches to build moshi-server
-        "git clone --depth 1 https://github.com/kyutai-labs/moshi.git /tmp/moshi",
-        # Build without CUDA features during image build (CUDA will be available at runtime)
-        # This avoids nvidia-smi dependency during build while still allowing GPU usage at runtime
-        "cd /tmp/moshi/rust && (rm -f Cargo.lock && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with CPU-compatible build') || echo 'Build approach 1 failed, trying approach 2'",
-        # Approach 2: If approach 1 failed, patch hf-hub dependency and try again
-        "cd /tmp/moshi/rust && (test -f /usr/local/bin/moshi-server || (rm -f Cargo.lock && sed -i 's/hf-hub = { version = \\\"0.4.3\\\", features = \\[\\\"tokio\\\"\\] }/hf-hub = { version = \\\"0.4.3\\\", features = [\\\"native-tls\\\"] }/' Cargo.toml && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with patched dependencies'))",
-        "rm -rf /tmp/moshi",
+        # Install moshi-server using cargo install (cleaner than building from source)
+        # This will install the moshi-server binary with proper Python integration
+        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install moshi-server@0.6.3",
+        # Add cargo bin to system PATH permanently
+        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
+        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
+        # Copy moshi-server to a standard location for easier access
+        "cp ~/.cargo/bin/moshi-server /usr/local/bin/ || echo 'Failed to copy moshi-server, but it may still work from cargo bin'",
         # Verify moshi-server was installed successfully
-        ". ~/.cargo/env && which moshi-server && moshi-server --version || echo 'moshi-server installation verification failed'"
+        "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -105,6 +113,13 @@ tts_image = (
         "torch>=2.1.0",
         "torchaudio>=2.1.0",
         "huggingface_hub>=0.19.0",
+        "safetensors>=0.4.0",
+        "transformers>=4.35.0",
+        "tokenizers>=0.15.0",
+        # Moshi Python package and dependencies for moshi-server
+        "moshi>=0.2.8",
+        "sentencepiece>=0.2.0",
+        "einops>=0.8.0",
     )
     .run_commands(
         # Set environment variables for building
@@ -117,16 +132,16 @@ tts_image = (
         "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
         "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
         "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
-        # Clone moshi repo and try multiple approaches to build moshi-server
-        "git clone --depth 1 https://github.com/kyutai-labs/moshi.git /tmp/moshi",
-        # Build without CUDA features during image build (CUDA will be available at runtime)
-        # This avoids nvidia-smi dependency during build while still allowing GPU usage at runtime
-        "cd /tmp/moshi/rust && (rm -f Cargo.lock && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with CPU-compatible build') || echo 'Build approach 1 failed, trying approach 2'",
-        # Approach 2: If approach 1 failed, patch hf-hub dependency and try again
-        "cd /tmp/moshi/rust && (test -f /usr/local/bin/moshi-server || (rm -f Cargo.lock && sed -i 's/hf-hub = { version = \\\"0.4.3\\\", features = \\[\\\"tokio\\\"\\] }/hf-hub = { version = \\\"0.4.3\\\", features = [\\\"native-tls\\\"] }/' Cargo.toml && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with patched dependencies'))",
-        "rm -rf /tmp/moshi",
+        # Install moshi-server using cargo install (cleaner than building from source)
+        # This will install the moshi-server binary with proper Python integration
+        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install moshi-server@0.6.3",
+        # Add cargo bin to system PATH permanently
+        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
+        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
+        # Copy moshi-server to a standard location for easier access
+        "cp ~/.cargo/bin/moshi-server /usr/local/bin/ || echo 'Failed to copy moshi-server, but it may still work from cargo bin'",
         # Verify moshi-server was installed successfully
-        ". ~/.cargo/env && which moshi-server && moshi-server --version || echo 'moshi-server installation verification failed'"
+        "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -184,14 +199,25 @@ class STTService:
         
         print("Setting up STT Service...")
         
+        # Set up environment with cargo bin in PATH
+        import os
+        env = os.environ.copy()
+        cargo_bin_path = os.path.expanduser("~/.cargo/bin")
+        env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
+        
         # First, verify moshi-server binary is available
         print("Checking moshi-server availability...")
         try:
             result = subprocess.run(["which", "moshi-server"], 
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, env=env)
             print(f"moshi-server location: {result.stdout.strip()}")
             if result.returncode != 0:
                 print("moshi-server not found in PATH")
+                # Try to find it in common locations
+                for path in ["/usr/local/bin/moshi-server", cargo_bin_path + "/moshi-server"]:
+                    if os.path.exists(path):
+                        print(f"Found moshi-server at: {path}")
+                        break
         except Exception as e:
             print(f"Failed to check moshi-server location: {e}")
         
@@ -270,11 +296,20 @@ dim = 6
             print("STT Config content:")
             print(config_content)
         
+        # Find the moshi-server binary
+        moshi_server_cmd = "moshi-server"
+        if os.path.exists("/usr/local/bin/moshi-server"):
+            moshi_server_cmd = "/usr/local/bin/moshi-server"
+        elif os.path.exists(cargo_bin_path + "/moshi-server"):
+            moshi_server_cmd = cargo_bin_path + "/moshi-server"
+        
+        print(f"Using moshi-server at: {moshi_server_cmd}")
+        
         self.proc = subprocess.Popen([
-            "moshi-server", "worker", 
+            moshi_server_cmd, "worker", 
             "--config", self.config_path,
             "--port", "8090"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         
         # Wait for the server to be ready with health checking
         import socket
@@ -303,13 +338,13 @@ dim = 6
                 # Try to get more debug info
                 print("Checking moshi-server binary...")
                 try:
-                    version_result = subprocess.run(["moshi-server", "--version"], 
-                                                  capture_output=True, text=True, timeout=10)
-                    print(f"moshi-server version: {version_result.stdout}")
+                    version_result = subprocess.run([moshi_server_cmd, "--help"], 
+                                                  capture_output=True, text=True, timeout=10, env=env)
+                    print(f"moshi-server help output: {version_result.stdout[:200]}...")
                     if version_result.stderr:
-                        print(f"moshi-server version stderr: {version_result.stderr}")
+                        print(f"moshi-server help stderr: {version_result.stderr}")
                 except Exception as e:
-                    print(f"Failed to get moshi-server version: {e}")
+                    print(f"Failed to get moshi-server help: {e}")
                 
                 raise RuntimeError(f"STT moshi-server process died during startup with return code {self.proc.returncode}")
             else:
@@ -404,14 +439,25 @@ class TTSService:
         
         print("Setting up TTS Service...")
         
+        # Set up environment with cargo bin in PATH
+        import os
+        env = os.environ.copy()
+        cargo_bin_path = os.path.expanduser("~/.cargo/bin")
+        env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
+        
         # First, verify moshi-server binary is available
         print("Checking moshi-server availability...")
         try:
             result = subprocess.run(["which", "moshi-server"], 
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, env=env)
             print(f"moshi-server location: {result.stdout.strip()}")
             if result.returncode != 0:
                 print("moshi-server not found in PATH")
+                # Try to find it in common locations
+                for path in ["/usr/local/bin/moshi-server", cargo_bin_path + "/moshi-server"]:
+                    if os.path.exists(path):
+                        print(f"Found moshi-server at: {path}")
+                        break
         except Exception as e:
             print(f"Failed to check moshi-server location: {e}")
         
@@ -464,11 +510,20 @@ n_q = 24
             print("TTS Config content:")
             print(config_content)
         
+        # Find the moshi-server binary
+        moshi_server_cmd = "moshi-server"
+        if os.path.exists("/usr/local/bin/moshi-server"):
+            moshi_server_cmd = "/usr/local/bin/moshi-server"
+        elif os.path.exists(cargo_bin_path + "/moshi-server"):
+            moshi_server_cmd = cargo_bin_path + "/moshi-server"
+        
+        print(f"Using moshi-server at: {moshi_server_cmd}")
+        
         self.proc = subprocess.Popen([
-            "moshi-server", "worker",
+            moshi_server_cmd, "worker",
             "--config", self.config_path, 
             "--port", "8089"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         
         # Wait for the server to be ready with health checking
         import socket
@@ -497,13 +552,13 @@ n_q = 24
                 # Try to get more debug info
                 print("Checking moshi-server binary...")
                 try:
-                    version_result = subprocess.run(["moshi-server", "--version"], 
-                                                  capture_output=True, text=True, timeout=10)
-                    print(f"moshi-server version: {version_result.stdout}")
+                    version_result = subprocess.run([moshi_server_cmd, "--help"], 
+                                                  capture_output=True, text=True, timeout=10, env=env)
+                    print(f"moshi-server help output: {version_result.stdout[:200]}...")
                     if version_result.stderr:
-                        print(f"moshi-server version stderr: {version_result.stderr}")
+                        print(f"moshi-server help stderr: {version_result.stderr}")
                 except Exception as e:
-                    print(f"Failed to get moshi-server version: {e}")
+                    print(f"Failed to get moshi-server help: {e}")
                 
                 raise RuntimeError(f"TTS moshi-server process died during startup with return code {self.proc.returncode}")
             else:
