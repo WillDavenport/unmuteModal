@@ -546,15 +546,21 @@ async def emit_loop(
             elif isinstance(emitted_by_handler, ora.ServerEvent):
                 to_emit = emitted_by_handler
             else:
-                _sr, audio = emitted_by_handler
-                audio = audio_to_float32(audio)
-                opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
-                # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
-                if opus_bytes:
-                    to_emit = ora.ResponseAudioDelta(
-                        delta=base64.b64encode(opus_bytes).decode("utf-8"),
-                    )
-                else:
+                # Handle audio tuple: (sample_rate, audio_data)
+                try:
+                    _sr, audio = emitted_by_handler
+                    audio = audio_to_float32(audio)
+                    opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
+                    # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
+                    if opus_bytes:
+                        to_emit = ora.ResponseAudioDelta(
+                            delta=base64.b64encode(opus_bytes).decode("utf-8"),
+                        )
+                    else:
+                        continue
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to unpack emitted_by_handler: {type(emitted_by_handler)=}, {emitted_by_handler=}, error: {e}")
+                    # Skip this iteration if we can't handle the data
                     continue
 
         emit_debug_logger.on_emit(to_emit)

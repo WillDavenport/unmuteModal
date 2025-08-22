@@ -17,8 +17,8 @@ VOICE_CLONING_SERVER = os.environ.get(
 # If None, a dict-based cache will be used instead of Redis
 REDIS_SERVER = os.environ.get("KYUTAI_REDIS_URL")
 
-SPEECH_TO_TEXT_PATH = "/api/asr-streaming"
-TEXT_TO_SPEECH_PATH = "/api/tts_streaming"
+SPEECH_TO_TEXT_PATH = os.environ.get("KYUTAI_STT_PATH", "/api/asr-streaming")
+TEXT_TO_SPEECH_PATH = os.environ.get("KYUTAI_TTS_PATH", "/api/tts_streaming")
 
 repo_root = Path(__file__).parents[1]
 VOICE_DONATION_DIR = Path(

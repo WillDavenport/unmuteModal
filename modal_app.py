@@ -567,6 +567,10 @@ class OrchestratorService:
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         
+        # Override paths for Modal services (they use /ws instead of /api/*)
+        os.environ["KYUTAI_STT_PATH"] = "/ws"
+        os.environ["KYUTAI_TTS_PATH"] = "/ws"
+        
         print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")
         print(f"Orchestrator setup complete - TTS: {os.environ['KYUTAI_TTS_URL']}")
         print(f"Orchestrator setup complete - LLM: {os.environ['KYUTAI_LLM_URL']}")

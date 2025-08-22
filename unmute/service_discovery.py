@@ -58,10 +58,24 @@ async def _resolve(hostname: str) -> list[str]:
 async def get_instances(service_name: str) -> list[str]:
     url = SERVICES[service_name]
     protocol, remaining = url.split("://", 1)
-    hostname, port = remaining.split(":", 1)
-    ips = list(await _resolve(hostname))
-    random.shuffle(ips)
-    return [f"{protocol}://{ip}:{port}" for ip in ips]
+    
+    # For secure protocols (wss, https), don't resolve to IP addresses
+    # to avoid SSL certificate validation issues
+    if protocol in ("wss", "https"):
+        return [url]
+    
+    # Handle URLs with and without explicit ports for non-secure protocols
+    if ":" in remaining:
+        hostname, port = remaining.split(":", 1)
+        ips = list(await _resolve(hostname))
+        random.shuffle(ips)
+        return [f"{protocol}://{ip}:{port}" for ip in ips]
+    else:
+        # No explicit port in URL (e.g., Modal URLs)
+        hostname = remaining
+        ips = list(await _resolve(hostname))
+        random.shuffle(ips)
+        return [f"{protocol}://{ip}" for ip in ips]
 
 
 class ServiceWithStartup(tp.Protocol):
