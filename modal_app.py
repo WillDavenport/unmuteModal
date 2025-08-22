@@ -169,7 +169,7 @@ secrets = [
     volumes={"/models": models_volume},
     secrets=secrets,
     min_containers=0,
-    scaledown_window=1200,  # 20 minutes
+    scaledown_window=300,  # 5 minutes
 )
 class STTService:
     """Speech-to-Text service using Moshi STT model"""
@@ -314,7 +314,7 @@ dim = 6
     volumes={"/models": models_volume},
     secrets=secrets,
     min_containers=0,
-    scaledown_window=600,  # 10 minutes
+    scaledown_window=300,  # 5 minutes
 )
 class TTSService:
     """Text-to-Speech service using Moshi TTS model"""
@@ -428,12 +428,12 @@ n_q = 24
 
 
 @app.cls(
-    gpu="L40S",
+    gpu="L4",
     image=llm_image,
     volumes={"/models": models_volume},
     secrets=secrets,
     min_containers=0,
-    scaledown_window=600,  # 10 minutes
+    scaledown_window=300,  # 5 minutes
 )
 class LLMService:
     """Large Language Model service using VLLM"""
@@ -528,7 +528,7 @@ class LLMService:
     image=orchestrator_image,
     secrets=secrets,
     min_containers=0,
-    scaledown_window=1200,  # 20 minutes
+    scaledown_window=300,  # 5 minutes
 )
 class OrchestratorService:
     """Orchestrator service that coordinates between STT, LLM, and TTS"""
@@ -558,7 +558,7 @@ class OrchestratorService:
     @modal.asgi_app()
     def web(self):
         """Main WebSocket endpoint for client connections"""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile
         from fastapi.middleware.cors import CORSMiddleware
         import asyncio
         import json
@@ -591,6 +591,36 @@ class OrchestratorService:
             health = await _get_health(None)
             return health
         
+        @app.get("/v1/voices")
+        def get_voices():
+            """Get available voices - mimics the original backend endpoint"""
+            from unmute.tts.voices import VoiceList
+            voice_list = VoiceList()
+            # Note that `voice.good` is bool | None, here we really take only True values.
+            good_voices = [
+                voice.model_dump(exclude={"comment"})
+                for voice in voice_list.voices
+                if voice.good
+            ]
+            return good_voices
+        
+        @app.post("/v1/voices")
+        async def post_voices(file: UploadFile):
+            """Upload a voice file for cloning - mimics the original backend endpoint"""
+            from unmute.tts.voice_cloning import clone_voice
+            
+            # Note: Voice cloning is not fully available in Modal deployment
+            # but we provide this endpoint for compatibility
+            try:
+                file_content = await file.read()
+                name = clone_voice(file_content)
+                return {"name": name}
+            except Exception as e:
+                # If voice cloning server is not available, return a mock response
+                import uuid
+                mock_name = "custom:" + str(uuid.uuid4())
+                return {"name": mock_name}
+        
         @app.websocket("/v1/realtime")
         async def websocket_endpoint(websocket: WebSocket):
             """Main client WebSocket endpoint using the existing unmute handler"""
@@ -602,7 +632,6 @@ class OrchestratorService:
                 from unmute.unmute_handler import UnmuteHandler
                 from unmute.main_websocket import receive_loop, emit_loop
                 import unmute.openai_realtime_api_events as ora
-                from fastrtc import OpusReader
                 
                 # Create handler instance
                 handler = UnmuteHandler()

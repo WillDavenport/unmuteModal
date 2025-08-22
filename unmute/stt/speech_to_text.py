@@ -129,8 +129,11 @@ class SpeechToText(ServiceWithStartup):
 
     async def start_up(self):
         logger.info(f"Connecting to STT {self.stt_instance}...")
-        self.websocket = await websockets.connect(
-            self.stt_instance + SPEECH_TO_TEXT_PATH, additional_headers=HEADERS
+        self.websocket = await asyncio.wait_for(
+            websockets.connect(
+                self.stt_instance + SPEECH_TO_TEXT_PATH, additional_headers=HEADERS
+            ),
+            timeout=60.0  # Allow 60 seconds for cold start
         )
         logger.info("Connected to STT")
 

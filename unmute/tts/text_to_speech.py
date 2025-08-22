@@ -206,9 +206,12 @@ class TextToSpeech(ServiceWithStartup):
     async def start_up(self):
         url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
         logger.info(f"Connecting to TTS: {url}")
-        self.websocket = await websockets.connect(
-            url,
-            additional_headers=HEADERS,
+        self.websocket = await asyncio.wait_for(
+            websockets.connect(
+                url,
+                additional_headers=HEADERS,
+            ),
+            timeout=60.0  # Allow 60 seconds for cold start
         )
         logger.debug("Connected to TTS")
 

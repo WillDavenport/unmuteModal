@@ -113,7 +113,7 @@ def _ws_to_http(ws_url: str) -> str:
 def _check_server_status(server_url: str) -> bool:
     """Check if the server is up by sending a GET request."""
     try:
-        response = requests.get(server_url, timeout=2)
+        response = requests.get(server_url, timeout=60)
         logger.info(f"Response from {server_url}: {response}")
         return response.status_code == 200
     except requests.exceptions.RequestException as e:
