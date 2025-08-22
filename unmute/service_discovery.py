@@ -87,7 +87,7 @@ class ServiceWithStartup(tp.Protocol):
 async def find_instance(
     service_name: str,
     client_factory: tp.Callable[[str], S],
-    timeout_sec: float = 0.5,
+    timeout_sec: float = 10.0,  # Increased for Modal cloud services
     max_trials: int = 3,
 ) -> S:
     stopwatch = Stopwatch()

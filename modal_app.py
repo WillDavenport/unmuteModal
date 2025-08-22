@@ -224,7 +224,7 @@ class STTService:
         # Check if Rust environment is available
         try:
             result = subprocess.run(["rustc", "--version"], 
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, env=env)
             print(f"Rust version: {result.stdout.strip()}")
         except Exception as e:
             print(f"Rust not available: {e}")
@@ -387,7 +387,24 @@ dim = 6
                     return
                 
                 async with moshi_connection as moshi_ws:
-                    # Proxy messages between client and moshi server
+                    # First, wait for and forward the initial Ready message from moshi-server
+                    try:
+                        initial_message = await asyncio.wait_for(moshi_ws.recv(), timeout=30.0)
+                        print(f"STT: Received initial message from moshi-server: {type(initial_message)}")
+                        if isinstance(initial_message, bytes):
+                            await websocket.send_bytes(initial_message)
+                        else:
+                            await websocket.send_text(initial_message)
+                    except asyncio.TimeoutError:
+                        print("STT: Timeout waiting for initial Ready message from moshi-server")
+                        await websocket.close(code=1011, reason="Internal STT server timeout")
+                        return
+                    except Exception as e:
+                        print(f"STT: Error receiving initial message: {e}")
+                        await websocket.close(code=1011, reason="Internal STT server error")
+                        return
+                    
+                    # Now proxy messages between client and moshi server
                     async def client_to_moshi():
                         try:
                             while True:
@@ -464,7 +481,7 @@ class TTSService:
         # Check if Rust environment is available
         try:
             result = subprocess.run(["rustc", "--version"], 
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, env=env)
             print(f"Rust version: {result.stdout.strip()}")
         except Exception as e:
             print(f"Rust not available: {e}")
@@ -601,7 +618,24 @@ n_q = 24
                     return
                 
                 async with moshi_connection as moshi_ws:
-                    # Proxy messages between client and moshi server
+                    # First, wait for and forward the initial Ready message from moshi-server
+                    try:
+                        initial_message = await asyncio.wait_for(moshi_ws.recv(), timeout=30.0)
+                        print(f"TTS: Received initial message from moshi-server: {type(initial_message)}")
+                        if isinstance(initial_message, bytes):
+                            await websocket.send_bytes(initial_message)
+                        else:
+                            await websocket.send_text(initial_message)
+                    except asyncio.TimeoutError:
+                        print("TTS: Timeout waiting for initial Ready message from moshi-server")
+                        await websocket.close(code=1011, reason="Internal TTS server timeout")
+                        return
+                    except Exception as e:
+                        print(f"TTS: Error receiving initial message: {e}")
+                        await websocket.close(code=1011, reason="Internal TTS server error")
+                        return
+                    
+                    # Now proxy messages between client and moshi server
                     async def client_to_moshi():
                         try:
                             while True:
@@ -776,6 +810,9 @@ class OrchestratorService:
         os.environ["KYUTAI_STT_PATH"] = "/ws"
         os.environ["KYUTAI_TTS_PATH"] = "/ws"
         
+        # Set longer timeout for Modal services which can take time to cold start
+        os.environ["KYUTAI_SERVICE_TIMEOUT_SEC"] = "60.0"
+        
         print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")
         print(f"Orchestrator setup complete - TTS: {os.environ['KYUTAI_TTS_URL']}")
         print(f"Orchestrator setup complete - LLM: {os.environ['KYUTAI_LLM_URL']}")
@@ -785,11 +822,9 @@ class OrchestratorService:
     @modal.asgi_app()
     def web(self):
         """Main WebSocket endpoint for client connections"""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile
+        from fastapi import FastAPI, WebSocket, UploadFile
         from fastapi.middleware.cors import CORSMiddleware
         import asyncio
-        import json
-        import base64
         
         app = FastAPI(title="Orchestrator Service", version="1.0.0")
         
@@ -842,7 +877,7 @@ class OrchestratorService:
                 file_content = await file.read()
                 name = clone_voice(file_content)
                 return {"name": name}
-            except Exception as e:
+            except Exception:
                 # If voice cloning server is not available, return a mock response
                 import uuid
                 mock_name = "custom:" + str(uuid.uuid4())
@@ -854,34 +889,45 @@ class OrchestratorService:
             await websocket.accept()
             print("Orchestrator WebSocket connection established")
             
+            # Import the complete websocket handling logic
+            from unmute.unmute_handler import UnmuteHandler
+            from unmute.main_websocket import receive_loop, emit_loop, debug_running_tasks, _get_health, _report_websocket_exception
+            import unmute.openai_realtime_api_events as ora
+            from fastapi import status
+            
             try:
-                # Import unmute modules within the function
-                from unmute.unmute_handler import UnmuteHandler
-                from unmute.main_websocket import receive_loop, emit_loop
-                import unmute.openai_realtime_api_events as ora
-                
                 # Create handler instance
                 handler = UnmuteHandler()
-                emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
                 
-                # Start the handler
-                async with handler:
-                    # Start STT
-                    await handler.start_up_stt()
-                    
-                    # Run the main loops
-                    await asyncio.gather(
-                        receive_loop(websocket, handler, emit_queue),
-                        emit_loop(websocket, handler, emit_queue),
-                        return_exceptions=True
+                # Check health first
+                health = await _get_health(None)
+                if not health.ok:
+                    print("Health check failed, closing WebSocket connection.")
+                    await websocket.close(
+                        code=status.WS_1011_INTERNAL_ERROR,
+                        reason=f"Server is not healthy: {health}",
                     )
-                    
-            except Exception as e:
-                print(f"Orchestrator error: {e}")
+                    return
+                
+                emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
                 try:
-                    await websocket.close(code=1000, reason=str(e))
-                except Exception:
-                    pass  # WebSocket might already be closed
+                    async with handler:
+                        await handler.start_up()
+                        async with asyncio.TaskGroup() as tg:
+                            tg.create_task(
+                                receive_loop(websocket, handler, emit_queue), name="receive_loop()"
+                            )
+                            tg.create_task(
+                                emit_loop(websocket, handler, emit_queue), name="emit_loop()"
+                            )
+                            tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
+                            tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
+                finally:
+                    await handler.cleanup()
+                    print("websocket_route() finished")
+                    
+            except Exception as exc:
+                await _report_websocket_exception(websocket, exc)
         
         return app
 

@@ -25,6 +25,7 @@ from unmute.kyutai_constants import (
     RECORDINGS_DIR,
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
+    get_service_discovery_timeout,
 )
 from unmute.llm.chatbot import Chatbot
 from unmute.llm.llm_utils import (
@@ -421,7 +422,8 @@ class UnmuteHandler(AsyncStreamHandler):
 
     async def start_up_stt(self):
         async def _init() -> SpeechToText:
-            return await find_instance("stt", SpeechToText)
+            # Use longer timeout for Modal services which can take time to cold start
+            return await find_instance("stt", SpeechToText, timeout_sec=get_service_discovery_timeout())
 
         async def _run(stt: SpeechToText):
             await self._stt_loop(stt)
@@ -481,7 +483,8 @@ class UnmuteHandler(AsyncStreamHandler):
             trials = 5
             for trial in range(trials):
                 try:
-                    tts = await find_instance("tts", factory)
+                    # Use longer timeout for Modal services which can take time to cold start
+                    tts = await find_instance("tts", factory, timeout_sec=get_service_discovery_timeout())
                 except Exception:
                     if trial == trials - 1:
                         raise
