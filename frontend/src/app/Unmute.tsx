@@ -93,6 +93,15 @@ const Unmute = () => {
     webSocketUrl || null,
     {
       protocols: ["realtime"],
+      onOpen: () => {
+        console.log("=== FRONTEND: WebSocket connection opened ===");
+      },
+      onClose: (event) => {
+        console.log(`=== FRONTEND: WebSocket connection closed: code=${event.code}, reason=${event.reason} ===`);
+      },
+      onError: (event) => {
+        console.log("=== FRONTEND: WebSocket error:", event);
+      },
     },
     shouldConnect
   );
@@ -224,22 +233,24 @@ const Unmute = () => {
   // When we connect, we send the initial config (voice and instructions) to the server.
   // Also clear the chat history.
   useEffect(() => {
+    console.log(`=== FRONTEND: Ready state changed: ${readyState} ===`);
     if (readyState !== ReadyState.OPEN) return;
 
+    console.log("=== FRONTEND: WebSocket is open, sending session.update ===");
     const recordingConsent =
       localStorage.getItem(COOKIE_CONSENT_STORAGE_KEY) === "true";
 
     setRawChatHistory([]);
-    sendMessage(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          instructions: unmuteConfig.instructions,
-          voice: unmuteConfig.voice,
-          allow_recording: recordingConsent,
-        },
-      })
-    );
+    const sessionMessage = {
+      type: "session.update",
+      session: {
+        instructions: unmuteConfig.instructions,
+        voice: unmuteConfig.voice,
+        allow_recording: recordingConsent,
+      },
+    };
+    console.log("=== FRONTEND: Sending session.update:", sessionMessage);
+    sendMessage(JSON.stringify(sessionMessage));
   }, [unmuteConfig, readyState, sendMessage]);
 
   // Disconnect when the voice or instruction changes.

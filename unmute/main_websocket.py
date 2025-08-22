@@ -146,6 +146,7 @@ class HealthStatus(BaseModel):
 async def _get_health(
     _none: None,
 ):  # dummy param _none because caching function expects a single param as cache key.
+    print("=== HEALTH_CHECK: Starting health check ===")
     async with asyncio.TaskGroup() as tg:
         # For Modal deployment, check root endpoints instead of specific API paths
         # This allows the health check to work with both local Moshi servers and Modal services
@@ -173,6 +174,8 @@ async def _get_health(
         else:
             voice_cloning_endpoint += "/api/build_info"  # Local Moshi servers
         
+        print(f"=== HEALTH_CHECK: Checking endpoints - TTS: {tts_endpoint}, STT: {stt_endpoint}, LLM: {llm_endpoint}, Voice: {voice_cloning_endpoint} ===")
+        
         tts_up = tg.create_task(
             asyncio.to_thread(_check_server_status, tts_endpoint)
         )
@@ -190,12 +193,14 @@ async def _get_health(
         llm_up_res = await llm_up
         voice_cloning_up_res = await voice_cloning_up
 
-    return HealthStatus(
+    health_result = HealthStatus(
         tts_up=tts_up_res,
         stt_up=stt_up_res,
         llm_up=llm_up_res,
         voice_cloning_up=voice_cloning_up_res,
     )
+    print(f"=== HEALTH_CHECK: Health check completed: {health_result} ===")
+    return health_result
 
 
 @app.get("/v1/health")
@@ -412,12 +417,18 @@ async def receive_loop(
 
     Can decide to send messages via `emit_queue`.
     """
+    print("=== RECEIVE_LOOP: Starting receive loop ===")
     opus_reader = sphn.OpusStreamReader(SAMPLE_RATE)
     wait_for_first_opus = True
+    message_count = 0
     while True:
         try:
+            print(f"=== RECEIVE_LOOP: Waiting for message #{message_count + 1} ===")
             message_raw = await websocket.receive_text()
+            message_count += 1
+            print(f"=== RECEIVE_LOOP: Received message #{message_count}: {message_raw[:100]}... ===")
         except WebSocketDisconnect as e:
+            print(f"=== RECEIVE_LOOP: WebSocket disconnected: {e.code=} {e.reason=} ===")
             logger.info(
                 "receive_loop() stopped because WebSocket disconnected: "
                 f"{e.code=} {e.reason=}"
@@ -426,8 +437,10 @@ async def receive_loop(
         except RuntimeError as e:
             # This is expected when the client disconnects
             if "WebSocket is not connected" not in str(e):
+                print(f"=== RECEIVE_LOOP: Unexpected RuntimeError: {e} ===")
                 raise  # re-raise unexpected errors
 
+            print(f"=== RECEIVE_LOOP: WebSocket disconnected (RuntimeError): {e} ===")
             logger.info("receive_loop() stopped because WebSocket disconnected.")
             raise WebSocketClosedError() from e
 
@@ -515,20 +528,24 @@ async def emit_loop(
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Send messages to the WebSocket."""
+    print("=== EMIT_LOOP: Starting emit loop ===")
     emit_debug_logger = EmitDebugLogger()
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
+    emit_count = 0
 
     while True:
         if (
             websocket.application_state == WebSocketState.DISCONNECTED
             or websocket.client_state == WebSocketState.DISCONNECTED
         ):
+            print(f"=== EMIT_LOOP: WebSocket disconnected (states: app={websocket.application_state}, client={websocket.client_state}) ===")
             logger.info("emit_loop() stopped because WebSocket disconnected")
             raise WebSocketClosedError()
 
         try:
             to_emit = emit_queue.get_nowait()
+            print(f"=== EMIT_LOOP: Got queued message: {to_emit.type} ===")
         except asyncio.QueueEmpty:
             emitted_by_handler = await handler.emit()
 
@@ -569,19 +586,25 @@ async def emit_loop(
             await handler.recorder.add_event("server", to_emit)
 
         try:
+            emit_count += 1
+            print(f"=== EMIT_LOOP: Sending message #{emit_count}: {to_emit.type} ===")
             await websocket.send_text(to_emit.model_dump_json())
+            print(f"=== EMIT_LOOP: Successfully sent message #{emit_count} ===")
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):
                     # This is expected when the client disconnects
                     message = f"emit_loop() stopped because WebSocket disconnected: {e}"
+                    print(f"=== EMIT_LOOP: {message} ===")
                 else:
+                    print(f"=== EMIT_LOOP: Unexpected RuntimeError: {e} ===")
                     raise
             else:
                 message = (
                     "emit_loop() stopped because WebSocket disconnected: "
                     f"{e.code=} {e.reason=}"
                 )
+                print(f"=== EMIT_LOOP: {message} ===")
 
             logger.info(message)
             raise WebSocketClosedError() from e

@@ -366,23 +366,51 @@ dim = 6
         
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
+            print("=== STT_SERVICE: WebSocket connection attempt ===")
+            
+            # First check if our internal moshi server is ready before accepting the connection
+            import socket
+            import asyncio
+            max_wait_attempts = 30  # 30 seconds max
+            for attempt in range(max_wait_attempts):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1.0)
+                    result = sock.connect_ex(('127.0.0.1', 8090))
+                    sock.close()
+                    if result == 0:
+                        print(f"=== STT_SERVICE: Internal moshi server ready after {attempt + 1} attempts ===")
+                        break
+                except Exception:
+                    pass
+                print(f"=== STT_SERVICE: Waiting for internal moshi server, attempt {attempt + 1}/{max_wait_attempts} ===")
+                await asyncio.sleep(1)  # Use async sleep instead of blocking sleep
+            else:
+                print("=== STT_SERVICE: Internal moshi server not ready after 30 seconds ===")
+                # We must accept the websocket first before we can close it
+                await websocket.accept()
+                await websocket.close(code=1011, reason="Internal STT server not ready")
+                return
+            
             await websocket.accept()
-            print("STT WebSocket connection established")
+            print("=== STT_SERVICE: WebSocket connection accepted, internal server ready ===")
             
             try:
                 # Connect to the local moshi server and proxy messages
                 import websockets
                 try:
+                    print("=== STT_SERVICE: Connecting to internal moshi server ===")
                     moshi_connection = await websockets.connect(
                         "ws://localhost:8090/api/asr-streaming",
                         additional_headers={"kyutai-api-key": "public_token"}
                     )
+                    print("=== STT_SERVICE: Successfully connected to internal moshi server ===")
                 except ConnectionRefusedError as e:
-                    print(f"STT: Failed to connect to internal moshi server: {e}")
+                    print(f"=== STT_SERVICE: Failed to connect to internal moshi server: {e} ===")
                     await websocket.close(code=1011, reason="Internal STT server not ready")
                     return
                 except Exception as e:
-                    print(f"STT: Unexpected error connecting to moshi server: {e}")
+                    print(f"=== STT_SERVICE: Unexpected error connecting to moshi server: {e} ===")
                     await websocket.close(code=1011, reason="Internal STT server error")
                     return
                 
@@ -597,23 +625,51 @@ n_q = 24
         
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
+            print("=== TTS_SERVICE: WebSocket connection attempt ===")
+            
+            # First check if our internal moshi server is ready before accepting the connection
+            import socket
+            import asyncio
+            max_wait_attempts = 30  # 30 seconds max
+            for attempt in range(max_wait_attempts):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1.0)
+                    result = sock.connect_ex(('127.0.0.1', 8089))
+                    sock.close()
+                    if result == 0:
+                        print(f"=== TTS_SERVICE: Internal moshi server ready after {attempt + 1} attempts ===")
+                        break
+                except Exception:
+                    pass
+                print(f"=== TTS_SERVICE: Waiting for internal moshi server, attempt {attempt + 1}/{max_wait_attempts} ===")
+                await asyncio.sleep(1)  # Use async sleep instead of blocking sleep
+            else:
+                print("=== TTS_SERVICE: Internal moshi server not ready after 30 seconds ===")
+                # We must accept the websocket first before we can close it
+                await websocket.accept()
+                await websocket.close(code=1011, reason="Internal TTS server not ready")
+                return
+            
             await websocket.accept()
-            print("TTS WebSocket connection established")
+            print("=== TTS_SERVICE: WebSocket connection accepted, internal server ready ===")
             
             try:
                 # Connect to the local moshi server and proxy messages
                 import websockets
                 try:
+                    print("=== TTS_SERVICE: Connecting to internal moshi server ===")
                     moshi_connection = await websockets.connect(
                         "ws://localhost:8089/api/tts_streaming",
                         additional_headers={"kyutai-api-key": "public_token"}
                     )
+                    print("=== TTS_SERVICE: Successfully connected to internal moshi server ===")
                 except ConnectionRefusedError as e:
-                    print(f"TTS: Failed to connect to internal moshi server: {e}")
+                    print(f"=== TTS_SERVICE: Failed to connect to internal moshi server: {e} ===")
                     await websocket.close(code=1011, reason="Internal TTS server not ready")
                     return
                 except Exception as e:
-                    print(f"TTS: Unexpected error connecting to moshi server: {e}")
+                    print(f"=== TTS_SERVICE: Unexpected error connecting to moshi server: {e} ===")
                     await websocket.close(code=1011, reason="Internal TTS server error")
                     return
                 
@@ -886,8 +942,14 @@ class OrchestratorService:
         @app.websocket("/v1/realtime")
         async def websocket_endpoint(websocket: WebSocket):
             """Main client WebSocket endpoint using the existing unmute handler"""
-            await websocket.accept()
-            print("Orchestrator WebSocket connection established")
+            print("=== ORCHESTRATOR: WebSocket connection attempt started ===")
+            try:
+                # Accept with the correct subprotocol
+                await websocket.accept(subprotocol="realtime")
+                print("=== ORCHESTRATOR: WebSocket connection accepted with realtime subprotocol ===")
+            except Exception as e:
+                print(f"=== ORCHESTRATOR: Failed to accept WebSocket connection: {e} ===")
+                return
             
             # Import the complete websocket handling logic
             from unmute.unmute_handler import UnmuteHandler
@@ -896,37 +958,68 @@ class OrchestratorService:
             from fastapi import status
             
             try:
+                print("=== ORCHESTRATOR: Creating handler instance ===")
                 # Create handler instance
                 handler = UnmuteHandler()
                 
+                print("=== ORCHESTRATOR: Checking health status ===")
                 # Check health first
                 health = await _get_health(None)
+                print(f"=== ORCHESTRATOR: Health check result: {health} ===")
                 if not health.ok:
-                    print("Health check failed, closing WebSocket connection.")
+                    print(f"=== ORCHESTRATOR: Health check failed, closing WebSocket connection: {health} ===")
                     await websocket.close(
                         code=status.WS_1011_INTERNAL_ERROR,
                         reason=f"Server is not healthy: {health}",
                     )
                     return
                 
+                print("=== ORCHESTRATOR: Health check passed, starting handler ===")
+                
+                # Log current environment variables for debugging
+                import os
+                print(f"=== ORCHESTRATOR: Environment variables ===")
+                print(f"KYUTAI_STT_URL: {os.environ.get('KYUTAI_STT_URL', 'NOT_SET')}")
+                print(f"KYUTAI_TTS_URL: {os.environ.get('KYUTAI_TTS_URL', 'NOT_SET')}")
+                print(f"KYUTAI_LLM_URL: {os.environ.get('KYUTAI_LLM_URL', 'NOT_SET')}")
+                print(f"KYUTAI_VOICE_CLONING_URL: {os.environ.get('KYUTAI_VOICE_CLONING_URL', 'NOT_SET')}")
+                print(f"KYUTAI_STT_PATH: {os.environ.get('KYUTAI_STT_PATH', 'NOT_SET')}")
+                print(f"KYUTAI_TTS_PATH: {os.environ.get('KYUTAI_TTS_PATH', 'NOT_SET')}")
+                print(f"KYUTAI_SERVICE_TIMEOUT_SEC: {os.environ.get('KYUTAI_SERVICE_TIMEOUT_SEC', 'NOT_SET')}")
+                print("=== ORCHESTRATOR: Environment variables end ===")
+                
                 emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
                 try:
                     async with handler:
+                        print("=== ORCHESTRATOR: Handler context entered, calling start_up ===")
                         await handler.start_up()
+                        print("=== ORCHESTRATOR: Handler start_up completed, creating task group ===")
                         async with asyncio.TaskGroup() as tg:
+                            print("=== ORCHESTRATOR: Creating receive_loop task ===")
                             tg.create_task(
                                 receive_loop(websocket, handler, emit_queue), name="receive_loop()"
                             )
+                            print("=== ORCHESTRATOR: Creating emit_loop task ===")
                             tg.create_task(
                                 emit_loop(websocket, handler, emit_queue), name="emit_loop()"
                             )
+                            print("=== ORCHESTRATOR: Creating quest_manager.wait task ===")
                             tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
+                            print("=== ORCHESTRATOR: Creating debug_running_tasks task ===")
                             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
+                            print("=== ORCHESTRATOR: All tasks created, task group running ===")
+                except Exception as handler_exc:
+                    print(f"=== ORCHESTRATOR: Exception in handler context: {handler_exc} ===")
+                    raise
                 finally:
+                    print("=== ORCHESTRATOR: Cleaning up handler ===")
                     await handler.cleanup()
-                    print("websocket_route() finished")
+                    print("=== ORCHESTRATOR: websocket_route() finished ===")
                     
             except Exception as exc:
+                print(f"=== ORCHESTRATOR: Exception in websocket_endpoint: {exc} ===")
+                import traceback
+                print(f"=== ORCHESTRATOR: Traceback: {traceback.format_exc()} ===")
                 await _report_websocket_exception(websocket, exc)
         
         return app

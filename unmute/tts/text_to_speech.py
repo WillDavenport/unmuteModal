@@ -204,7 +204,12 @@ class TextToSpeech(ServiceWithStartup):
             await self.websocket.send(msgpack.packb(message.model_dump()))
 
     async def start_up(self):
-        url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
+        # For Modal services, connect to /ws instead of /api/tts_streaming
+        if "modal.run" in self.tts_instance:
+            url = self.tts_instance + "/ws"
+        else:
+            url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
+            
         logger.info(f"Connecting to TTS: {url}")
         self.websocket = await asyncio.wait_for(
             websockets.connect(
@@ -229,16 +234,28 @@ class TextToSpeech(ServiceWithStartup):
             for _ in range(10):
                 # Due to some race condition in the TTS, we might get packets from a previous TTS client.
                 message_bytes = await self.websocket.recv(decode=False)
-                message_dict = msgpack.unpackb(message_bytes)
-                message = TTSMessageAdapter.validate_python(message_dict)
-                if isinstance(message, TTSReadyMessage):
-                    return
-                elif isinstance(message, TTSErrorMessage):
-                    raise MissingServiceAtCapacity("tts")
+                
+                # Handle different protocols for Modal vs local services
+                if "modal.run" in self.tts_instance:
+                    # For Modal services, expect raw moshi-server Ready message (bytes)
+                    # We don't need to parse it, just verify we got something
+                    if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
+                        return
+                    else:
+                        logger.warning(f"Received unexpected message type from Modal TTS service: {type(message_bytes)}")
+                        continue
                 else:
-                    logger.warning(
-                        f"Received unexpected message type from {self.tts_instance}, {message.type}"
-                    )
+                    # For local services, expect msgpack format
+                    message_dict = msgpack.unpackb(message_bytes)
+                    message = TTSMessageAdapter.validate_python(message_dict)
+                    if isinstance(message, TTSReadyMessage):
+                        return
+                    elif isinstance(message, TTSErrorMessage):
+                        raise MissingServiceAtCapacity("tts")
+                    else:
+                        logger.warning(
+                            f"Received unexpected message type from {self.tts_instance}, {message.type}"
+                        )
         except Exception as e:
             logger.error(f"Error during TTS startup: {repr(e)}")
             # Make sure we don't leave a dangling websocket connection

@@ -25,7 +25,6 @@ from unmute.kyutai_constants import (
     RECORDINGS_DIR,
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
-    get_service_discovery_timeout,
 )
 from unmute.llm.chatbot import Chatbot
 from unmute.llm.llm_utils import (
@@ -414,26 +413,37 @@ class UnmuteHandler(AsyncStreamHandler):
         await self.quest_manager.__aenter__()
 
     async def start_up(self):
+        print("=== UNMUTE_HANDLER: Starting up handler ===")
         await self.start_up_stt()
+        print("=== UNMUTE_HANDLER: STT startup completed ===")
         self.waiting_for_user_start_time = self.audio_received_sec()
+        print("=== UNMUTE_HANDLER: Handler startup completed ===")
 
     async def __aexit__(self, *exc: Any) -> None:
         return await self.quest_manager.__aexit__(*exc)
 
     async def start_up_stt(self):
+        print("=== UNMUTE_HANDLER: Starting STT initialization ===")
         async def _init() -> SpeechToText:
+            print("=== UNMUTE_HANDLER: Finding STT instance ===")
             # Use longer timeout for Modal services which can take time to cold start
-            return await find_instance("stt", SpeechToText, timeout_sec=get_service_discovery_timeout())
+            stt = await find_instance("stt", SpeechToText)
+            print("=== UNMUTE_HANDLER: STT instance found ===")
+            return stt
 
         async def _run(stt: SpeechToText):
+            print("=== UNMUTE_HANDLER: Starting STT loop ===")
             await self._stt_loop(stt)
 
         async def _close(stt: SpeechToText):
+            print("=== UNMUTE_HANDLER: Shutting down STT ===")
             await stt.shutdown()
 
         quest = await self.quest_manager.add(Quest("stt", _init, _run, _close))
+        print("=== UNMUTE_HANDLER: STT quest added, waiting for initialization ===")
         # We want to be sure to have the STT before starting anything.
         await quest.get()
+        print("=== UNMUTE_HANDLER: STT quest initialization completed ===")
 
     async def _stt_loop(self, stt: SpeechToText):
         try:
@@ -484,7 +494,7 @@ class UnmuteHandler(AsyncStreamHandler):
             for trial in range(trials):
                 try:
                     # Use longer timeout for Modal services which can take time to cold start
-                    tts = await find_instance("tts", factory, timeout_sec=get_service_discovery_timeout())
+                    tts = await find_instance("tts", factory)
                 except Exception:
                     if trial == trials - 1:
                         raise
