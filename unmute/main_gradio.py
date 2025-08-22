@@ -56,7 +56,7 @@ if __name__ == "__main__":
         additional_outputs=[gradio_chatbot, gradio_debug_textbox, gradio_debug_plot],
         additional_outputs_handler=update_outputs,
         # TODO: check if clients actually get disconnected
-        concurrency_limit=1,
+        max_containers=1,
     )
 
     # This variable needs to contain the Gradio UI for the autoreload to work:
