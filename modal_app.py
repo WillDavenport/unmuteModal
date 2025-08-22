@@ -467,6 +467,24 @@ class LLMService:
         def root():
             return {"service": "llm", "model": "gemma-3-1b-it", "status": "ready"}
         
+        @app.get("/v1/models")
+        def list_models():
+            """List available models endpoint for OpenAI client compatibility"""
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "google/gemma-3-1b-it",
+                        "object": "model",
+                        "created": 1640995200,
+                        "owned_by": "google",
+                        "permission": [],
+                        "root": "google/gemma-3-1b-it",
+                        "parent": None
+                    }
+                ]
+            }
+        
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
             await websocket.accept()
