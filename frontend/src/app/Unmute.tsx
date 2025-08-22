@@ -65,6 +65,7 @@ const Unmute = () => {
 
         clearTimeout(timeoutId);
         if (!response.ok) {
+          console.error("Backend server is not healthy", response);
           setHealthStatus({
             connected: "yes_request_fail",
             ok: false,

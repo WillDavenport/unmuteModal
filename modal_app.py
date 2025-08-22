@@ -48,34 +48,85 @@ base_deps_image = (
         
         # LLM and API dependencies
         "openai>=1.70.0",
+        "mistralai>=1.5.1",
     )
 )
 
-# STT image: use Python moshi package instead of Rust binary
+# STT image: build steps first, then local files
 stt_image = (
     base_deps_image
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl")
+    .run_commands(
+        # Install latest Rust toolchain to handle Cargo.lock version 4
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
+        ". ~/.cargo/env"
+    )
     .pip_install(
         "torch>=2.1.0",
         "torchaudio>=2.1.0",
-        # Use Python moshi package instead of compiling Rust binary
-        "moshi>=0.2.8",
-        "transformers>=4.35.0",
+    )
+    .run_commands(
+        # Set environment variables for building
+        "export CXXFLAGS='-include cstdint'",
+        # Set LD_LIBRARY_PATH for Python integration
+        "export LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')",
+        # Ensure Rust environment is available
+        ". ~/.cargo/env",
+        # Debug: Check OpenSSL installation
+        "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
+        "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
+        "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
+        # Clone moshi repo and try multiple approaches to build moshi-server
+        "git clone --depth 1 https://github.com/kyutai-labs/moshi.git /tmp/moshi",
+        # Build without CUDA features during image build (CUDA will be available at runtime)
+        # This avoids nvidia-smi dependency during build while still allowing GPU usage at runtime
+        "cd /tmp/moshi/rust && (rm -f Cargo.lock && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with CPU-compatible build') || echo 'Build approach 1 failed, trying approach 2'",
+        # Approach 2: If approach 1 failed, patch hf-hub dependency and try again
+        "cd /tmp/moshi/rust && (test -f /usr/local/bin/moshi-server || (rm -f Cargo.lock && sed -i 's/hf-hub = { version = \\\"0.4.3\\\", features = \\[\\\"tokio\\\"\\] }/hf-hub = { version = \\\"0.4.3\\\", features = [\\\"native-tls\\\"] }/' Cargo.toml && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with patched dependencies'))",
+        "rm -rf /tmp/moshi",
+        # Verify moshi-server was installed successfully
+        ". ~/.cargo/env && which moshi-server && moshi-server --version || echo 'moshi-server installation verification failed'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
-# TTS image: use Python moshi package instead of Rust binary
+# TTS image: build steps first, then local files
 tts_image = (
     base_deps_image
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl")
+    .run_commands(
+        # Install latest Rust toolchain to handle Cargo.lock version 4
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
+        ". ~/.cargo/env"
+    )
     .pip_install(
         "torch>=2.1.0",
         "torchaudio>=2.1.0",
         "huggingface_hub>=0.19.0",
-        # Use Python moshi package instead of compiling Rust binary
-        "moshi>=0.2.8",
-        "transformers>=4.35.0",
+    )
+    .run_commands(
+        # Set environment variables for building
+        "export CXXFLAGS='-include cstdint'",
+        # Set LD_LIBRARY_PATH for Python integration
+        "export LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')",
+        # Ensure Rust environment is available
+        ". ~/.cargo/env",
+        # Debug: Check OpenSSL installation
+        "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
+        "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
+        "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
+        # Clone moshi repo and try multiple approaches to build moshi-server
+        "git clone --depth 1 https://github.com/kyutai-labs/moshi.git /tmp/moshi",
+        # Build without CUDA features during image build (CUDA will be available at runtime)
+        # This avoids nvidia-smi dependency during build while still allowing GPU usage at runtime
+        "cd /tmp/moshi/rust && (rm -f Cargo.lock && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with CPU-compatible build') || echo 'Build approach 1 failed, trying approach 2'",
+        # Approach 2: If approach 1 failed, patch hf-hub dependency and try again
+        "cd /tmp/moshi/rust && (test -f /usr/local/bin/moshi-server || (rm -f Cargo.lock && sed -i 's/hf-hub = { version = \\\"0.4.3\\\", features = \\[\\\"tokio\\\"\\] }/hf-hub = { version = \\\"0.4.3\\\", features = [\\\"native-tls\\\"] }/' Cargo.toml && . ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && timeout 600 cargo build --release --bin moshi-server && cp target/release/moshi-server /usr/local/bin/ && echo 'Success with patched dependencies'))",
+        "rm -rf /tmp/moshi",
+        # Verify moshi-server was installed successfully
+        ". ~/.cargo/env && which moshi-server && moshi-server --version || echo 'moshi-server installation verification failed'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -86,7 +137,7 @@ tts_image = (
 llm_image = (
     base_deps_image
     .pip_install(
-        "vllm==0.9.1",
+        "vllm==0.8.5",
         "torch>=2.1.0",
         "transformers>=4.35.0",
     )
@@ -117,9 +168,8 @@ secrets = [
     image=stt_image,
     volumes={"/models": models_volume},
     secrets=secrets,
-    concurrency_limit=1,
-    keep_warm=0,
-    container_idle_timeout=1200,  # 20 minutes
+    min_containers=0,
+    scaledown_window=1200,  # 20 minutes
 )
 class STTService:
     """Speech-to-Text service using Moshi STT model"""
@@ -127,26 +177,81 @@ class STTService:
     @modal.enter()
     def load_model(self):
         """Load STT model weights once per container"""
+        import subprocess
+        import os
+        import tempfile
+        import time
+        
         print("Setting up STT Service...")
         
-        # Initialize the Python moshi STT model
-        try:
-            from moshi.models import loaders
-            import torch
-            
-            # Load the STT model using Python moshi package
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"Loading STT model on device: {device}")
-            
-            # Load the model - this will download if not cached
-            self.stt_model = loaders.get_stt_model("kyutai/stt-1b-en_fr", device=device)
-            
-            print("STT model loaded successfully")
-            
-        except Exception as e:
-            print(f"Error loading STT model: {e}")
-            print("STT service will use fallback simulation")
-            self.stt_model = None
+        # Create temporary config file for STT
+        config_content = '''
+static_dir = "./static/"
+log_dir = "/tmp/unmute_logs"
+instance_name = "stt"
+authorized_ids = ["public_token"]
+
+[modules.asr]
+path = "/api/asr-streaming"
+type = "BatchedAsr"
+lm_model_file = "hf://kyutai/stt-1b-en_fr-candle/model.safetensors"
+text_tokenizer_file = "hf://kyutai/stt-1b-en_fr-candle/tokenizer_en_fr_audio_8000.model"
+audio_tokenizer_file = "hf://kyutai/stt-1b-en_fr-candle/mimi-pytorch-e351c8d8@125.safetensors"
+asr_delay_in_tokens = 6
+batch_size = 1
+conditioning_learnt_padding = true
+temperature = 0.25
+
+[modules.asr.model]
+audio_vocab_size = 2049
+text_in_vocab_size = 8001
+text_out_vocab_size = 8000
+audio_codebooks = 20
+
+[modules.asr.model.transformer]
+d_model = 2048
+num_heads = 16
+num_layers = 16
+dim_feedforward = 8192
+causal = true
+norm_first = true
+bias_ff = false
+bias_attn = false
+context = 750
+max_period = 100000
+use_conv_block = false
+use_conv_bias = true
+gating = "silu"
+norm = "RmsNorm"
+positional_embedding = "Rope"
+conv_layout = false
+conv_kernel_size = 3
+kv_repeat = 1
+max_seq_len = 40960
+
+[modules.asr.model.extra_heads]
+num_heads = 4
+dim = 6
+'''
+        
+        os.makedirs("/tmp/unmute_logs", exist_ok=True)
+        os.makedirs("./static", exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(config_content)
+            self.config_path = f.name
+        
+        # Start moshi-server as a background process
+        self.proc = subprocess.Popen([
+            "moshi-server", "worker", 
+            "--config", self.config_path,
+            "--port", "8090"
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Wait a bit for the server to start
+        time.sleep(5)
+        
+        print("STT model loaded successfully")
     
     @modal.asgi_app()
     def web(self):
@@ -166,66 +271,39 @@ class STTService:
             print("STT WebSocket connection established")
             
             try:
-                import numpy as np
-                import json
-                import base64
-                
-                while True:
-                    # Receive audio data from client
-                    data = await websocket.receive_bytes()
-                    
-                    # Process audio with STT model
-                    if self.stt_model is not None:
+                # Connect to the local moshi server and proxy messages
+                import websockets
+                async with websockets.connect(
+                    "ws://localhost:8090/api/asr-streaming",
+                    extra_headers={"kyutai-api-key": "public_token"}
+                ) as moshi_ws:
+                    # Proxy messages between client and moshi server
+                    async def client_to_moshi():
                         try:
-                            # Convert bytes to audio array
-                            audio_array = np.frombuffer(data, dtype=np.float32)
-                            
-                            # Run STT inference (this is a simplified example)
-                            # In practice, you'd need to handle the specific moshi STT API
-                            transcription = await self._transcribe_audio(audio_array)
-                            
-                            # Send transcription result
-                            result = {
-                                "type": "Word",
-                                "text": transcription,
-                                "start_time": 0.0
-                            }
-                            await websocket.send_text(json.dumps(result))
-                            
+                            while True:
+                                data = await websocket.receive_bytes()
+                                await moshi_ws.send(data)
+                        except WebSocketDisconnect:
+                            pass
+                    
+                    async def moshi_to_client():
+                        try:
+                            async for message in moshi_ws:
+                                if isinstance(message, bytes):
+                                    await websocket.send_bytes(message)
+                                else:
+                                    await websocket.send_text(message)
                         except Exception as e:
-                            print(f"STT inference error: {e}")
-                            # Send empty result on error
-                            result = {"type": "Word", "text": "", "start_time": 0.0}
-                            await websocket.send_text(json.dumps(result))
-                    else:
-                        # Fallback simulation when model not available
-                        result = {
-                            "type": "Word", 
-                            "text": "Hello, this is simulated STT output",
-                            "start_time": 0.0
-                        }
-                        await websocket.send_text(json.dumps(result))
-                        
-            except WebSocketDisconnect:
-                print("STT WebSocket disconnected")
+                            print(f"STT moshi_to_client error: {e}")
+                    
+                    # Run both directions concurrently
+                    await asyncio.gather(
+                        client_to_moshi(),
+                        moshi_to_client(),
+                        return_exceptions=True
+                    )
             except Exception as e:
                 print(f"STT websocket error: {e}")
-        
-        async def _transcribe_audio(self, audio_array: np.ndarray) -> str:
-            """Transcribe audio using the loaded STT model"""
-            try:
-                # This is a placeholder - you'd implement the actual moshi STT inference here
-                # The exact API depends on how the moshi Python package exposes the STT model
-                if len(audio_array) > 0:
-                    return "Transcribed text from audio"  # Placeholder
-                else:
-                    return ""
-            except Exception as e:
-                print(f"Transcription error: {e}")
-                return ""
-        
-        # Attach the method to self for access
-        self._transcribe_audio = _transcribe_audio
         
         return app
 
@@ -235,9 +313,8 @@ class STTService:
     image=tts_image,
     volumes={"/models": models_volume},
     secrets=secrets,
-    concurrency_limit=1,
-    keep_warm=0,
-    container_idle_timeout=1200,  # 20 minutes
+    min_containers=0,
+    scaledown_window=600,  # 10 minutes
 )
 class TTSService:
     """Text-to-Speech service using Moshi TTS model"""
@@ -245,26 +322,55 @@ class TTSService:
     @modal.enter()
     def load_model(self):
         """Load TTS model weights once per container"""
+        import subprocess
+        import tempfile
+        import os
+        import time
+        
         print("Setting up TTS Service...")
         
-        # Initialize the Python moshi TTS model
-        try:
-            from moshi.models import loaders
-            import torch
+        # Create temporary config file for TTS
+        config_content = '''
+static_dir = "./static/"
+log_dir = "/tmp/unmute_logs"
+instance_name = "tts"
+authorized_ids = ["public_token"]
+
+[modules.tts_py]
+type = "Py"
+path = "/api/tts_streaming"
+text_tokenizer_file = "hf://kyutai/tts-1.6b-en_fr/tokenizer_spm_8k_en_fr_audio.model"
+batch_size = 2
+text_bos_token = 1
+
+[modules.tts_py.py]
+log_folder = "/tmp/unmute_logs"
+voice_folder = "hf-snapshot://kyutai/tts-voices/**/*.safetensors"
+default_voice = "unmute-prod-website/default_voice.wav"
+cfg_coef = 2.0
+cfg_is_no_text = true
+padding_between = 1
+n_q = 24
+'''
+        
+        os.makedirs("/tmp/unmute_logs", exist_ok=True)
+        os.makedirs("./static", exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(config_content)
+            self.config_path = f.name
+        
+        # Start moshi-server as a background process
+        self.proc = subprocess.Popen([
+            "moshi-server", "worker",
+            "--config", self.config_path, 
+            "--port", "8089"
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Wait a bit for the server to start
+        time.sleep(5)
             
-            # Load the TTS model using Python moshi package
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"Loading TTS model on device: {device}")
-            
-            # Load the model - this will download if not cached
-            self.tts_model = loaders.get_tts_model("kyutai/tts-1.6b-en_fr", device=device)
-            
-            print("TTS model loaded successfully")
-            
-        except Exception as e:
-            print(f"Error loading TTS model: {e}")
-            print("TTS service will use fallback simulation")
-            self.tts_model = None
+        print("TTS model loaded successfully")
     
     @modal.asgi_app()
     def web(self):
@@ -284,76 +390,39 @@ class TTSService:
             print("TTS WebSocket connection established")
             
             try:
-                import numpy as np
-                import json
-                
-                while True:
-                    # Receive text data from client
-                    message = await websocket.receive_text()
-                    data = json.loads(message)
-                    
-                    text = data.get("text", "")
-                    voice = data.get("voice", "default")
-                    
-                    # Process text with TTS model
-                    if self.tts_model is not None and text.strip():
+                # Connect to the local moshi server and proxy messages
+                import websockets
+                async with websockets.connect(
+                    "ws://localhost:8089/api/tts_streaming",
+                    extra_headers={"kyutai-api-key": "public_token"}
+                ) as moshi_ws:
+                    # Proxy messages between client and moshi server
+                    async def client_to_moshi():
                         try:
-                            # Run TTS inference
-                            audio_bytes = await self._synthesize_speech(text, voice)
-                            
-                            # Send audio data
-                            await websocket.send_bytes(audio_bytes)
-                            
+                            while True:
+                                data = await websocket.receive_bytes()
+                                await moshi_ws.send(data)
+                        except WebSocketDisconnect:
+                            pass
+                    
+                    async def moshi_to_client():
+                        try:
+                            async for message in moshi_ws:
+                                if isinstance(message, bytes):
+                                    await websocket.send_bytes(message)
+                                else:
+                                    await websocket.send_text(message)
                         except Exception as e:
-                            print(f"TTS inference error: {e}")
-                            # Send empty audio on error
-                            await websocket.send_bytes(b"")
-                    else:
-                        # Fallback simulation when model not available
-                        # Generate simple sine wave audio as placeholder
-                        sample_rate = 24000
-                        duration = max(len(text) * 0.1, 1.0)
-                        samples = int(duration * sample_rate)
-                        
-                        t = np.linspace(0, duration, samples, dtype=np.float32)
-                        frequency = 440
-                        amplitude = 0.1
-                        audio_array = amplitude * np.sin(2 * np.pi * frequency * t)
-                        
-                        audio_bytes = audio_array.astype(np.float32).tobytes()
-                        await websocket.send_bytes(audio_bytes)
-                        
-            except WebSocketDisconnect:
-                print("TTS WebSocket disconnected")
+                            print(f"TTS moshi_to_client error: {e}")
+                    
+                    # Run both directions concurrently
+                    await asyncio.gather(
+                        client_to_moshi(),
+                        moshi_to_client(),
+                        return_exceptions=True
+                    )
             except Exception as e:
                 print(f"TTS websocket error: {e}")
-        
-        async def _synthesize_speech(self, text: str, voice: str = "default") -> bytes:
-            """Synthesize speech using the loaded TTS model"""
-            try:
-                # This is a placeholder - you'd implement the actual moshi TTS inference here
-                # The exact API depends on how the moshi Python package exposes the TTS model
-                import numpy as np
-                
-                # Generate simple audio as placeholder
-                sample_rate = 24000
-                duration = max(len(text) * 0.1, 1.0)
-                samples = int(duration * sample_rate)
-                
-                # Simple sine wave based on text length
-                t = np.linspace(0, duration, samples, dtype=np.float32)
-                frequency = 440 + (len(text) % 200)  # Vary frequency based on text
-                amplitude = 0.1
-                audio_array = amplitude * np.sin(2 * np.pi * frequency * t)
-                
-                return audio_array.astype(np.float32).tobytes()
-                
-            except Exception as e:
-                print(f"Speech synthesis error: {e}")
-                return b""
-        
-        # Attach the method to self for access
-        self._synthesize_speech = _synthesize_speech
         
         return app
 
@@ -363,9 +432,8 @@ class TTSService:
     image=llm_image,
     volumes={"/models": models_volume},
     secrets=secrets,
-    concurrency_limit=1,
-    keep_warm=0,
-    container_idle_timeout=1200,  # 20 minutes
+    min_containers=0,
+    scaledown_window=600,  # 10 minutes
 )
 class LLMService:
     """Large Language Model service using VLLM"""
@@ -459,8 +527,8 @@ class LLMService:
     cpu=2,
     image=orchestrator_image,
     secrets=secrets,
-    keep_warm=0,
-    container_idle_timeout=1200,  # 20 minutes
+    min_containers=0,
+    scaledown_window=1200,  # 20 minutes
 )
 class OrchestratorService:
     """Orchestrator service that coordinates between STT, LLM, and TTS"""
@@ -473,10 +541,17 @@ class OrchestratorService:
         print("Setting up Orchestrator Service...")
         
         # Set environment variables to point to Modal services
-        # These will be updated based on actual Modal deployment URLs
-        os.environ["KYUTAI_STT_URL"] = "wss://your-username--voice-stack-sttservice-web.modal.run"
-        os.environ["KYUTAI_TTS_URL"] = "wss://your-username--voice-stack-ttsservice-web.modal.run"
-        os.environ["KYUTAI_LLM_URL"] = "https://your-username--voice-stack-llmservice-web.modal.run"
+        # Use the actual Modal deployment URLs based on the app name and service classes
+        base_url = "willdavenport--voice-stack"
+        os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web.modal.run"
+        os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web.modal.run"
+        os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web.modal.run"
+        # Voice cloning is not available in Modal deployment
+        os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
+        
+        print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")
+        print(f"Orchestrator setup complete - TTS: {os.environ['KYUTAI_TTS_URL']}")
+        print(f"Orchestrator setup complete - LLM: {os.environ['KYUTAI_LLM_URL']}")
         
         print("Orchestrator setup complete")
     
@@ -508,7 +583,15 @@ class OrchestratorService:
                 "services": ["stt", "llm", "tts"]
             }
         
-        @app.websocket("/ws")
+        @app.get("/v1/health")
+        async def get_health():
+            """Health check endpoint that mimics the original backend"""
+            # Import the health check logic from main_websocket
+            from unmute.main_websocket import _get_health
+            health = await _get_health(None)
+            return health
+        
+        @app.websocket("/v1/realtime")
         async def websocket_endpoint(websocket: WebSocket):
             """Main client WebSocket endpoint using the existing unmute handler"""
             await websocket.accept()
@@ -524,7 +607,6 @@ class OrchestratorService:
                 # Create handler instance
                 handler = UnmuteHandler()
                 emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
-                opus_reader = OpusReader()
                 
                 # Start the handler
                 async with handler:
@@ -533,7 +615,7 @@ class OrchestratorService:
                     
                     # Run the main loops
                     await asyncio.gather(
-                        receive_loop(websocket, handler, emit_queue, opus_reader),
+                        receive_loop(websocket, handler, emit_queue),
                         emit_loop(websocket, handler, emit_queue),
                         return_exceptions=True
                     )

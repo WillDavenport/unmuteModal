@@ -147,26 +147,43 @@ async def _get_health(
     _none: None,
 ):  # dummy param _none because caching function expects a single param as cache key.
     async with asyncio.TaskGroup() as tg:
+        # For Modal deployment, check root endpoints instead of specific API paths
+        # This allows the health check to work with both local Moshi servers and Modal services
+        tts_endpoint = _ws_to_http(TTS_SERVER)
+        if "modal.run" in tts_endpoint:
+            tts_endpoint += "/"  # Modal services use root endpoint
+        else:
+            tts_endpoint += "/api/build_info"  # Local Moshi servers
+        
+        stt_endpoint = _ws_to_http(STT_SERVER)
+        if "modal.run" in stt_endpoint:
+            stt_endpoint += "/"  # Modal services use root endpoint
+        else:
+            stt_endpoint += "/api/build_info"  # Local Moshi servers
+        
+        llm_endpoint = LLM_SERVER
+        if "modal.run" in llm_endpoint:
+            llm_endpoint += "/"  # Modal services use root endpoint
+        else:
+            llm_endpoint += "/v1/models"  # Local VLLM servers
+        
+        voice_cloning_endpoint = _ws_to_http(VOICE_CLONING_SERVER)
+        if "modal.run" in voice_cloning_endpoint:
+            voice_cloning_endpoint += "/"  # Modal services use root endpoint
+        else:
+            voice_cloning_endpoint += "/api/build_info"  # Local Moshi servers
+        
         tts_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(TTS_SERVER) + "/api/build_info"
-            )
+            asyncio.to_thread(_check_server_status, tts_endpoint)
         )
         stt_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(STT_SERVER) + "/api/build_info"
-            )
+            asyncio.to_thread(_check_server_status, stt_endpoint)
         )
         llm_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(LLM_SERVER) + "/v1/models"
-            )
+            asyncio.to_thread(_check_server_status, llm_endpoint)
         )
         voice_cloning_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status,
-                _ws_to_http(VOICE_CLONING_SERVER) + "/api/build_info",
-            )
+            asyncio.to_thread(_check_server_status, voice_cloning_endpoint)
         )
         tts_up_res = await tts_up
         stt_up_res = await stt_up
