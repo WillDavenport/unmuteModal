@@ -17,6 +17,9 @@ This reduces initial TTS startup time significantly while maintaining voice vari
 """
 
 import modal
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Modal app definition
 app = modal.App("voice-stack")
@@ -241,6 +244,8 @@ class STTService:
         env = os.environ.copy()
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
+        # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
+        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
         
         # First, verify moshi-server binary is available
         print("Checking moshi-server availability...")
@@ -546,6 +551,8 @@ class TTSService:
         env = os.environ.copy()
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
+        # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
+        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
         
         # Check if HuggingFace token is available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -1172,13 +1179,13 @@ class OrchestratorService:
         @app.websocket("/v1/realtime")
         async def websocket_endpoint(websocket: WebSocket):
             """Main client WebSocket endpoint using the existing unmute handler"""
-            print("=== ORCHESTRATOR: WebSocket connection attempt started ===")
+            logger.debug("WebSocket connection attempt started")
             try:
                 # Accept with the correct subprotocol
                 await websocket.accept(subprotocol="realtime")
-                print("=== ORCHESTRATOR: WebSocket connection accepted with realtime subprotocol ===")
+                logger.info("WebSocket connection accepted with realtime subprotocol")
             except Exception as e:
-                print(f"=== ORCHESTRATOR: Failed to accept WebSocket connection: {e} ===")
+                logger.error(f"Failed to accept WebSocket connection: {e}")
                 return
             
             # Import the complete websocket handling logic
@@ -1188,11 +1195,11 @@ class OrchestratorService:
             from fastapi import status
             
             try:
-                print("=== ORCHESTRATOR: Creating handler instance ===")
+                logger.debug("Creating handler instance")
                 # Create handler instance
                 handler = UnmuteHandler()
                 
-                print("=== ORCHESTRATOR: Checking health status ===")
+                logger.debug("Checking health status")
                 # Check health first
                 health = await _get_health(None)
                 print(f"=== ORCHESTRATOR: Health check result: {health} ===")
@@ -1208,36 +1215,24 @@ class OrchestratorService:
                 
                 # Log current environment variables for debugging
                 import os
-                print(f"=== ORCHESTRATOR: Environment variables ===")
-                print(f"KYUTAI_STT_URL: {os.environ.get('KYUTAI_STT_URL', 'NOT_SET')}")
-                print(f"KYUTAI_TTS_URL: {os.environ.get('KYUTAI_TTS_URL', 'NOT_SET')}")
-                print(f"KYUTAI_LLM_URL: {os.environ.get('KYUTAI_LLM_URL', 'NOT_SET')}")
-                print(f"KYUTAI_VOICE_CLONING_URL: {os.environ.get('KYUTAI_VOICE_CLONING_URL', 'NOT_SET')}")
-                print(f"KYUTAI_STT_PATH: {os.environ.get('KYUTAI_STT_PATH', 'NOT_SET')}")
-                print(f"KYUTAI_TTS_PATH: {os.environ.get('KYUTAI_TTS_PATH', 'NOT_SET')}")
-                print(f"KYUTAI_SERVICE_TIMEOUT_SEC: {os.environ.get('KYUTAI_SERVICE_TIMEOUT_SEC', 'NOT_SET')}")
-                print("=== ORCHESTRATOR: Environment variables end ===")
+                logger.debug(f"Environment variables: STT_URL={os.environ.get('KYUTAI_STT_URL', 'NOT_SET')}, TTS_URL={os.environ.get('KYUTAI_TTS_URL', 'NOT_SET')}, LLM_URL={os.environ.get('KYUTAI_LLM_URL', 'NOT_SET')}")
                 
                 emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
                 try:
                     async with handler:
-                        print("=== ORCHESTRATOR: Handler context entered, calling start_up ===")
+                        logger.debug("Handler context entered, calling start_up")
                         await handler.start_up()
-                        print("=== ORCHESTRATOR: Handler start_up completed, creating task group ===")
+                        logger.debug("Handler start_up completed, creating task group")
                         async with asyncio.TaskGroup() as tg:
-                            print("=== ORCHESTRATOR: Creating receive_loop task ===")
                             tg.create_task(
                                 receive_loop(websocket, handler, emit_queue), name="receive_loop()"
                             )
-                            print("=== ORCHESTRATOR: Creating emit_loop task ===")
                             tg.create_task(
                                 emit_loop(websocket, handler, emit_queue), name="emit_loop()"
                             )
-                            print("=== ORCHESTRATOR: Creating quest_manager.wait task ===")
                             tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
-                            print("=== ORCHESTRATOR: Creating debug_running_tasks task ===")
                             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
-                            print("=== ORCHESTRATOR: All tasks created, task group running ===")
+                            logger.debug("All tasks created, task group running")
                 except Exception as handler_exc:
                     print(f"=== ORCHESTRATOR: Exception in handler context: {handler_exc} ===")
                     raise

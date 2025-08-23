@@ -202,21 +202,19 @@ class TextToSpeech(ServiceWithStartup):
                 self.time_since_first_text_sent.start_if_not_started()
 
             await self.websocket.send(msgpack.packb(message.model_dump()))
+        
 
     async def start_up(self):
         # For Modal services, connect to /ws instead of /api/tts_streaming
         if "modal.run" in self.tts_instance:
-            url = self.tts_instance + "/ws"
+            url = self.tts_instance + "/ws" + self.query.to_url_params()
         else:
             url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
             
         logger.info(f"Connecting to TTS: {url}")
-        self.websocket = await asyncio.wait_for(
-            websockets.connect(
-                url,
-                additional_headers=HEADERS,
-            ),
-            timeout=60.0  # Allow 60 seconds for cold start
+        self.websocket = await websockets.connect(
+            url,
+            additional_headers=HEADERS,
         )
         logger.debug("Connected to TTS")
 
@@ -234,28 +232,16 @@ class TextToSpeech(ServiceWithStartup):
             for _ in range(10):
                 # Due to some race condition in the TTS, we might get packets from a previous TTS client.
                 message_bytes = await self.websocket.recv(decode=False)
-                
-                # Handle different protocols for Modal vs local services
-                if "modal.run" in self.tts_instance:
-                    # For Modal services, expect raw moshi-server Ready message (bytes)
-                    # We don't need to parse it, just verify we got something
-                    if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
-                        return
-                    else:
-                        logger.warning(f"Received unexpected message type from Modal TTS service: {type(message_bytes)}")
-                        continue
+                message_dict = msgpack.unpackb(message_bytes)
+                message = TTSMessageAdapter.validate_python(message_dict)
+                if isinstance(message, TTSReadyMessage):
+                    return
+                elif isinstance(message, TTSErrorMessage):
+                    raise MissingServiceAtCapacity("tts")
                 else:
-                    # For local services, expect msgpack format
-                    message_dict = msgpack.unpackb(message_bytes)
-                    message = TTSMessageAdapter.validate_python(message_dict)
-                    if isinstance(message, TTSReadyMessage):
-                        return
-                    elif isinstance(message, TTSErrorMessage):
-                        raise MissingServiceAtCapacity("tts")
-                    else:
-                        logger.warning(
-                            f"Received unexpected message type from {self.tts_instance}, {message.type}"
-                        )
+                    logger.warning(
+                        f"Received unexpected message type from {self.tts_instance}, {message.type}"
+                    )
         except Exception as e:
             logger.error(f"Error during TTS startup: {repr(e)}")
             # Make sure we don't leave a dangling websocket connection
@@ -296,14 +282,14 @@ class TextToSpeech(ServiceWithStartup):
             async for message_bytes in self.websocket:
                 # Handle different protocols for Modal vs local services
                 if "modal.run" in self.tts_instance:
-                    # For Modal services, we might get raw moshi-server protocol messages
-                    # Try to parse as msgpack first, but handle raw bytes gracefully
+                    # For Modal services, we get raw moshi-server protocol messages
+                    # Try to parse as msgpack first for text messages, but skip raw audio bytes
                     try:
                         message_dict = msgpack.unpackb(cast(Any, message_bytes))
                         message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
-                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError) as e:
-                        # Skip messages that can't be unpacked as msgpack (likely raw audio data)
-                        logger.debug(f"Skipping non-msgpack message from Modal service: {len(message_bytes)} bytes, error: {e}")
+                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError):
+                        # Raw bytes from moshi-server are PCM audio data that we should skip
+                        # The original working version skipped these and it worked fine
                         continue
                 else:
                     # For local services, expect msgpack format

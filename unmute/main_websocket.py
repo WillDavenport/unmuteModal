@@ -526,7 +526,7 @@ async def emit_loop(
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Send messages to the WebSocket."""
-    print("=== EMIT_LOOP: Starting emit loop ===")
+    logger.debug("Starting emit loop")
     emit_debug_logger = EmitDebugLogger()
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
@@ -537,13 +537,13 @@ async def emit_loop(
             websocket.application_state == WebSocketState.DISCONNECTED
             or websocket.client_state == WebSocketState.DISCONNECTED
         ):
-            print(f"=== EMIT_LOOP: WebSocket disconnected (states: app={websocket.application_state}, client={websocket.client_state}) ===")
+            logger.debug(f"WebSocket disconnected (states: app={websocket.application_state}, client={websocket.client_state})")
             logger.info("emit_loop() stopped because WebSocket disconnected")
             raise WebSocketClosedError()
 
         try:
             to_emit = emit_queue.get_nowait()
-            print(f"=== EMIT_LOOP: Got queued message: {to_emit.type} ===")
+            logger.debug(f"Got queued message: {to_emit.type}")
         except asyncio.QueueEmpty:
             emitted_by_handler = await handler.emit()
 
@@ -585,24 +585,24 @@ async def emit_loop(
 
         try:
             emit_count += 1
-            print(f"=== EMIT_LOOP: Sending message #{emit_count}: {to_emit.type} ===")
+            logger.debug(f"Sending message #{emit_count}: {to_emit.type}")
             await websocket.send_text(to_emit.model_dump_json())
-            print(f"=== EMIT_LOOP: Successfully sent message #{emit_count} ===")
+            logger.debug(f"Successfully sent message #{emit_count}")
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):
                     # This is expected when the client disconnects
                     message = f"emit_loop() stopped because WebSocket disconnected: {e}"
-                    print(f"=== EMIT_LOOP: {message} ===")
+                    logger.debug(f"{message}")
                 else:
-                    print(f"=== EMIT_LOOP: Unexpected RuntimeError: {e} ===")
+                    logger.error(f"Unexpected RuntimeError: {e}")
                     raise
             else:
                 message = (
                     "emit_loop() stopped because WebSocket disconnected: "
                     f"{e.code=} {e.reason=}"
                 )
-                print(f"=== EMIT_LOOP: {message} ===")
+                logger.debug(f"{message}")
 
             logger.info(message)
             raise WebSocketClosedError() from e

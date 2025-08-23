@@ -175,14 +175,20 @@ class UnmuteHandler(AsyncStreamHandler):
         return is_new_message
 
     async def _generate_response(self):
+        logger.info("=== Starting response generation ===")
         # Empty message to signal we've started responding.
         # Do it here in the lock to avoid race conditions
         await self.add_chat_message_delta("", "assistant")
+        logger.info("Added empty assistant message to chat history")
         quest = Quest.from_run_step("llm", self._generate_response_task)
+        logger.info("Created LLM quest, adding to quest manager")
         await self.quest_manager.add(quest)
+        logger.info("=== Response generation quest added ===")
 
     async def _generate_response_task(self):
+        logger.info("=== Starting response generation task ===")
         generating_message_i = len(self.chatbot.chat_history)
+        logger.info(f"Generating message index: {generating_message_i}")
 
         await self.output_queue.put(
             ora.ResponseCreated(
@@ -193,10 +199,13 @@ class UnmuteHandler(AsyncStreamHandler):
                 )
             )
         )
+        logger.info("Sent ResponseCreated event to output queue")
 
         llm_stopwatch = Stopwatch()
 
+        logger.info("=== Starting TTS startup ===")
         quest = await self.start_up_tts(generating_message_i)
+        logger.info("=== TTS startup completed ===")
         llm = VLLMStream(
             # if generating_message_i is 2, then we have a system prompt + an empty
             # assistant message signalling that we are generating a response.
@@ -207,6 +216,7 @@ class UnmuteHandler(AsyncStreamHandler):
         )
 
         messages = self.chatbot.preprocessed_messages()
+        logger.info(f"Preprocessed {len(messages)} messages for LLM")
 
         self.tts_output_stopwatch = Stopwatch(autostart=False)
         tts = None
@@ -217,11 +227,13 @@ class UnmuteHandler(AsyncStreamHandler):
         num_words_sent = sum(
             len(message.get("content", "").split()) for message in messages
         )
+        logger.info(f"Sending {num_words_sent} words to LLM")
         mt.VLLM_SENT_WORDS.inc(num_words_sent)
         mt.VLLM_REQUEST_LENGTH.observe(num_words_sent)
         mt.VLLM_ACTIVE_SESSIONS.inc()
 
         try:
+            logger.info("=== Starting LLM chat completion stream ===")
             async for delta in rechunk_to_words(llm.chat_completion(messages)):
                 await self.output_queue.put(
                     ora.UnmuteResponseTextDeltaReady(delta=delta)
@@ -238,25 +250,35 @@ class UnmuteHandler(AsyncStreamHandler):
 
                 self.tts_output_stopwatch.start_if_not_started()
                 try:
+                    logger.info("=== Getting TTS instance from quest ===")
                     tts = await quest.get()
-                except Exception:
+                    logger.info("=== Got TTS instance successfully ===")
+                except Exception as e:
+                    logger.error(f"=== Failed to get TTS instance: {e} ===")
                     error_from_tts = True
                     raise
 
                 if len(self.chatbot.chat_history) > generating_message_i:
+                    logger.info("=== Response interrupted, breaking ===")
                     break  # We've been interrupted
 
                 assert isinstance(delta, str)  # make Pyright happy
+                logger.info(f"=== Sending word to TTS: '{delta}' ===")
                 await tts.send(delta)
+                logger.info(f"=== Successfully sent word to TTS ===")
 
             await self.output_queue.put(
                 # The words include the whitespace, so no need to add it here
                 ora.ResponseTextDone(text="".join(response_words))
             )
 
+            logger.info(f"=== LLM stream completed with {len(response_words)} words ===")
             if tts is not None:
-                logger.info("Sending TTS EOS.")
+                logger.info("=== Sending TTS EOS ===")
                 await tts.send(TTSClientEosMessage())
+                logger.info("=== TTS EOS sent successfully ===")
+            else:
+                logger.warning("=== TTS is None, cannot send EOS ===")
         except asyncio.CancelledError:
             mt.VLLM_INTERRUPTS.inc()
             raise
@@ -481,22 +503,30 @@ class UnmuteHandler(AsyncStreamHandler):
 
     async def start_up_tts(self, generating_message_i: int) -> Quest[TextToSpeech]:
         async def _init() -> TextToSpeech:
+            logger.info("=== TTS _init() starting ===")
             factory = partial(
                 TextToSpeech,
                 recorder=self.recorder,
                 get_time=self.audio_received_sec,
                 voice=self.tts_voice,
             )
+            logger.info(f"Created TTS factory with voice: {self.tts_voice}")
             sleep_time = 0.05
             sleep_growth = 1.5
             max_sleep = 1.0
             trials = 5
             for trial in range(trials):
+                logger.info(f"=== TTS connection attempt {trial + 1}/{trials} ===")
                 try:
                     # Use longer timeout for Modal services which can take time to cold start
+                    logger.info("Calling find_instance for TTS...")
                     tts = await find_instance("tts", factory)
-                except Exception:
+                    logger.info("=== TTS instance found successfully ===")
+                    return tts
+                except Exception as e:
+                    logger.error(f"=== TTS connection attempt {trial + 1} failed: {e} ===")
                     if trial == trials - 1:
+                        logger.error("=== All TTS connection attempts failed ===")
                         raise
                     logger.warning("Will sleep for %.4f sec", sleep_time)
                     await asyncio.sleep(sleep_time)
@@ -506,26 +536,36 @@ class UnmuteHandler(AsyncStreamHandler):
                         message="Looking for the resources, expect some latency.",
                     )
                     await self.output_queue.put(error)
-                else:
-                    return tts
             raise AssertionError("Too many unexpected packets.")
 
         async def _run(tts: TextToSpeech):
+            logger.info("=== Starting TTS _run loop ===")
             await self._tts_loop(tts, generating_message_i)
+            logger.info("=== TTS _run loop completed ===")
 
         async def _close(tts: TextToSpeech):
+            logger.info("=== TTS _close() starting ===")
             await tts.shutdown()
+            logger.info("=== TTS _close() completed ===")
 
-        return await self.quest_manager.add(Quest("tts", _init, _run, _close))
+        logger.info("=== Adding TTS quest to quest manager ===")
+        quest = await self.quest_manager.add(Quest("tts", _init, _run, _close))
+        logger.info("=== TTS quest added successfully ===")
+        return quest
 
     async def _tts_loop(self, tts: TextToSpeech, generating_message_i: int):
+        logger.info("=== TTS loop starting ===")
         # On interruption, we swap the output queue. This will ensure that this worker
         # can never accidentally push to the new queue if it's interrupted.
         output_queue = self.output_queue
         try:
             audio_started = None
+            message_count = 0
 
+            logger.info("=== Starting to iterate over TTS messages ===")
             async for message in tts:
+                message_count += 1
+                logger.info(f"=== Received TTS message #{message_count}: {type(message).__name__} ===")
                 if audio_started is not None:
                     time_since_start = self.audio_received_sec() - audio_started
                     time_received = tts.received_samples / self.input_sample_rate
@@ -546,6 +586,7 @@ class UnmuteHandler(AsyncStreamHandler):
                     break
 
                 if isinstance(message, TTSAudioMessage):
+                    logger.info(f"=== Processing TTSAudioMessage with {len(message.pcm)} samples ===")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
@@ -553,11 +594,14 @@ class UnmuteHandler(AsyncStreamHandler):
                     audio = np.array(message.pcm, dtype=np.float32)
                     assert self.output_sample_rate == SAMPLE_RATE
 
+                    logger.info("=== Putting audio in output queue ===")
                     await output_queue.put((SAMPLE_RATE, audio))
 
                     if audio_started is None:
                         audio_started = self.audio_received_sec()
+                        logger.info("=== First audio message received ===")
                 elif isinstance(message, TTSTextMessage):
+                    logger.info(f"=== Processing TTSTextMessage: '{message.text}' ===")
                     await output_queue.put(ora.ResponseTextDelta(delta=message.text))
                     await self.add_chat_message_delta(
                         message.text,
@@ -570,8 +614,10 @@ class UnmuteHandler(AsyncStreamHandler):
         except websockets.ConnectionClosedError as e:
             logger.error(f"TTS connection closed with an error: {e}")
 
+        logger.info("=== TTS loop ended, cleaning up ===")
         # Push some silence to flush the Opus state.
         # Not sure that this is actually needed.
+        logger.info("=== Pushing silence to flush Opus state ===")
         await output_queue.put(
             (SAMPLE_RATE, np.zeros(SAMPLES_PER_FRAME, dtype=np.float32))
         )
@@ -583,15 +629,18 @@ class UnmuteHandler(AsyncStreamHandler):
 
         # It's convenient to have the whole chat history available in the client
         # after the response is done, so send the "gradio update"
+        logger.info("=== Sending final gradio update and ResponseAudioDone ===")
         await self.output_queue.put(self.get_gradio_update())
         await self.output_queue.put(ora.ResponseAudioDone())
 
         # Signal that the turn is over by adding an empty message.
+        logger.info("=== Adding empty user message to signal turn end ===")
         await self.add_chat_message_delta("", "user")
 
         await asyncio.sleep(1)
         await self.check_for_bot_goodbye()
         self.waiting_for_user_start_time = self.audio_received_sec()
+        logger.info("=== TTS loop cleanup completed ===")
 
     async def interrupt_bot(self):
         if self.chatbot.conversation_state() != "bot_speaking":
