@@ -173,15 +173,36 @@ tts_image = (
         # Create cache directories
         "mkdir -p /root/.cache/huggingface/hub",
         "mkdir -p /root/.cache/huggingface/xet",
+        "mkdir -p /root/tts-voices-cache",
         # Download essential TTS tokenizer (required for TTS to work)
         "python -c \"from huggingface_hub import hf_hub_download; hf_hub_download('kyutai/tts-1.6b-en_fr', 'tokenizer_spm_8k_en_fr_audio.model', cache_dir='/root/.cache/huggingface/hub')\"",
-        # Note: Default voice will be downloaded on-demand at runtime to avoid rate limiting during build
+        # Pre-download essential voices to avoid downloading 446 files on each startup
+        "echo 'Pre-downloading essential TTS voices...'",
+        # Download just the essential voices used by unmute instead of all 446 files
+        "python -c \"",
+        "import os",
+        "from huggingface_hub import snapshot_download",
+        "try:",
+        "    # Download only the unmute-prod-website voices (much smaller subset)",
+        "    snapshot_download(",
+        "        'kyutai/tts-voices',",
+        "        cache_dir='/root/.cache/huggingface/hub',",
+        "        local_dir='/root/tts-voices-cache',",
+        "        allow_patterns=['unmute-prod-website/*.safetensors', 'unmute-prod-website/*.wav']",
+        "    )",
+        "    print('Essential voices downloaded successfully')",
+        "except Exception as e:",
+        "    print(f'Voice download failed: {e}')",
+        "    # Create minimal structure so moshi-server doesn't crash",
+        "    os.makedirs('/root/tts-voices-cache/unmute-prod-website', exist_ok=True)",
+        "\"",
         # Verify essential models were downloaded
         "echo 'Verifying downloaded models...'",
         "ls -la /root/.cache/huggingface/hub/ | head -10",
-        "find /root/.cache/huggingface/hub -name '*.safetensors' | wc -l",
+        "ls -la /root/tts-voices-cache/ | head -10",
         "find /root/.cache/huggingface/hub -name 'tokenizer_spm_8k_en_fr_audio.model' | head -5 || echo 'Tokenizer not found in expected location'",
-        "echo 'TTS model pre-download completed. Additional voices will be downloaded on-demand at runtime.'"
+        "find /root/tts-voices-cache -name '*.safetensors' | wc -l",
+        "echo 'TTS model pre-download completed. Essential voices cached locally.'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -211,6 +232,7 @@ orchestrator_image = (
 
 # Modal volumes for model storage
 models_volume = modal.Volume.from_name("voice-models")
+tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 
 # Modal secrets for API keys and auth tokens
 secrets = [
@@ -528,7 +550,7 @@ dim = 6
 @app.cls(
     gpu="L4", 
     image=tts_image,
-    volumes={"/models": models_volume},
+    volumes={"/models": models_volume, "/persistent-voices": tts_voices_volume},
     secrets=secrets,
     min_containers=0,
     scaledown_window=300,  # 5 minutes
@@ -585,6 +607,26 @@ class TTSService:
         except Exception as e:
             print(f"Rust not available: {e}")
         
+        # Set up persistent voice storage
+        print("Setting up persistent voice storage...")
+        persistent_voices_dir = "/persistent-voices"
+        os.makedirs(persistent_voices_dir, exist_ok=True)
+        
+        # Check if voices already exist in persistent storage
+        voices_exist = os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") and len(os.listdir(f"{persistent_voices_dir}/unmute-prod-website")) > 0 if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else False
+        
+        if not voices_exist:
+            print("Copying voices from image cache to persistent storage...")
+            # Copy voices from image cache to persistent volume
+            if os.path.exists("/root/tts-voices-cache"):
+                subprocess.run(["cp", "-r", "/root/tts-voices-cache/.", persistent_voices_dir], check=False)
+                print("Voices copied to persistent storage")
+            else:
+                print("No voices found in image cache, creating directory structure")
+                os.makedirs(f"{persistent_voices_dir}/unmute-prod-website", exist_ok=True)
+        else:
+            print("Voices already exist in persistent storage, skipping copy")
+        
         # Create temporary config file for TTS
         config_content = '''
 static_dir = "./static/"
@@ -601,7 +643,8 @@ text_bos_token = 1
 
 [modules.tts_py.py]
 log_folder = "/tmp/unmute_logs"
-voice_folder = "hf-snapshot://kyutai/tts-voices/**/*.safetensors"
+# Use persistent volume for voices to avoid re-downloading on each container restart
+voice_folder = "/persistent-voices/**/*.safetensors"
 default_voice = "unmute-prod-website/default_voice.wav"
 cfg_coef = 2.0
 cfg_is_no_text = true
