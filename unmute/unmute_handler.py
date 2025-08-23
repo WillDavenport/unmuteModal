@@ -511,32 +511,22 @@ class UnmuteHandler(AsyncStreamHandler):
                 voice=self.tts_voice,
             )
             logger.info(f"Created TTS factory with voice: {self.tts_voice}")
-            sleep_time = 0.05
-            sleep_growth = 1.5
-            max_sleep = 1.0
-            trials = 5
-            for trial in range(trials):
-                logger.info(f"=== TTS connection attempt {trial + 1}/{trials} ===")
-                try:
-                    # Use longer timeout for Modal services which can take time to cold start
-                    logger.info("Calling find_instance for TTS...")
-                    tts = await find_instance("tts", factory)
-                    logger.info("=== TTS instance found successfully ===")
-                    return tts
-                except Exception as e:
-                    logger.error(f"=== TTS connection attempt {trial + 1} failed: {e} ===")
-                    if trial == trials - 1:
-                        logger.error("=== All TTS connection attempts failed ===")
-                        raise
-                    logger.warning("Will sleep for %.4f sec", sleep_time)
-                    await asyncio.sleep(sleep_time)
-                    sleep_time = min(max_sleep, sleep_time * sleep_growth)
-                    error = make_ora_error(
-                        type="warning",
-                        message="Looking for the resources, expect some latency.",
-                    )
-                    await self.output_queue.put(error)
-            raise AssertionError("Too many unexpected packets.")
+            
+            try:
+                # find_instance already has its own retry logic, no need to duplicate it here
+                logger.info("Calling find_instance for TTS...")
+                tts = await find_instance("tts", factory)
+                logger.info("=== TTS instance found successfully ===")
+                return tts
+            except Exception as e:
+                logger.error(f"=== TTS connection failed: {e} ===")
+                # Send a user-friendly error message
+                error = make_ora_error(
+                    type="error",
+                    message="Unable to connect to text-to-speech service. Please try again.",
+                )
+                await self.output_queue.put(error)
+                raise
 
         async def _run(tts: TextToSpeech):
             logger.info("=== Starting TTS _run loop ===")

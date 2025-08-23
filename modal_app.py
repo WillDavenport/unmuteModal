@@ -962,7 +962,9 @@ class LLMService:
                         }
                         yield f"data: {json.dumps(final_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
-                    
+
+                        print("=== LLM_SERVICE: Streaming response completed final chunk: {} ===".format(final_chunk))
+
                     return StreamingResponse(generate_stream(), media_type="text/plain", headers={"Content-Type": "text/event-stream"})
                 
                 else:
