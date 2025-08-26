@@ -56,8 +56,8 @@ base_deps_image = (
         "prometheus-client==0.21.0",
         
         # LLM and API dependencies
-        "openai>=1.70.0",
         "mistralai>=1.5.1",
+        "openai>=1.70.0",
     )
 )
 
@@ -176,26 +176,10 @@ tts_image = (
         "mkdir -p /root/tts-voices-cache",
         # Download essential TTS tokenizer (required for TTS to work)
         "python -c \"from huggingface_hub import hf_hub_download; hf_hub_download('kyutai/tts-1.6b-en_fr', 'tokenizer_spm_8k_en_fr_audio.model', cache_dir='/root/.cache/huggingface/hub')\"",
-        # Pre-download essential voices to avoid downloading 446 files on each startup
-        "echo 'Pre-downloading essential TTS voices...'",
-        # Download just the essential voices used by unmute instead of all 446 files
-        "python -c \"",
-        "import os",
-        "from huggingface_hub import snapshot_download",
-        "try:",
-        "    # Download only the unmute-prod-website voices (much smaller subset)",
-        "    snapshot_download(",
-        "        'kyutai/tts-voices',",
-        "        cache_dir='/root/.cache/huggingface/hub',",
-        "        local_dir='/root/tts-voices-cache',",
-        "        allow_patterns=['unmute-prod-website/*.safetensors', 'unmute-prod-website/*.wav']",
-        "    )",
-        "    print('Essential voices downloaded successfully')",
-        "except Exception as e:",
-        "    print(f'Voice download failed: {e}')",
-        "    # Create minimal structure so moshi-server doesn't crash",
-        "    os.makedirs('/root/tts-voices-cache/unmute-prod-website', exist_ok=True)",
-        "\"",
+        # Create directory structure for voices (actual download will happen at runtime with persistent storage)
+        "echo 'Creating TTS voices directory structure...'",
+        "mkdir -p /root/tts-voices-cache/unmute-prod-website",
+        "echo 'TTS voices directory structure created'",
         # Verify essential models were downloaded
         "echo 'Verifying downloaded models...'",
         "ls -la /root/.cache/huggingface/hub/ | head -10",
@@ -213,10 +197,14 @@ tts_image = (
 llm_image = (
     base_deps_image
     .pip_install(
-        "vllm==0.8.5",
+        "huggingface_hub[hf_transfer]==0.32.0",
+        "hf_transfer==0.1.8",  # Pin specific version for stability
+        "vllm==0.9.1",
         "torch>=2.1.0",
-        "transformers>=4.35.0",
+        "transformers>=4.51.1",
     )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # faster model transfers
+    .env({"VLLM_USE_V1": "1"})  # use V1 engine for better performance
     # Add local files LAST
     .add_local_python_source("unmute")
     .add_local_file("voices.yaml", "/root/voices.yaml")
@@ -234,9 +222,19 @@ orchestrator_image = (
 models_volume = modal.Volume.from_name("voice-models")
 tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 
+# Cache volumes for LLM optimization
+hf_cache_vol = modal.Volume.from_name("huggingface-cache")
+vllm_cache_vol = modal.Volume.from_name("vllm-cache")
+
+# Model configuration for Mistral
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+MODEL_REVISION = "main"  # Pin to specific revision when available
+FAST_BOOT = True  # Set to False for better performance if you have persistent replicas
+
 # Modal secrets for API keys and auth tokens
 secrets = [
     modal.Secret.from_name("voice-auth"),
+    modal.Secret.from_name("huggingface-secret"),  # Add HF token for model access
 ]
 
 
@@ -246,8 +244,9 @@ secrets = [
     volumes={"/models": models_volume},
     secrets=secrets,
     min_containers=0,
-    scaledown_window=300,  # 5 minutes
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
+@modal.concurrent(max_inputs=10)
 class STTService:
     """Speech-to-Text service using Moshi STT model"""
     
@@ -385,7 +384,10 @@ dim = 6
                 while self.proc.poll() is None:
                     line = self.proc.stdout.readline()
                     if line:
-                        print(f"STT moshi-server: {line.strip()}")
+                        # Filter out noisy batched_asr logs
+                        line_stripped = line.strip()
+                        if "moshi_server::batched_asr" not in line_stripped:
+                            print(f"STT moshi-server: {line_stripped}")
             except Exception as e:
                 print(f"STT output monitor error: {e}")
         
@@ -553,8 +555,9 @@ dim = 6
     volumes={"/models": models_volume, "/persistent-voices": tts_voices_volume},
     secrets=secrets,
     min_containers=0,
-    scaledown_window=300,  # 5 minutes
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
+@modal.concurrent(max_inputs=10)
 class TTSService:
     """Text-to-Speech service using Moshi TTS model"""
     
@@ -613,19 +616,39 @@ class TTSService:
         os.makedirs(persistent_voices_dir, exist_ok=True)
         
         # Check if voices already exist in persistent storage
-        voices_exist = os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") and len(os.listdir(f"{persistent_voices_dir}/unmute-prod-website")) > 0 if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else False
+        voices_exist = (os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") and 
+                       len([f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')]) > 0) if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else False
         
         if not voices_exist:
-            print("Copying voices from image cache to persistent storage...")
-            # Copy voices from image cache to persistent volume
-            if os.path.exists("/root/tts-voices-cache"):
-                subprocess.run(["cp", "-r", "/root/tts-voices-cache/.", persistent_voices_dir], check=False)
-                print("Voices copied to persistent storage")
-            else:
-                print("No voices found in image cache, creating directory structure")
-                os.makedirs(f"{persistent_voices_dir}/unmute-prod-website", exist_ok=True)
+            print("Downloading essential voices to persistent storage (one-time setup)...")
+            try:
+                # Download only the essential voices directly to persistent storage
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    'kyutai/tts-voices',
+                    cache_dir='/root/.cache/huggingface/hub',
+                    local_dir=persistent_voices_dir,
+                    allow_patterns=['unmute-prod-website/*.safetensors', 'unmute-prod-website/*.wav']
+                )
+                print("Essential voices downloaded successfully to persistent storage")
+                
+                # Verify that voices were actually downloaded
+                voice_files = [f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')] if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else []
+                if len(voice_files) == 0:
+                    raise RuntimeError("No voice files found after download - TTS will not work")
+                print(f"Verified {len(voice_files)} voice files downloaded successfully")
+                
+            except Exception as e:
+                print(f"CRITICAL ERROR: Voice download failed: {e}")
+                print("TTS service cannot start without voices - failing container startup")
+                raise RuntimeError(f"TTS service initialization failed: {e}. Container must be restarted.")
         else:
-            print("Voices already exist in persistent storage, skipping copy")
+            print("Voices already exist in persistent storage, skipping download")
+            # Verify existing voices are still valid
+            voice_files = [f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')] if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else []
+            if len(voice_files) == 0:
+                print("CRITICAL ERROR: No voice files found in persistent storage")
+                raise RuntimeError("TTS service cannot start: No voice files available in persistent storage")
         
         # Create temporary config file for TTS
         config_content = '''
@@ -644,7 +667,7 @@ text_bos_token = 1
 [modules.tts_py.py]
 log_folder = "/tmp/unmute_logs"
 # Use persistent volume for voices to avoid re-downloading on each container restart
-voice_folder = "/persistent-voices/**/*.safetensors"
+voice_folder = "/persistent-voices"
 default_voice = "unmute-prod-website/default_voice.wav"
 cfg_coef = 2.0
 cfg_is_no_text = true
@@ -696,7 +719,10 @@ log_level = "debug"
                 while self.proc.poll() is None:
                     line = self.proc.stdout.readline()
                     if line:
-                        print(f"TTS moshi-server: {line.strip()}")
+                        # Filter out noisy batched_asr logs
+                        line_stripped = line.strip()
+                        if "moshi_server::batched_asr" not in line_stripped:
+                            print(f"TTS moshi-server: {line_stripped}")
             except Exception as e:
                 print(f"TTS output monitor error: {e}")
         
@@ -799,7 +825,7 @@ log_level = "debug"
                 try:
                     print("=== TTS_SERVICE: Connecting to internal moshi server ===")
                     moshi_connection = await websockets.connect(
-                        "ws://localhost:8089/api/tts_streaming",
+                        "ws://localhost:8089/api/tts_streaming?format=PcmMessagePack",
                         additional_headers={"kyutai-api-key": "public_token"}
                     )
                     print("=== TTS_SERVICE: Successfully connected to internal moshi server ===")
@@ -864,42 +890,134 @@ log_level = "debug"
 @app.cls(
     gpu="L4",
     image=llm_image,
-    volumes={"/models": models_volume},
+    volumes={
+        "/models": models_volume,
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+    },
     secrets=secrets,
     min_containers=0,
-    scaledown_window=300,  # 5 minutes
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
+    timeout=10 * 60,  # 10 minutes for model loading
 )
+@modal.concurrent(max_inputs=10)
 class LLMService:
-    """Large Language Model service using VLLM"""
+    """Large Language Model service using VLLM with OpenAI-compatible server"""
     
     @modal.enter()
     def load_model(self):
-        """Load LLM model weights once per container"""
+        """Start VLLM OpenAI-compatible server"""
         print("Setting up LLM Service...")
         
-        from vllm import AsyncLLMEngine, AsyncEngineArgs
+        import subprocess
+        import os
+        import time
+        import socket
+        import threading
         
-        # Initialize VLLM engine
-        engine_args = AsyncEngineArgs(
-            model="google/gemma-3-1b-it",
-            max_model_len=8192,
-            dtype="bfloat16",
-            gpu_memory_utilization=0.3,
-        )
-        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-        print("LLM model loaded successfully")
+        # Import constants from module level
+        MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+        MODEL_REVISION = "main"
+        FAST_BOOT = True
+        
+        # Set up environment
+        env = os.environ.copy()
+        env["KYUTAI_LLM_MODEL"] = MODEL_NAME
+        
+        # Add HuggingFace token for model authentication
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
+            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+            print(f"LLM: HuggingFace token configured (length: {len(hf_token)})")
+        else:
+            print("LLM: WARNING - No HuggingFace token found! This will likely cause authentication errors for gated models like Mistral.")
+            print("LLM: Please ensure 'huggingface-secret' is configured in Modal with your HF_TOKEN")
+        
+        # Start VLLM server using optimized configuration
+        print("Starting VLLM server...")
+        
+        cmd = [
+            "vllm", "serve",
+            MODEL_NAME,  # Model as positional argument, not --model flag
+            "--host", "0.0.0.0",
+            "--port", "8091",
+            "--served-model-name", MODEL_NAME,
+            "--max-model-len", "8192",
+            "--dtype", "bfloat16",
+            "--gpu-memory-utilization", "0.9",
+            "--uvicorn-log-level", "info",
+        ]
+        
+        # Performance optimization: enforce-eager for fast boot vs better performance
+        if FAST_BOOT:
+            cmd.append("--enforce-eager")
+        else:
+            cmd.append("--no-enforce-eager")
+        
+        print(f"VLLM command: {' '.join(cmd)}")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        
+        # Monitor output
+        def monitor_output():
+            try:
+                while self.proc.poll() is None:
+                    line = self.proc.stdout.readline()
+                    if line:
+                        print(f"VLLM server: {line.strip()}")
+            except Exception as e:
+                print(f"VLLM output monitor error: {e}")
+        
+        output_thread = threading.Thread(target=monitor_output, daemon=True)
+        output_thread.start()
+        
+        # Wait for server to be ready
+        max_attempts = 48  # 8 minutes
+        for attempt in range(max_attempts):
+            if self.proc.poll() is not None:
+                print(f"VLLM server process died with return code: {self.proc.returncode}")
+                break
+                
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                result = sock.connect_ex(('127.0.0.1', 8091))
+                sock.close()
+                if result == 0:
+                    print(f"VLLM server ready after {attempt + 1} seconds")
+                    break
+            except Exception:
+                pass
+            time.sleep(10)
+        else:
+            if self.proc.poll() is not None:
+                stdout, stderr = self.proc.communicate()
+                print(f"VLLM server failed to start. Return code: {self.proc.returncode}")
+                print(f"VLLM server stdout: {stdout}")
+                print(f"VLLM server stderr: {stderr}")
+                raise RuntimeError(f"VLLM server process died during startup with return code {self.proc.returncode}")
+            else:
+                print("VLLM server taking longer than expected to start, continuing anyway...")
+        
+        print("LLM service loaded successfully")
     
     @modal.asgi_app()
     def web(self):
-        """WebSocket endpoint for LLM service"""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        """OpenAI-compatible API endpoint for LLM service"""
+        from fastapi import FastAPI
+        from fastapi.responses import StreamingResponse
+        from unmute.llm.llm_utils import get_openai_client, rechunk_to_words, VLLMStream
         import json
+        import os
+        
+        # Import constants from module level
+        MODEL_NAME = "mistralai/Mistral-Small-24B-Instruct-2501"
         
         app = FastAPI(title="LLM Service", version="1.0.0")
         
         @app.get("/")
         def root():
-            return {"service": "llm", "model": "gemma-3-1b-it", "status": "ready"}
+            return {"service": "llm", "model": MODEL_NAME, "status": "ready"}
         
         @app.get("/v1/models")
         def list_models():
@@ -908,12 +1026,12 @@ class LLMService:
                 "object": "list",
                 "data": [
                     {
-                        "id": "google/gemma-3-1b-it",
+                        "id": MODEL_NAME,
                         "object": "model",
                         "created": 1640995200,
-                        "owned_by": "google",
+                        "owned_by": "mistralai",
                         "permission": [],
-                        "root": "google/gemma-3-1b-it",
+                        "root": MODEL_NAME,
                         "parent": None
                     }
                 ]
@@ -921,114 +1039,109 @@ class LLMService:
         
         @app.post("/v1/chat/completions")
         async def chat_completions(request: dict):
-            """OpenAI-compatible chat completions endpoint"""
+            """OpenAI-compatible chat completions endpoint using VLLMStream"""
             print(f"=== LLM_SERVICE: Received chat completion request: {request} ===")
             
             try:
-                from vllm import SamplingParams
-                
                 # Extract parameters from request
                 messages = request.get("messages", [])
                 temperature = request.get("temperature", 0.7)
-                max_tokens = request.get("max_tokens", 1024)
                 stream = request.get("stream", False)
                 
-                # Convert messages to a single prompt (simplified approach)
-                prompt = ""
-                for message in messages:
-                    role = message.get("role", "user")
-                    content = message.get("content", "")
-                    if role == "system":
-                        prompt += f"System: {content}\n"
-                    elif role == "user":
-                        prompt += f"User: {content}\n"
-                    elif role == "assistant":
-                        prompt += f"Assistant: {content}\n"
+                print(f"=== LLM_SERVICE: Processing {len(messages)} messages, temperature={temperature}, stream={stream} ===")
                 
-                prompt += "Assistant: "
+                # Wait for VLLM server to be ready before creating client
+                import socket
+                import time
+                max_wait = 30  # 30 seconds max wait
+                for attempt in range(max_wait):
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(1.0)
+                        result = sock.connect_ex(('127.0.0.1', 8091))
+                        sock.close()
+                        if result == 0:
+                            print(f"=== LLM_SERVICE: VLLM server ready after {attempt + 1} attempts ===")
+                            break
+                    except Exception:
+                        pass
+                    if attempt < max_wait - 1:  # Don't sleep on the last attempt
+                        time.sleep(1)
+                else:
+                    raise ConnectionError("VLLM server not ready after 30 seconds")
                 
-                print(f"=== LLM_SERVICE: Generated prompt: {prompt[:200]}... ===")
+                # Create OpenAI client pointing to local VLLM server
+                client = get_openai_client(server_url="http://localhost:8091")
                 
-                # Generate response using VLLM
-                sampling_params = SamplingParams(
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                
-                request_id = f"req_{hash(prompt)}"
+                # Use existing VLLMStream class
+                llm = VLLMStream(client, temperature=temperature)
                 
                 if stream:
-                    # Streaming response
-                    from fastapi.responses import StreamingResponse
-                    import json
-                    
+                    # Streaming response using the existing VLLMStream + rechunk_to_words
                     async def generate_stream():
-                        results_generator = self.engine.generate(
-                            prompt,
-                            sampling_params,
-                            request_id=request_id
-                        )
-                        
-                        async for request_output in results_generator:
-                            if request_output.outputs:
-                                for output in request_output.outputs:
-                                    chunk = {
-                                        "id": request_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": 1640995200,
-                                        "model": "google/gemma-3-1b-it",
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": output.text
-                                                },
-                                                "finish_reason": "stop" if request_output.finished else None
-                                            }
-                                        ]
-                                    }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                        # Send final chunk
-                        final_chunk = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": 1640995200,
-                            "model": "google/gemma-3-1b-it",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
+                        try:
+                            async for word in rechunk_to_words(llm.chat_completion(messages)):
+                                chunk = {
+                                    "id": f"chatcmpl-{hash(str(messages))}",
+                                    "object": "chat.completion.chunk",
+                                    "created": 1640995200,
+                                    "model": MODEL_NAME,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "content": word
+                                            },
+                                            "finish_reason": None
+                                        }
+                                    ]
                                 }
-                            ]
-                        }
-                        yield f"data: {json.dumps(final_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            
+                            # Send final chunk
+                            final_chunk = {
+                                "id": f"chatcmpl-{hash(str(messages))}",
+                                "object": "chat.completion.chunk",
+                                "created": 1640995200,
+                                "model": MODEL_NAME,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            
+                        except Exception as e:
+                            print(f"=== LLM_SERVICE: Error in streaming: {e} ===")
+                            import traceback
+                            print(f"=== LLM_SERVICE: Traceback: {traceback.format_exc()} ===")
+                            # Send error chunk
+                            error_chunk = {
+                                "error": {
+                                    "message": str(e),
+                                    "type": "internal_server_error",
+                                    "code": "internal_error"
+                                }
+                            }
+                            yield f"data: {json.dumps(error_chunk)}\n\n"
 
-                        print("=== LLM_SERVICE: Streaming response completed final chunk: {} ===".format(final_chunk))
-
-                    return StreamingResponse(generate_stream(), media_type="text/plain", headers={"Content-Type": "text/event-stream"})
+                    return StreamingResponse(generate_stream(), media_type="text/event-stream")
                 
                 else:
-                    # Non-streaming response
-                    results_generator = self.engine.generate(
-                        prompt,
-                        sampling_params,
-                        request_id=request_id
-                    )
-                    
+                    # Non-streaming response - collect all words
                     full_text = ""
-                    async for request_output in results_generator:
-                        if request_output.outputs:
-                            for output in request_output.outputs:
-                                full_text = output.text
+                    async for word in rechunk_to_words(llm.chat_completion(messages)):
+                        full_text += word
                     
                     response = {
-                        "id": request_id,
+                        "id": f"chatcmpl-{hash(str(messages))}",
                         "object": "chat.completion",
                         "created": 1640995200,
-                        "model": "google/gemma-3-1b-it",
+                        "model": MODEL_NAME,
                         "choices": [
                             {
                                 "index": 0,
@@ -1040,9 +1153,9 @@ class LLMService:
                             }
                         ],
                         "usage": {
-                            "prompt_tokens": len(prompt.split()),
+                            "prompt_tokens": sum(len(msg.get("content", "").split()) for msg in messages),
                             "completion_tokens": len(full_text.split()),
-                            "total_tokens": len(prompt.split()) + len(full_text.split())
+                            "total_tokens": sum(len(msg.get("content", "").split()) for msg in messages) + len(full_text.split())
                         }
                     }
                     
@@ -1061,59 +1174,6 @@ class LLMService:
                     }
                 }
         
-        @app.websocket("/ws")
-        async def websocket_endpoint(websocket: WebSocket):
-            await websocket.accept()
-            print("LLM WebSocket connection established")
-            
-            try:
-                while True:
-                    # Receive prompt from orchestrator
-                    message = await websocket.receive_text()
-                    data = json.loads(message)
-                    
-                    if data.get("type") == "generate":
-                        prompt = data.get("prompt", "")
-                        temperature = data.get("temperature", 0.7)
-                        max_tokens = data.get("max_tokens", 1024)
-                        
-                        # Generate streaming response
-                        from vllm import SamplingParams
-                        sampling_params = SamplingParams(
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                        )
-                        
-                        request_id = f"req_{hash(prompt)}_{id(websocket)}"
-                        
-                        # Generate response using VLLM
-                        results_generator = self.engine.generate(
-                            prompt,
-                            sampling_params,
-                            request_id=request_id
-                        )
-                        
-                        # Stream results
-                        async for request_output in results_generator:
-                            if request_output.outputs:
-                                for output in request_output.outputs:
-                                    # Send incremental text
-                                    await websocket.send_text(json.dumps({
-                                        "type": "token",
-                                        "text": output.text,
-                                        "finished": request_output.finished
-                                    }))
-                        
-                        # Send completion signal
-                        await websocket.send_text(json.dumps({
-                            "type": "complete"
-                        }))
-                        
-            except WebSocketDisconnect:
-                print("LLM WebSocket disconnected")
-            except Exception as e:
-                print(f"LLM error: {e}")
-        
         return app
 
 
@@ -1122,8 +1182,9 @@ class LLMService:
     image=orchestrator_image,
     secrets=secrets,
     min_containers=0,
-    scaledown_window=300,  # 5 minutes
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
+@modal.concurrent(max_inputs=10)
 class OrchestratorService:
     """Orchestrator service that coordinates between STT, LLM, and TTS"""
     

@@ -93,6 +93,12 @@ const Unmute = () => {
     webSocketUrl || null,
     {
       protocols: ["realtime"],
+      heartbeat: {
+        message: JSON.stringify({ type: "ping" }),
+        returnMessage: JSON.stringify({ type: "pong" }),
+        timeout: 240000, // 4 minutes
+        interval: 240000, // 4 minutes - send heartbeat before 5min timeout
+      },
       onOpen: () => {
         console.log("=== FRONTEND: WebSocket connection opened ===");
       },

@@ -441,6 +441,19 @@ async def receive_loop(
             raise WebSocketClosedError() from e
 
         try:
+            # Parse the raw message to check for ping/pong
+            raw_parsed = json.loads(message_raw)
+            if raw_parsed.get("type") == "ping":
+                # Respond to ping with pong
+                await emit_queue.put(
+                    ora.UnmuteAdditionalOutputs(args={"type": "pong"})
+                )
+                continue
+            elif raw_parsed.get("type") == "pong":
+                # Ignore pong responses (they're handled by the WebSocket layer)
+                logger.debug("Received pong from client")
+                continue
+            
             message: ora.ClientEvent = ClientEventAdapter.validate_json(message_raw)
         except json.JSONDecodeError as e:
             print(f"=== RECEIVE_LOOP: Invalid JSON: {e} ===")
@@ -531,6 +544,8 @@ async def emit_loop(
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
     emit_count = 0
+    last_keepalive = asyncio.get_event_loop().time()
+    KEEPALIVE_INTERVAL = 240  # 4 minutes - send keepalive before 5min timeout
 
     while True:
         if (
@@ -540,6 +555,17 @@ async def emit_loop(
             logger.debug(f"WebSocket disconnected (states: app={websocket.application_state}, client={websocket.client_state})")
             logger.info("emit_loop() stopped because WebSocket disconnected")
             raise WebSocketClosedError()
+
+        # Check if we need to send a keepalive ping
+        current_time = asyncio.get_event_loop().time()
+        if current_time - last_keepalive > KEEPALIVE_INTERVAL:
+            try:
+                await websocket.ping()
+                last_keepalive = current_time
+                logger.debug("Sent WebSocket keepalive ping")
+            except Exception as e:
+                logger.warning(f"Failed to send keepalive ping: {e}")
+                # Don't raise here, let the normal WebSocket error handling deal with it
 
         try:
             to_emit = emit_queue.get_nowait()
