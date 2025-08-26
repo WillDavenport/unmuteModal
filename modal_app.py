@@ -95,7 +95,7 @@ stt_image = (
         "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
         # Install moshi-server using cargo install (cleaner than building from source)
         # This will install the moshi-server binary with proper Python integration
-        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install moshi-server@0.6.3",
+        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install --features cuda moshi-server@0.6.3",
         # Add cargo bin to system PATH permanently
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
@@ -158,7 +158,7 @@ tts_image = (
         "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
         # Install moshi-server using cargo install (cleaner than building from source)
         # This will install the moshi-server binary with proper Python integration
-        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install moshi-server@0.6.3",
+        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo --features cuda install moshi-server@0.6.3",
         # Add cargo bin to system PATH permanently
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",

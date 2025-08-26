@@ -250,7 +250,6 @@ class UnmuteHandler(AsyncStreamHandler):
 
                 self.tts_output_stopwatch.start_if_not_started()
                 try:
-                    logger.info("=== Getting TTS instance from quest ===")
                     tts = await quest.get()
                     logger.info("=== Got TTS instance successfully ===")
                 except Exception as e:
@@ -259,13 +258,12 @@ class UnmuteHandler(AsyncStreamHandler):
                     raise
 
                 if len(self.chatbot.chat_history) > generating_message_i:
-                    logger.info("=== Response interrupted, breaking ===")
+                    logger.info("=== Response interrupted, breaking LLM loop ===")
                     break  # We've been interrupted
 
                 assert isinstance(delta, str)  # make Pyright happy
                 logger.info(f"=== Sending word to TTS: '{delta}' ===")
                 await tts.send(delta)
-                logger.info(f"=== Successfully sent word to TTS ===")
 
             await self.output_queue.put(
                 # The words include the whitespace, so no need to add it here
@@ -573,6 +571,7 @@ class UnmuteHandler(AsyncStreamHandler):
                     }
 
                 if len(self.chatbot.chat_history) > generating_message_i:
+                    logger.info("=== Response interrupted, breaking TTS loop ===")
                     break
 
                 if isinstance(message, TTSAudioMessage):

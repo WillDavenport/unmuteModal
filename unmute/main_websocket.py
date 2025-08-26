@@ -560,7 +560,9 @@ async def emit_loop(
         current_time = asyncio.get_event_loop().time()
         if current_time - last_keepalive > KEEPALIVE_INTERVAL:
             try:
-                await websocket.ping()
+                # Send custom ping message (matches frontend heartbeat implementation)
+                ping_message = json.dumps({"type": "ping"})
+                await websocket.send_text(ping_message)
                 last_keepalive = current_time
                 logger.debug("Sent WebSocket keepalive ping")
             except Exception as e:
