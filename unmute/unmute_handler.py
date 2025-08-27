@@ -298,7 +298,18 @@ class UnmuteHandler(AsyncStreamHandler):
 
         This is so that we aren't tied to real-time streaming.
         """
-        return self.n_samples_received / self.input_sample_rate
+        current_audio_time = self.n_samples_received / self.input_sample_rate
+        
+        # Debug logging for timing diagnostics
+        if hasattr(self, '_last_audio_time_log'):
+            time_diff = current_audio_time - self._last_audio_time_log
+            if time_diff > 2.0:  # Log every 2 seconds of audio time
+                logger.info(f"Audio timing: n_samples_received={self.n_samples_received}, audio_received_sec={current_audio_time:.3f}, sample_rate={self.input_sample_rate}")
+                self._last_audio_time_log = current_audio_time
+        else:
+            self._last_audio_time_log = current_audio_time
+            
+        return current_audio_time
 
     async def receive(self, frame: tuple[int, np.ndarray]) -> None:
         stt = self.stt

@@ -347,7 +347,9 @@ class TextToSpeech(ServiceWithStartup):
                     # has already been said, so that if there's an interruption, the
                     # chat history matches what's actually been said.
                     output_queue.put(message, message.stop_s)
-                    logger.info(f"Queued TTSTextMessage '{message.text}' with stop_s={message.stop_s}, queue size={len(output_queue.queue)}")
+                    current_time = output_queue.get_time() if output_queue.start_time else 0
+                    time_since_start = current_time - output_queue.start_time if output_queue.start_time else 0
+                    logger.info(f"Queued TTSTextMessage '{message.text}' with stop_s={message.stop_s}, current_time_since_start={time_since_start:.3f}, queue size={len(output_queue.queue)}")
 
                 for _, message in output_queue.get_nowait():
                     if isinstance(message, TTSAudioMessage):

@@ -73,4 +73,60 @@ If no messages have been released for X seconds, force-release the next N messag
 ## Status
 - ✅ Identified root cause: RealtimeQueue timing issue, not message generation failure  
 - ✅ Confirmed all system components (LLM, TTS server, websocket) are working correctly
-- 🔄 Next: Implement timing debugging and timeout mechanism
+- ✅ Implemented comprehensive timing debugging in RealtimeQueue.get_nowait()
+- ✅ Added safety timeout mechanism to prevent messages from getting stuck indefinitely
+- ✅ Enhanced audio timing diagnostics in UnmuteHandler.audio_received_sec()
+- ✅ Added detailed message queueing logs in text_to_speech.py
+- 🔄 Next: Test with the specific scenario that causes "Bonaparte" to be the last word
+
+## Recent Changes Made
+
+### 1. Enhanced RealtimeQueue Debugging (realtime_queue.py)
+- Added detailed timing logs showing current_time, start_time, time_since_start, and message timing
+- Logs every 2 seconds or when messages are overdue by 1+ seconds
+- Tracks message release counts and queue status
+
+### 2. Safety Timeout Mechanism (realtime_queue.py)
+- Implemented 5-second timeout to force-release stuck messages
+- Prevents indefinite blocking when timing calculations fail
+- Force-releases up to 3 messages when timeout is triggered
+- Comprehensive logging of timeout events
+
+### 3. Audio Timing Diagnostics (unmute_handler.py)
+- Enhanced audio_received_sec() with timing logs
+- Tracks n_samples_received and sample rate progression
+- Logs every 2 seconds of audio time to detect timing stalls
+
+### 4. Message Queue Monitoring (text_to_speech.py)
+- Added current_time_since_start logging when messages are queued
+- Shows relationship between message stop_s and current timing
+- Helps identify timing drift issues
+
+### 5. Testing and Verification
+- Created and ran tests to verify the timeout mechanism works correctly
+- Confirmed that stuck messages are force-released after the timeout period
+- Validated that normal message timing continues to work as expected
+
+## Solution Summary
+
+The TTS stopping issue has been addressed through a multi-layered approach:
+
+1. **Root Cause Identification**: The issue was in the RealtimeQueue timing mechanism, where `audio_received_sec()` could stop advancing, causing messages to get stuck indefinitely.
+
+2. **Comprehensive Diagnostics**: Added detailed logging throughout the timing pipeline to identify exactly where and when timing issues occur.
+
+3. **Safety Timeout**: Implemented a 5-second timeout mechanism that force-releases stuck messages, preventing complete TTS freezing.
+
+4. **Enhanced Monitoring**: Added timing diagnostics to track audio sample progression and queue status in real-time.
+
+The changes ensure that:
+- TTS messages will continue to be released even if timing calculations drift or stall
+- Detailed logs will help identify the exact cause of any future timing issues
+- The system gracefully handles timing anomalies without complete failure
+- Normal operation is unaffected by the safety mechanisms
+
+**Next Steps for Production**:
+1. Deploy these changes to the staging environment
+2. Monitor the enhanced logs during normal operation
+3. Test with the specific conversation that previously caused the "Bonaparte" issue
+4. Adjust timeout values if needed based on real-world performance
