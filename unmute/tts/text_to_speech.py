@@ -290,6 +290,8 @@ class TextToSpeech(ServiceWithStartup):
                     except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError):
                         # Raw bytes from moshi-server are PCM audio data that we should skip
                         # The original working version skipped these and it worked fine
+                        logger.warning("Received unexpected message type from TTS: %s, value error: %s", message_bytes )
+                        logger.debug(f"First 50 bytes: {message_bytes[:50]}")
                         continue
                 else:
                     # For local services, expect msgpack format
@@ -345,6 +347,7 @@ class TextToSpeech(ServiceWithStartup):
                     # has already been said, so that if there's an interruption, the
                     # chat history matches what's actually been said.
                     output_queue.put(message, message.stop_s)
+                    logger.info(f"Queued TTSTextMessage '{message.text}' with stop_s={message.stop_s}, queue size={len(output_queue.queue)}")
 
                 for _, message in output_queue.get_nowait():
                     if isinstance(message, TTSAudioMessage):

@@ -64,8 +64,13 @@ base_deps_image = (
 # STT image: build steps first, then local files
 stt_image = (
     base_deps_image
-    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl")
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg")
     .run_commands(
+        # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
+        "dpkg -i cuda-keyring_1.0-1_all.deb",
+        "apt-get update -q",
+        "apt-get install -y cuda-toolkit-12-1 || apt-get install -y cuda-toolkit-11-8",
         # Install latest Rust toolchain to handle Cargo.lock version 4
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
         ". ~/.cargo/env"
@@ -83,26 +88,13 @@ stt_image = (
         "einops>=0.8.0",
     )
     .run_commands(
-        # Set environment variables for building
-        "export CXXFLAGS='-include cstdint'",
-        # Set LD_LIBRARY_PATH for Python integration
-        "export LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')",
-        # Ensure Rust environment is available
-        ". ~/.cargo/env",
-        # Debug: Check OpenSSL installation
-        "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
-        "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
-        "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
-        # Install moshi-server using cargo install (cleaner than building from source)
-        # This will install the moshi-server binary with proper Python integration
-        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo install --features cuda moshi-server@0.6.3",
-        # Add cargo bin to system PATH permanently
+        # Set up environment variables that will be needed at runtime
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
-        # Copy moshi-server to a standard location for easier access
-        "cp ~/.cargo/bin/moshi-server /usr/local/bin/ || echo 'Failed to copy moshi-server, but it may still work from cargo bin'",
-        # Verify moshi-server was installed successfully
-        "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
+        # Create directory for cached binaries
+        "mkdir -p /usr/local/bin",
+        # Note: moshi-server binary will be installed at startup time with CUDA support
+        "echo 'Rust environment prepared for runtime binary installation'"
     )
     .run_commands(
         # Pre-download STT models during image build to avoid startup delays
@@ -127,8 +119,13 @@ stt_image = (
 # TTS image: build steps first, then local files
 tts_image = (
     base_deps_image
-    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl")
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg")
     .run_commands(
+        # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
+        "dpkg -i cuda-keyring_1.0-1_all.deb",
+        "apt-get update -q",
+        "apt-get install -y cuda-toolkit-12-1 || apt-get install -y cuda-toolkit-11-8",
         # Install latest Rust toolchain to handle Cargo.lock version 4
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
         ". ~/.cargo/env"
@@ -146,26 +143,13 @@ tts_image = (
         "einops>=0.8.0",
     )
     .run_commands(
-        # Set environment variables for building
-        "export CXXFLAGS='-include cstdint'",
-        # Set LD_LIBRARY_PATH for Python integration
-        "export LD_LIBRARY_PATH=$(python -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')",
-        # Ensure Rust environment is available
-        ". ~/.cargo/env",
-        # Debug: Check OpenSSL installation
-        "echo 'Checking OpenSSL installation:' && find /usr -name '*ssl*' -type f 2>/dev/null | grep -E '\\.(so|a)$' | head -10",
-        "ls -la /usr/lib/x86_64-linux-gnu/ | grep ssl || echo 'No SSL libs in x86_64-linux-gnu'",
-        "ls -la /usr/include/ | grep ssl || echo 'No SSL headers in include'",
-        # Install moshi-server using cargo install (cleaner than building from source)
-        # This will install the moshi-server binary with proper Python integration
-        ". ~/.cargo/env && export OPENSSL_DIR=/usr && export OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu && export OPENSSL_INCLUDE_DIR=/usr/include/openssl && export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig && cargo --features cuda install moshi-server@0.6.3",
-        # Add cargo bin to system PATH permanently
+        # Set up environment variables that will be needed at runtime
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
         "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
-        # Copy moshi-server to a standard location for easier access
-        "cp ~/.cargo/bin/moshi-server /usr/local/bin/ || echo 'Failed to copy moshi-server, but it may still work from cargo bin'",
-        # Verify moshi-server was installed successfully
-        "export PATH=\"$HOME/.cargo/bin:$PATH\" && which moshi-server && moshi-server --help | head -10 || echo 'moshi-server installation verification failed'"
+        # Create directory for cached binaries
+        "mkdir -p /usr/local/bin",
+        # Note: moshi-server binary will be installed at startup time with CUDA support
+        "echo 'Rust environment prepared for runtime binary installation'"
     )
     .run_commands(
         # Pre-download TTS models during image build to avoid startup delays
@@ -226,6 +210,9 @@ tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 hf_cache_vol = modal.Volume.from_name("huggingface-cache")
 vllm_cache_vol = modal.Volume.from_name("vllm-cache")
 
+# Cache volume for Rust binaries (shared between STT and TTS)
+rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache")
+
 # Model configuration for Mistral
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 MODEL_REVISION = "main"  # Pin to specific revision when available
@@ -238,10 +225,138 @@ secrets = [
 ]
 
 
+def install_moshi_server_with_cuda():
+    """
+    Install moshi-server binary with CUDA support at runtime.
+    This function checks if a cached binary exists, and if not, compiles it with CUDA features.
+    """
+    import subprocess
+    import os
+    import time
+    from pathlib import Path
+    
+    print("Installing moshi-server with CUDA support...")
+    
+    # Check if we already have a cached binary
+    cached_binary_path = "/rust-binaries/moshi-server"
+    local_binary_path = "/usr/local/bin/moshi-server"
+    
+    if os.path.exists(cached_binary_path):
+        print(f"Found cached moshi-server binary at {cached_binary_path}")
+        # Copy from cache to local bin
+        subprocess.run(["cp", cached_binary_path, local_binary_path], check=True)
+        subprocess.run(["chmod", "+x", local_binary_path], check=True)
+        print("Cached binary copied and made executable")
+        return local_binary_path
+    
+    print("No cached binary found, compiling moshi-server with CUDA support...")
+    
+    # Set up environment with cargo bin in PATH
+    env = os.environ.copy()
+    cargo_bin_path = os.path.expanduser("~/.cargo/bin")
+    env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
+    
+    # Set up compilation environment for CUDA
+    env.update({
+        "CXXFLAGS": "-include cstdint",
+        "LD_LIBRARY_PATH": subprocess.check_output([
+            "python", "-c", 
+            "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"
+        ], text=True).strip(),
+        "OPENSSL_DIR": "/usr",
+        "OPENSSL_LIB_DIR": "/usr/lib/x86_64-linux-gnu",
+        "OPENSSL_INCLUDE_DIR": "/usr/include/openssl",
+        "PKG_CONFIG_PATH": "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        "RUST_LOG": "warn,moshi_server::batched_asr=off",  # Reduce noisy logs
+        # CUDA environment variables
+        "CUDA_ROOT": "/usr/local/cuda-12.1",
+        "CUDA_PATH": "/usr/local/cuda-12.1",
+        "CUDA_TOOLKIT_ROOT_DIR": "/usr/local/cuda-12.1",
+        "PATH": f"{env.get('PATH', '')}:/usr/local/cuda-12.1/bin"
+    })
+    
+    try:
+        # Verify CUDA installation
+        print("Verifying CUDA installation...")
+        try:
+            nvcc_result = subprocess.run([
+                "nvcc", "--version"
+            ], env=env, capture_output=True, text=True, timeout=10)
+            if nvcc_result.returncode == 0:
+                print(f"CUDA nvcc found: {nvcc_result.stdout.strip()}")
+            else:
+                print(f"CUDA nvcc check failed: {nvcc_result.stderr}")
+        except Exception as e:
+            print(f"CUDA nvcc verification failed: {e}")
+            print("Continuing without CUDA verification - compilation may still work")
+        
+        # Install moshi-server with CUDA features
+        print("Running cargo install moshi-server@0.6.3 --features cuda...")
+        start_time = time.time()
+        
+        result = subprocess.run([
+            "cargo", "install", "moshi-server@0.6.3", "--features", "cuda"
+        ], env=env, capture_output=True, text=True, timeout=600)  # 10 minute timeout
+        
+        compile_time = time.time() - start_time
+        print(f"Compilation completed in {compile_time:.1f} seconds")
+        
+        if result.returncode != 0:
+            print(f"Cargo install with CUDA failed with return code {result.returncode}")
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+            
+            # Try fallback compilation without CUDA features
+            print("Attempting fallback compilation without CUDA features...")
+            fallback_result = subprocess.run([
+                "cargo", "install", "moshi-server@0.6.3"
+            ], env=env, capture_output=True, text=True, timeout=600)
+            
+            if fallback_result.returncode != 0:
+                print(f"Fallback compilation also failed: {fallback_result.stderr}")
+                raise RuntimeError("Failed to compile moshi-server with and without CUDA")
+            else:
+                print("Successfully compiled moshi-server without CUDA features (fallback)")
+                result = fallback_result  # Use fallback result for rest of the function
+        
+        # Copy to local bin
+        cargo_binary = f"{cargo_bin_path}/moshi-server"
+        if not os.path.exists(cargo_binary):
+            raise RuntimeError(f"moshi-server not found at expected location: {cargo_binary}")
+            
+        subprocess.run(["cp", cargo_binary, local_binary_path], check=True)
+        subprocess.run(["chmod", "+x", local_binary_path], check=True)
+        
+        # Cache the binary for future use
+        print("Caching compiled binary...")
+        os.makedirs("/rust-binaries", exist_ok=True)
+        subprocess.run(["cp", local_binary_path, cached_binary_path], check=True)
+        
+        # Verify the binary works
+        result = subprocess.run([
+            local_binary_path, "--help"
+        ], capture_output=True, text=True, timeout=10, env=env)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Compiled binary failed verification: {result.stderr}")
+            
+        print("moshi-server successfully installed and cached")
+        return local_binary_path
+        
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Compilation timed out after 10 minutes")
+    except Exception as e:
+        print(f"Error during compilation: {e}")
+        raise
+
+
 @app.cls(
     gpu="L4",
     image=stt_image,
-    volumes={"/models": models_volume},
+    volumes={
+        "/models": models_volume,
+        "/rust-binaries": rust_binaries_volume,
+    },
     secrets=secrets,
     min_containers=0,
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
@@ -260,37 +375,27 @@ class STTService:
         
         print("Setting up STT Service...")
         
+        # Install moshi-server with CUDA support
+        moshi_server_path = install_moshi_server_with_cuda()
+        
         # Set up environment with cargo bin in PATH
-        import os
         env = os.environ.copy()
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
         # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
         env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
         
-        # First, verify moshi-server binary is available
-        print("Checking moshi-server availability...")
+        # Verify the installed binary
+        print(f"Verifying moshi-server at: {moshi_server_path}")
         try:
-            result = subprocess.run(["which", "moshi-server"], 
+            result = subprocess.run([moshi_server_path, "--help"], 
                                   capture_output=True, text=True, timeout=10, env=env)
-            print(f"moshi-server location: {result.stdout.strip()}")
+            print(f"moshi-server help output: {result.stdout[:200]}...")  # Show first 200 chars
             if result.returncode != 0:
-                print("moshi-server not found in PATH")
-                # Try to find it in common locations
-                for path in ["/usr/local/bin/moshi-server", cargo_bin_path + "/moshi-server"]:
-                    if os.path.exists(path):
-                        print(f"Found moshi-server at: {path}")
-                        break
+                raise RuntimeError(f"moshi-server verification failed: {result.stderr}")
         except Exception as e:
-            print(f"Failed to check moshi-server location: {e}")
-        
-        # Check if Rust environment is available
-        try:
-            result = subprocess.run(["rustc", "--version"], 
-                                  capture_output=True, text=True, timeout=10, env=env)
-            print(f"Rust version: {result.stdout.strip()}")
-        except Exception as e:
-            print(f"Rust not available: {e}")
+            print(f"Failed to verify moshi-server: {e}")
+            raise
         
         # Create temporary config file for STT
         config_content = '''
@@ -552,7 +657,11 @@ dim = 6
 @app.cls(
     gpu="L4", 
     image=tts_image,
-    volumes={"/models": models_volume, "/persistent-voices": tts_voices_volume},
+    volumes={
+        "/models": models_volume, 
+        "/persistent-voices": tts_voices_volume,
+        "/rust-binaries": rust_binaries_volume,
+    },
     secrets=secrets,
     min_containers=0,
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
@@ -571,8 +680,10 @@ class TTSService:
         
         print("Setting up TTS Service...")
         
+        # Install moshi-server with CUDA support
+        moshi_server_path = install_moshi_server_with_cuda()
+        
         # Set up environment with cargo bin in PATH
-        import os
         env = os.environ.copy()
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
@@ -586,29 +697,17 @@ class TTSService:
         else:
             print("TTS: No HuggingFace token found - this may cause issues downloading models")
         
-        # First, verify moshi-server binary is available
-        print("Checking moshi-server availability...")
+        # Verify the installed binary
+        print(f"Verifying moshi-server at: {moshi_server_path}")
         try:
-            result = subprocess.run(["which", "moshi-server"], 
+            result = subprocess.run([moshi_server_path, "--help"], 
                                   capture_output=True, text=True, timeout=10, env=env)
-            print(f"moshi-server location: {result.stdout.strip()}")
+            print(f"moshi-server help output: {result.stdout[:200]}...")  # Show first 200 chars
             if result.returncode != 0:
-                print("moshi-server not found in PATH")
-                # Try to find it in common locations
-                for path in ["/usr/local/bin/moshi-server", cargo_bin_path + "/moshi-server"]:
-                    if os.path.exists(path):
-                        print(f"Found moshi-server at: {path}")
-                        break
+                raise RuntimeError(f"moshi-server verification failed: {result.stderr}")
         except Exception as e:
-            print(f"Failed to check moshi-server location: {e}")
-        
-        # Check if Rust environment is available
-        try:
-            result = subprocess.run(["rustc", "--version"], 
-                                  capture_output=True, text=True, timeout=10, env=env)
-            print(f"Rust version: {result.stdout.strip()}")
-        except Exception as e:
-            print(f"Rust not available: {e}")
+            print(f"Failed to verify moshi-server: {e}")
+            raise
         
         # Set up persistent voice storage
         print("Setting up persistent voice storage...")

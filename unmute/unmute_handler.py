@@ -234,6 +234,15 @@ class UnmuteHandler(AsyncStreamHandler):
 
         try:
             logger.info("=== Starting LLM chat completion stream ===")
+            # Wait for TTS instance once before streaming words
+            try:
+                tts = await quest.get()
+                logger.info("=== Got TTS instance successfully ===")
+            except Exception as e:
+                logger.error(f"=== Failed to get TTS instance: {e} ===")
+                error_from_tts = True
+                raise
+
             async for delta in rechunk_to_words(llm.chat_completion(messages)):
                 await self.output_queue.put(
                     ora.UnmuteResponseTextDeltaReady(delta=delta)
@@ -246,16 +255,9 @@ class UnmuteHandler(AsyncStreamHandler):
                     time_to_first_token = llm_stopwatch.time()
                     self.debug_dict["timing"]["to_first_token"] = time_to_first_token
                     mt.VLLM_TTFT.observe(time_to_first_token)
-                    logger.info("Sending first word to TTS: %s", delta)
+                    logger.info("Sending first word to TTS: %s. Time to first token: %s", delta, time_to_first_token)
 
                 self.tts_output_stopwatch.start_if_not_started()
-                try:
-                    tts = await quest.get()
-                    logger.info("=== Got TTS instance successfully ===")
-                except Exception as e:
-                    logger.error(f"=== Failed to get TTS instance: {e} ===")
-                    error_from_tts = True
-                    raise
 
                 if len(self.chatbot.chat_history) > generating_message_i:
                     logger.info("=== Response interrupted, breaking LLM loop ===")
@@ -271,6 +273,7 @@ class UnmuteHandler(AsyncStreamHandler):
             )
 
             logger.info(f"=== LLM stream completed with {len(response_words)} words ===")
+            logger.info("Full LLM response: %s", "".join(response_words))
             if tts is not None:
                 logger.info("=== Sending TTS EOS ===")
                 await tts.send(TTSClientEosMessage())
@@ -633,6 +636,7 @@ class UnmuteHandler(AsyncStreamHandler):
 
     async def interrupt_bot(self):
         if self.chatbot.conversation_state() != "bot_speaking":
+            logger.error(f"Can't interrupt bot when conversation state is {self.chatbot.conversation_state()}")
             raise RuntimeError(
                 "Can't interrupt bot when conversation state is "
                 f"{self.chatbot.conversation_state()}"
