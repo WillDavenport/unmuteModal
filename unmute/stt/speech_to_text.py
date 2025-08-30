@@ -77,7 +77,7 @@ class SpeechToText(ServiceWithStartup):
         self.delay_sec = delay_sec
         self.websocket: websockets.ClientConnection | None = None
         self.sent_samples = 0
-        self.received_words = 0
+        self.received_word_count = 0
         self.current_time = -STT_DELAY_SEC
         self.time_since_first_audio_sent = Stopwatch(autostart=False)
         self.waiting_first_step: bool = True
@@ -186,7 +186,7 @@ class SpeechToText(ServiceWithStartup):
         if self.time_since_first_audio_sent.started:
             mt.STT_SESSION_DURATION.observe(self.time_since_first_audio_sent.time())
             mt.STT_AUDIO_DURATION.observe(self.sent_samples / SAMPLE_RATE)
-            mt.STT_NUM_WORDS.observe(self.received_words)
+            mt.STT_NUM_WORDS.observe(self.received_word_count)
 
         if not self.websocket:
             raise RuntimeError("STT websocket not connected")
@@ -217,7 +217,8 @@ class SpeechToText(ServiceWithStartup):
                     case STTWordMessage():
                         num_words = len(message.text.split())
                         mt.STT_RECV_WORDS.inc(num_words)
-                        self.received_words += 1
+                        self.received_word_count += 1
+                        logger.info(f"stt yielding message: {message.text}")
                         yield message
                     case STTEndWordMessage():
                         continue

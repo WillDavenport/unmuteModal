@@ -178,11 +178,8 @@ class UnmuteHandler(AsyncStreamHandler):
         # Empty message to signal we've started responding.
         # Do it here in the lock to avoid race conditions
         await self.add_chat_message_delta("", "assistant")
-        logger.info("Added empty assistant message to chat history")
         quest = Quest.from_run_step("llm", self._generate_response_task)
-        logger.info("Created LLM quest, adding to quest manager")
         await self.quest_manager.add(quest)
-        logger.info("=== Response generation quest added ===")
 
     async def _generate_response_task(self):
         logger.info("=== Starting response generation task ===")

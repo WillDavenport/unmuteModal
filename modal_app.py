@@ -1045,6 +1045,7 @@ class LLMService:
             "--dtype", "bfloat16",
             "--gpu-memory-utilization", "0.9",
             "--uvicorn-log-level", "info",
+            "--tokenizer-mode", "mistral",  # Fix for Mistral tokenizer warning
         ]
         
         # Performance optimization: enforce-eager for fast boot vs better performance
