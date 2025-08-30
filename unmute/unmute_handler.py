@@ -42,7 +42,6 @@ from unmute.timer import Stopwatch
 from unmute.tts.text_to_speech import (
     TextToSpeech,
     TTSAudioMessage,
-    TTSClientEosMessage,
     TTSTextMessage,
 )
 
@@ -274,12 +273,14 @@ class UnmuteHandler(AsyncStreamHandler):
 
             logger.info(f"=== LLM stream completed with {len(response_words)} words ===")
             logger.info("Full LLM response: %s", "".join(response_words))
+            await tts.send("".join(response_words))
+
             if tts is not None:
-                logger.info("=== Sending TTS EOS ===")
-                await tts.send(TTSClientEosMessage())
-                logger.info("=== TTS EOS sent successfully ===")
+                logger.info("=== Queuing TTS EOS after text messages ===")
+                tts.queue_eos()
+                logger.info("=== TTS EOS queued successfully ===")
             else:
-                logger.warning("=== TTS is None, cannot send EOS ===")
+                logger.warning("=== TTS is None, cannot queue EOS ===")
         except asyncio.CancelledError:
             mt.VLLM_INTERRUPTS.inc()
             raise
@@ -298,7 +299,18 @@ class UnmuteHandler(AsyncStreamHandler):
 
         This is so that we aren't tied to real-time streaming.
         """
-        return self.n_samples_received / self.input_sample_rate
+        current_audio_time = self.n_samples_received / self.input_sample_rate
+        
+        # Debug logging for timing diagnostics
+        if hasattr(self, '_last_audio_time_log'):
+            time_diff = current_audio_time - self._last_audio_time_log
+            if time_diff > 2.0:  # Log every 2 seconds of audio time
+                logger.info(f"Audio timing: n_samples_received={self.n_samples_received}, audio_received_sec={current_audio_time:.3f}, sample_rate={self.input_sample_rate}")
+                self._last_audio_time_log = current_audio_time
+        else:
+            self._last_audio_time_log = current_audio_time
+            
+        return current_audio_time
 
     async def receive(self, frame: tuple[int, np.ndarray]) -> None:
         stt = self.stt
@@ -388,7 +400,7 @@ class UnmuteHandler(AsyncStreamHandler):
                 elapsed = self.stt_flush_timer.time()
                 rtf = stt.delay_sec / elapsed
                 logger.info(
-                    "Flushing finished, took %.1f ms, RTF: %.1f", elapsed * 1000, rtf
+                    "STT Flushing finished, took %.1f ms, RTF: %.1f", elapsed * 1000, rtf
                 )
                 await self._generate_response()
 
@@ -409,6 +421,7 @@ class UnmuteHandler(AsyncStreamHandler):
 
         if stt.pause_prediction.value > 0.6:
             self.debug_dict["timing"]["pause_detection"] = time_since_last_message
+            logger.info("Pause detected")
             return True
         else:
             return False
@@ -536,8 +549,15 @@ class UnmuteHandler(AsyncStreamHandler):
 
         async def _close(tts: TextToSpeech):
             logger.info("=== TTS _close() starting ===")
-            await tts.shutdown()
-            logger.info("=== TTS _close() completed ===")
+            connection_state = tts.state()
+            logger.info(f"TTS connection state at shutdown: {connection_state}")
+            
+            try:
+                await tts.shutdown()
+                logger.info("=== TTS _close() completed successfully ===")
+            except Exception as e:
+                logger.error(f"=== TTS _close() failed: {e} ===")
+                raise
 
         logger.info("=== Adding TTS quest to quest manager ===")
         quest = await self.quest_manager.add(Quest("tts", _init, _run, _close))
@@ -552,11 +572,54 @@ class UnmuteHandler(AsyncStreamHandler):
         try:
             audio_started = None
             message_count = 0
+            last_message_time = asyncio.get_event_loop().time()
+            last_text_message_time = None
+            last_audio_message_time = None
+            text_message_count = 0
+            audio_message_count = 0
+            
+            # TTS Message Flow Watchdog - monitors for stopped message flow
+            async def tts_watchdog():
+                """Monitor TTS message flow and alert if it stops unexpectedly"""
+                while True:
+                    await asyncio.sleep(5.0)  # Check every 5 seconds
+                    current_watchdog_time = asyncio.get_event_loop().time()
+                    
+                    # Check if we've been receiving messages
+                    time_since_last_message = current_watchdog_time - last_message_time
+                    
+                    # Alert if no messages for 10+ seconds (indicates potential TTS server issue)
+                    if time_since_last_message > 10.0 and message_count > 0:
+                        logger.warning(f"=== TTS MESSAGE FLOW WATCHDOG ALERT ===")
+                        logger.warning(f"No TTS messages received for {time_since_last_message:.1f}s")
+                        logger.warning(f"Last message counts: total={message_count}, text={text_message_count}, audio={audio_message_count}")
+                        logger.warning(f"TTS connection state: {tts.state()}")
+                        tts.send("Yeah it broke")
+                        
+                        # Check if TTS server may have crashed/exited
+                        if time_since_last_message > 30.0:
+                            logger.error(f"=== SUSPECTED TTS SERVER FAILURE - No messages for {time_since_last_message:.1f}s ===")
+                            logger.error("This suggests the TTS server may have crashed or exited unexpectedly")
+            
+            # Start the watchdog task
+            watchdog_task = asyncio.create_task(tts_watchdog())
 
             logger.info("=== Starting to iterate over TTS messages ===")
             async for message in tts:
+                current_time = asyncio.get_event_loop().time()
                 message_count += 1
+                last_message_time = current_time
+                
                 logger.info(f"=== Received TTS message #{message_count}: {type(message).__name__} ===")
+                
+                # Track message types and timing for flow monitoring
+                if isinstance(message, TTSTextMessage):
+                    text_message_count += 1
+                    last_text_message_time = current_time
+                elif isinstance(message, TTSAudioMessage):
+                    audio_message_count += 1
+                    last_audio_message_time = current_time
+                
                 if audio_started is not None:
                     time_since_start = self.audio_received_sec() - audio_started
                     time_received = tts.received_samples / self.input_sample_rate
@@ -604,9 +667,25 @@ class UnmuteHandler(AsyncStreamHandler):
                     logger.warning("Got unexpected message from TTS: %s", message.type)
 
         except websockets.ConnectionClosedError as e:
-            logger.error(f"TTS connection closed with an error: {e}")
+            current_time = asyncio.get_event_loop().time()
+            logger.error(f"=== TTS CONNECTION CLOSED WITH ERROR: {e} ===")
+            logger.error(f"TTS message flow stats: total={message_count if 'message_count' in locals() else 0}, text={text_message_count if 'text_message_count' in locals() else 0}, audio={audio_message_count if 'audio_message_count' in locals() else 0}")
+            if 'last_text_message_time' in locals() and last_text_message_time:
+                logger.error(f"Last text message was {current_time - last_text_message_time:.1f}s ago")
+            if 'last_audio_message_time' in locals() and last_audio_message_time:
+                logger.error(f"Last audio message was {current_time - last_audio_message_time:.1f}s ago")
+        finally:
+            # Cancel the watchdog task
+            if 'watchdog_task' in locals() and watchdog_task is not None:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
         logger.info("=== TTS loop ended, cleaning up ===")
+        logger.info(f"TTS session stats: processed {message_count if 'message_count' in locals() else 0} messages ({text_message_count if 'text_message_count' in locals() else 0} text, {audio_message_count if 'audio_message_count' in locals() else 0} audio)")
+        
         # Push some silence to flush the Opus state.
         # Not sure that this is actually needed.
         logger.info("=== Pushing silence to flush Opus state ===")
@@ -648,6 +727,7 @@ class UnmuteHandler(AsyncStreamHandler):
             # Clear any audio queued up by FastRTC's emit().
             # Not sure under what circumstatnces this is None.
             self._clear_queue()
+        logger.info("=== Clearing TTS output queue because bot was interrupted ===")
         self.output_queue = asyncio.Queue()  # Clear our own queue too
 
         # Push some silence to flush the Opus state.

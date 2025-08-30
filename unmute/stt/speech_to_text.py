@@ -208,19 +208,10 @@ class SpeechToText(ServiceWithStartup):
 
         try:
             async for message_bytes in self.websocket:
-                # Handle different protocols for Modal vs local services
-                if "modal.run" in self.stt_instance:
-                    # For Modal services, we get raw moshi-server protocol
-                    # For now, we'll skip processing these messages since the current
-                    # implementation expects msgpack format. This needs to be implemented
-                    # to properly parse moshi-server protocol.
-                    logger.debug(f"{my_id} Received raw moshi message from Modal service: {len(message_bytes)} bytes")
-                    continue
-                else:
-                    # For local services, use msgpack format
-                    data = msgpack.unpackb(message_bytes)  # type: ignore
-                    logger.debug(f"{my_id} {self.pause_prediction.value} got {data}")
-                    message: STTMessage = STTMessageAdapter.validate_python(data)
+                # For local services, use msgpack format
+                data = msgpack.unpackb(message_bytes)  # type: ignore
+                logger.debug(f"stt pause prediction: {my_id} {self.pause_prediction.value} got {data}")
+                message: STTMessage = STTMessageAdapter.validate_python(data)
 
                 match message:
                     case STTWordMessage():

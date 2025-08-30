@@ -179,6 +179,7 @@ const Unmute = () => {
     const data = JSON.parse(lastMessage.data);
     if (data.type === "response.audio.delta") {
       const opus = base64DecodeOpus(data.delta);
+      console.log(`=== FRONTEND: Received audio delta, opus size: ${opus.length} bytes ===`);
       const ap = audioProcessor.current;
       if (!ap) return;
 

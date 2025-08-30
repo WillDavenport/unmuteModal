@@ -46,6 +46,12 @@ class TTSClientEosMessage(BaseModel):
     type: Literal["Eos"] = "Eos"
 
 
+class TTSQueuedEosMessage(BaseModel):
+    """Special EOS message that can be queued with a timestamp."""
+
+    type: Literal["QueuedEos"] = "QueuedEos"
+
+
 TTSClientMessage = Annotated[
     Union[TTSClientTextMessage, TTSClientVoiceMessage, TTSClientEosMessage],
     Field(discriminator="type"),
@@ -162,6 +168,9 @@ class TextToSpeech(ServiceWithStartup):
 
         # self.query_parameters = f"?voice={self.voice}&cfg_alpha=2&format=PcmMessagePack"
         self.text_output_queue = RealtimeQueue(get_time=get_time)
+        
+        # Track the last queued text message timestamp to properly schedule EOS
+        self.last_text_message_stop_time: float | None = None
 
         self.shutdown_lock = asyncio.Lock()
         self.shutdown_complete = asyncio.Event()
@@ -202,6 +211,27 @@ class TextToSpeech(ServiceWithStartup):
                 self.time_since_first_text_sent.start_if_not_started()
 
             await self.websocket.send(msgpack.packb(message.model_dump()))
+
+    def queue_eos(self) -> None:
+        """Queue an EOS message to be sent after all currently queued text messages.
+        
+        This prevents the TTS server from shutting down before all text messages
+        have been processed and released from the queue.
+        """
+        if self.last_text_message_stop_time is not None:
+            # Schedule EOS to be sent 0.1 seconds after the last text message
+            # This small buffer ensures all text has been processed
+            eos_timestamp = self.last_text_message_stop_time + 0.1
+            logger.info(f"Queuing EOS message at timestamp {eos_timestamp:.3f}s (after last text at {self.last_text_message_stop_time:.3f}s)")
+            self.text_output_queue.put(TTSQueuedEosMessage(), eos_timestamp)
+        else:
+            # No text messages have been queued, send EOS immediately
+            logger.info("No text messages queued, sending EOS immediately")
+            asyncio.create_task(self._send_eos_immediately())
+
+    async def _send_eos_immediately(self) -> None:
+        """Send EOS message immediately to the TTS server."""
+        await self.send(TTSClientEosMessage())
         
 
     async def start_up(self):
@@ -277,9 +307,24 @@ class TextToSpeech(ServiceWithStartup):
         mt.TTS_ACTIVE_SESSIONS.inc()
 
         output_queue: RealtimeQueue[TTSMessage] = RealtimeQueue()
+        
+        # TTS Connection Health Monitoring
+        last_message_time = asyncio.get_event_loop().time()
+        message_count = 0
+        last_health_check = last_message_time
+        
+        logger.info("=== TTS __aiter__() starting - connection established ===")
 
         try:
             async for message_bytes in self.websocket:
+                current_time = asyncio.get_event_loop().time()
+                message_count += 1
+                last_message_time = current_time
+                
+                # Log health check every 10 seconds or every 50 messages
+                if (current_time - last_health_check > 10.0) or (message_count % 50 == 0):
+                    logger.info(f"TTS connection health: {message_count} messages received, last message {current_time - last_message_time:.1f}s ago, websocket state: {self.websocket.state.name}")
+                    last_health_check = current_time
                 # Handle different protocols for Modal vs local services
                 if "modal.run" in self.tts_instance:
                     # For Modal services, we get raw moshi-server protocol messages
@@ -299,9 +344,7 @@ class TextToSpeech(ServiceWithStartup):
                     message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
 
                 if isinstance(message, TTSAudioMessage):
-                    # Use `yield message` if you want to to release the audio
-                    # as fast as it's being generated. However, it might desynchronize
-                    # the text and the audio.
+                    # Queue audio messages with proper timing to prevent fast/staticky playback
                     mt.TTS_RECV_FRAMES.inc()
                     if (
                         self.waiting_first_audio
@@ -347,32 +390,55 @@ class TextToSpeech(ServiceWithStartup):
                     # has already been said, so that if there's an interruption, the
                     # chat history matches what's actually been said.
                     output_queue.put(message, message.stop_s)
-                    logger.info(f"Queued TTSTextMessage '{message.text}' with stop_s={message.stop_s}, queue size={len(output_queue.queue)}")
+                    current_time = output_queue.get_time() if output_queue.start_time else 0
+                    time_since_start = current_time - output_queue.start_time if output_queue.start_time else 0
+                    logger.info(f"Queued TTSTextMessage '{message.text}' with stop_s={message.stop_s}, current_time_since_start={time_since_start:.3f}, queue size={len(output_queue.queue)}")
+                    
+                    # Track the latest text message timestamp for EOS scheduling
+                    self.last_text_message_stop_time = message.stop_s
 
                 for _, message in output_queue.get_nowait():
                     if isinstance(message, TTSAudioMessage):
                         self.received_samples_yielded += len(message.pcm)
-
-                    yield message
+                        yield message
+                    elif isinstance(message, TTSQueuedEosMessage):
+                        # Time to send the EOS message to the TTS server
+                        logger.info("Processing queued EOS message - sending to TTS server")
+                        await self.send(TTSClientEosMessage())
+                    else:
+                        yield message
 
         except websockets.ConnectionClosedOK:
-            pass
-        except websockets.ConnectionClosedError:
+            logger.info("=== TTS connection closed normally (ConnectionClosedOK) ===")
+        except websockets.ConnectionClosedError as e:
             if self.shutdown_complete.is_set():
                 # If we closed the websocket in shutdown(), it leads to this exception
                 # (not sure why) but it's an intentional exit, so don't raise.
-                pass
+                logger.info("=== TTS connection closed during intentional shutdown ===")
             else:
+                logger.error(f"=== TTS CONNECTION LOST UNEXPECTEDLY: {e} ===")
+                current_time = asyncio.get_event_loop().time()
+                connection_duration = current_time - (last_message_time if 'last_message_time' in locals() else current_time)
+                logger.error(f"TTS server disconnected after {message_count if 'message_count' in locals() else 0} messages, connection was active for {connection_duration:.1f}s")
                 raise
+        except Exception as e:
+            logger.error(f"=== TTS CONNECTION ERROR: {type(e).__name__}: {e} ===")
+            logger.error(f"TTS failed after {message_count if 'message_count' in locals() else 0} messages")
+            raise
 
         # Empty the queue if the connection is closed - we're releasing the messages
         # in real time, see above.
+        remaining_messages = 0
         async for _, message in output_queue:
             if self.shutdown_complete.is_set():
                 break
             if isinstance(message, TTSAudioMessage):
                 self.received_samples_yielded += len(message.pcm)
+            remaining_messages += 1
             yield message
 
-        logger.debug("TTS __aiter__() finished")
+        if remaining_messages > 0:
+            logger.info(f"=== TTS __aiter__() finished - released {remaining_messages} remaining queued messages ===")
+        else:
+            logger.info("=== TTS __aiter__() finished - no remaining messages ===")
         await self.shutdown()

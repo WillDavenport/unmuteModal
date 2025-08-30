@@ -120,10 +120,26 @@ async def find_instance(
                 await client.start_up()
                 print(f"=== SERVICE_DISCOVERY: [{service_name}] Successfully connected to {instance} ===")
         except Exception as exc:
-            print(f"=== SERVICE_DISCOVERY: [{service_name}] Failed to connect to {instance}: {exc} ===")
+            elapsed = pingwatch.time()
+            print(f"=== SERVICE_DISCOVERY: [{service_name}] Failed to connect to {instance}: {exc} (took {elapsed*1000:.1f}ms) ===")
             max_trials -= 1
+            
+            # Enhanced TTS-specific logging for debugging server shutdowns
+            if service_name == "tts":
+                logger.error(f"=== TTS CONNECTION FAILURE ===")
+                logger.error(f"TTS instance: {instance}")
+                logger.error(f"Error type: {type(exc).__name__}")
+                logger.error(f"Error message: {exc}")
+                logger.error(f"Connection attempt took: {elapsed*1000:.1f}ms")
+                logger.error(f"Remaining trials: {max_trials}")
+                
+                # Check if this looks like a server restart scenario
+                if elapsed < 1.0:  # Very quick failure suggests server not running
+                    logger.error("=== QUICK FAILURE - TTS SERVER MAY NOT BE RUNNING ===")
+                elif elapsed > 30.0:  # Long timeout suggests server hanging/overloaded
+                    logger.error("=== TIMEOUT - TTS SERVER MAY BE HANGING OR OVERLOADED ===")
+            
             if isinstance(exc, MissingServiceAtCapacity):
-                elapsed = pingwatch.time()
                 logger.info(
                     f"[{service_name}] Instance {instance} took {elapsed * 1000:.1f}ms to reject us."
                 )
@@ -164,8 +180,13 @@ async def find_instance(
         logger.info(
             f"[{service_name}] Instance {instance} took {elapsed * 1000:.1f}ms to accept us."
         )
-
+        
+        # Enhanced TTS connection success logging
         if service_name == "tts":
+            logger.info(f"=== TTS CONNECTION SUCCESSFUL ===")
+            logger.info(f"TTS instance: {instance}")
+            logger.info(f"Connection time: {elapsed * 1000:.1f}ms")
+            logger.info(f"Total discovery time: {stopwatch.time() * 1000:.1f}ms")
             mt.TTS_PING_TIME.observe(elapsed)
         elif service_name == "stt":
             mt.STT_PING_TIME.observe(elapsed)

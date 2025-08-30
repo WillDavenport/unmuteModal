@@ -267,7 +267,7 @@ def install_moshi_server_with_cuda():
         "OPENSSL_LIB_DIR": "/usr/lib/x86_64-linux-gnu",
         "OPENSSL_INCLUDE_DIR": "/usr/include/openssl",
         "PKG_CONFIG_PATH": "/usr/lib/x86_64-linux-gnu/pkgconfig",
-        "RUST_LOG": "warn,moshi_server::batched_asr=off",  # Reduce noisy logs
+        "RUST_LOG": "info",  # Reduce noisy logs
         # CUDA environment variables
         "CUDA_ROOT": "/usr/local/cuda-12.1",
         "CUDA_PATH": "/usr/local/cuda-12.1",
@@ -351,7 +351,7 @@ def install_moshi_server_with_cuda():
 
 
 @app.cls(
-    gpu="L4",
+    gpu="L40S",
     image=stt_image,
     volumes={
         "/models": models_volume,
@@ -383,7 +383,7 @@ class STTService:
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
         # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
-        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
+        env["RUST_LOG"] = "warn"
         
         # Verify the installed binary
         print(f"Verifying moshi-server at: {moshi_server_path}")
@@ -411,7 +411,7 @@ lm_model_file = "hf://kyutai/stt-1b-en_fr-candle/model.safetensors"
 text_tokenizer_file = "hf://kyutai/stt-1b-en_fr-candle/tokenizer_en_fr_audio_8000.model"
 audio_tokenizer_file = "hf://kyutai/stt-1b-en_fr-candle/mimi-pytorch-e351c8d8@125.safetensors"
 asr_delay_in_tokens = 6
-batch_size = 1
+batch_size = 64
 conditioning_learnt_padding = true
 temperature = 0.25
 
@@ -592,7 +592,7 @@ dim = 6
                 try:
                     print("=== STT_SERVICE: Connecting to internal moshi server ===")
                     moshi_connection = await websockets.connect(
-                        "ws://localhost:8090/api/asr-streaming",
+                        "ws://localhost:8090/api/asr-streaming?format=PcmMessagePack",
                         additional_headers={"kyutai-api-key": "public_token"}
                     )
                     print("=== STT_SERVICE: Successfully connected to internal moshi server ===")
@@ -688,7 +688,7 @@ class TTSService:
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
         # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
-        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
+        env["RUST_LOG"] = "info"
         
         # Check if HuggingFace token is available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -760,7 +760,7 @@ authorized_ids = ["public_token"]
 type = "Py"
 path = "/api/tts_streaming"
 text_tokenizer_file = "hf://kyutai/tts-1.6b-en_fr/tokenizer_spm_8k_en_fr_audio.model"
-batch_size = 2
+batch_size = 16
 text_bos_token = 1
 
 [modules.tts_py.py]
@@ -773,7 +773,7 @@ cfg_is_no_text = true
 padding_between = 1
 n_q = 24
 # Add debug logging
-log_level = "debug"
+log_level = "info"
 '''
         
         os.makedirs("/tmp/unmute_logs", exist_ok=True)
@@ -820,8 +820,7 @@ log_level = "debug"
                     if line:
                         # Filter out noisy batched_asr logs
                         line_stripped = line.strip()
-                        if "moshi_server::batched_asr" not in line_stripped:
-                            print(f"TTS moshi-server: {line_stripped}")
+                        print(f"TTS moshi-server: {line_stripped}")
             except Exception as e:
                 print(f"TTS output monitor error: {e}")
         
@@ -1427,7 +1426,7 @@ class OrchestratorService:
                     async with handler:
                         logger.debug("Handler context entered, calling start_up")
                         await handler.start_up()
-                        logger.debug("Handler start_up completed, creating task group")
+                        logger.info("Handler start_up completed, creating task group")
                         async with asyncio.TaskGroup() as tg:
                             tg.create_task(
                                 receive_loop(websocket, handler, emit_queue), name="receive_loop()"
