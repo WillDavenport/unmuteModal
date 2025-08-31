@@ -270,7 +270,6 @@ class UnmuteHandler(AsyncStreamHandler):
 
             logger.info(f"=== LLM stream completed with {len(response_words)} words ===")
             logger.info("Full LLM response: %s", "".join(response_words))
-            await tts.send("".join(response_words))
 
             if tts is not None:
                 logger.info("=== Queuing TTS EOS after text messages ===")
@@ -591,7 +590,7 @@ class UnmuteHandler(AsyncStreamHandler):
                         logger.warning(f"No TTS messages received for {time_since_last_message:.1f}s")
                         logger.warning(f"Last message counts: total={message_count}, text={text_message_count}, audio={audio_message_count}")
                         logger.warning(f"TTS connection state: {tts.state()}")
-                        tts.send("Yeah it broke")
+                        await tts.send("Yeah it broke")
                         
                         # Check if TTS server may have crashed/exited
                         if time_since_last_message > 30.0:

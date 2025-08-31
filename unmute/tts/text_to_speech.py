@@ -236,10 +236,8 @@ class TextToSpeech(ServiceWithStartup):
 
     async def start_up(self):
         # For Modal services, connect to /ws instead of /api/tts_streaming
-        if "modal.run" in self.tts_instance:
-            url = self.tts_instance + "/ws" + self.query.to_url_params()
-        else:
-            url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
+
+        url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
             
         logger.info(f"Connecting to TTS: {url}")
         self.websocket = await websockets.connect(
