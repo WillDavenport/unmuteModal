@@ -113,7 +113,7 @@ def _ws_to_http(ws_url: str) -> str:
 def _check_server_status(server_url: str) -> bool:
     """Check if the server is up by sending a GET request."""
     try:
-        response = requests.get(server_url, timeout=2)
+        response = requests.get(server_url, timeout=60)
         logger.info(f"Response from {server_url}: {response}")
         return response.status_code == 200
     except requests.exceptions.RequestException as e:
@@ -146,39 +146,61 @@ class HealthStatus(BaseModel):
 async def _get_health(
     _none: None,
 ):  # dummy param _none because caching function expects a single param as cache key.
+    print("=== HEALTH_CHECK: Starting health check ===")
     async with asyncio.TaskGroup() as tg:
+        # For Modal deployment, check root endpoints instead of specific API paths
+        # This allows the health check to work with both local Moshi servers and Modal services
+        tts_endpoint = _ws_to_http(TTS_SERVER)
+        if "modal.run" in tts_endpoint:
+            tts_endpoint += "/"  # Modal services use root endpoint
+        else:
+            tts_endpoint += "/api/build_info"  # Local Moshi servers
+        
+        stt_endpoint = _ws_to_http(STT_SERVER)
+        if "modal.run" in stt_endpoint:
+            stt_endpoint += "/"  # Modal services use root endpoint
+        else:
+            stt_endpoint += "/api/build_info"  # Local Moshi servers
+        
+        llm_endpoint = LLM_SERVER
+        if "modal.run" in llm_endpoint:
+            llm_endpoint += "/"  # Modal services use root endpoint
+        else:
+            llm_endpoint += "/v1/models"  # Local VLLM servers
+        
+        voice_cloning_endpoint = _ws_to_http(VOICE_CLONING_SERVER)
+        if "modal.run" in voice_cloning_endpoint:
+            voice_cloning_endpoint += "/"  # Modal services use root endpoint
+        else:
+            voice_cloning_endpoint += "/api/build_info"  # Local Moshi servers
+        
+        print(f"=== HEALTH_CHECK: Checking endpoints - TTS: {tts_endpoint}, STT: {stt_endpoint}, LLM: {llm_endpoint}, Voice: {voice_cloning_endpoint} ===")
+        
         tts_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(TTS_SERVER) + "/api/build_info"
-            )
+            asyncio.to_thread(_check_server_status, tts_endpoint)
         )
         stt_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(STT_SERVER) + "/api/build_info"
-            )
+            asyncio.to_thread(_check_server_status, stt_endpoint)
         )
         llm_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status, _ws_to_http(LLM_SERVER) + "/v1/models"
-            )
+            asyncio.to_thread(_check_server_status, llm_endpoint)
         )
         voice_cloning_up = tg.create_task(
-            asyncio.to_thread(
-                _check_server_status,
-                _ws_to_http(VOICE_CLONING_SERVER) + "/api/build_info",
-            )
+            asyncio.to_thread(_check_server_status, voice_cloning_endpoint)
         )
         tts_up_res = await tts_up
         stt_up_res = await stt_up
         llm_up_res = await llm_up
         voice_cloning_up_res = await voice_cloning_up
 
-    return HealthStatus(
+    health_result = HealthStatus(
         tts_up=tts_up_res,
         stt_up=stt_up_res,
         llm_up=llm_up_res,
         voice_cloning_up=voice_cloning_up_res,
     )
+    print(f"=== HEALTH_CHECK: Health check completed: {health_result} ===")
+    return health_result
 
 
 @app.get("/v1/health")
@@ -395,12 +417,14 @@ async def receive_loop(
 
     Can decide to send messages via `emit_queue`.
     """
+    print("=== RECEIVE_LOOP: Starting receive loop ===")
     opus_reader = sphn.OpusStreamReader(SAMPLE_RATE)
     wait_for_first_opus = True
     while True:
         try:
             message_raw = await websocket.receive_text()
         except WebSocketDisconnect as e:
+            print(f"=== RECEIVE_LOOP: WebSocket disconnected: {e.code=} {e.reason=} ===")
             logger.info(
                 "receive_loop() stopped because WebSocket disconnected: "
                 f"{e.code=} {e.reason=}"
@@ -409,14 +433,30 @@ async def receive_loop(
         except RuntimeError as e:
             # This is expected when the client disconnects
             if "WebSocket is not connected" not in str(e):
+                print(f"=== RECEIVE_LOOP: Unexpected RuntimeError: {e} ===")
                 raise  # re-raise unexpected errors
 
+            print(f"=== RECEIVE_LOOP: WebSocket disconnected (RuntimeError): {e} ===")
             logger.info("receive_loop() stopped because WebSocket disconnected.")
             raise WebSocketClosedError() from e
 
         try:
+            # Parse the raw message to check for ping/pong
+            raw_parsed = json.loads(message_raw)
+            if raw_parsed.get("type") == "ping":
+                # Respond to ping with pong
+                await emit_queue.put(
+                    ora.UnmuteAdditionalOutputs(args={"type": "pong"})
+                )
+                continue
+            elif raw_parsed.get("type") == "pong":
+                # Ignore pong responses (they're handled by the WebSocket layer)
+                logger.debug("Received pong from client")
+                continue
+            
             message: ora.ClientEvent = ClientEventAdapter.validate_json(message_raw)
         except json.JSONDecodeError as e:
+            print(f"=== RECEIVE_LOOP: Invalid JSON: {e} ===")
             await emit_queue.put(
                 ora.Error(
                     error=ora.ErrorDetails(
@@ -427,6 +467,7 @@ async def receive_loop(
             )
             continue
         except ValidationError as e:
+            print(f"=== RECEIVE_LOOP: ValidationError: {e} ===")
             await emit_queue.put(
                 ora.Error(
                     error=ora.ErrorDetails(
@@ -498,20 +539,40 @@ async def emit_loop(
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Send messages to the WebSocket."""
+    logger.debug("Starting emit loop")
     emit_debug_logger = EmitDebugLogger()
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
+    audio_emitted_count = 0
+    last_keepalive = asyncio.get_event_loop().time()
+    KEEPALIVE_INTERVAL = 240  # 4 minutes - send keepalive before 5min timeout
 
     while True:
         if (
             websocket.application_state == WebSocketState.DISCONNECTED
             or websocket.client_state == WebSocketState.DISCONNECTED
         ):
+            logger.debug(f"WebSocket disconnected (states: app={websocket.application_state}, client={websocket.client_state})")
             logger.info("emit_loop() stopped because WebSocket disconnected")
             raise WebSocketClosedError()
 
+        # logger.info("emit_loop() got message, calling handler.emit()")
+        # # Check if we need to send a keepalive ping
+        # current_time = asyncio.get_event_loop().time()
+        # if current_time - last_keepalive > KEEPALIVE_INTERVAL:
+        #     try:
+        #         # Send custom ping message (matches frontend heartbeat implementation)
+        #         ping_message = json.dumps({"type": "ping"})
+        #         await websocket.send_text(ping_message)
+        #         last_keepalive = current_time
+        #         logger.debug("Sent WebSocket keepalive ping")
+        #     except Exception as e:
+        #         logger.warning(f"Failed to send keepalive ping: {e}")
+        #         # Don't raise here, let the normal WebSocket error handling deal with it
+
         try:
             to_emit = emit_queue.get_nowait()
+            logger.info(f"Got queued message")
         except asyncio.QueueEmpty:
             emitted_by_handler = await handler.emit()
 
@@ -524,21 +585,33 @@ async def emit_loop(
                 )
             elif isinstance(emitted_by_handler, CloseStream):
                 # Close here explicitly so that the receive loop stops too
+                logger.info("emit_loop() got CloseStream, closing WebSocket")
                 await websocket.close()
                 break
             elif isinstance(emitted_by_handler, ora.ServerEvent):
                 to_emit = emitted_by_handler
             else:
-                _sr, audio = emitted_by_handler
-                audio = audio_to_float32(audio)
-                opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
-                # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
-                if opus_bytes:
-                    to_emit = ora.ResponseAudioDelta(
-                        delta=base64.b64encode(opus_bytes).decode("utf-8"),
-                    )
-                else:
+                # Handle audio tuple: (sample_rate, audio_data)
+                try:
+                    _sr, audio = emitted_by_handler
+                    audio = audio_to_float32(audio)
+                    opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
+                    # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
+                    if opus_bytes:
+                        logger.info(f"Sending audio to realtime websocket: {len(opus_bytes)} opus bytes")
+                        to_emit = ora.ResponseAudioDelta(
+                            delta=base64.b64encode(opus_bytes).decode("utf-8"),
+                        )
+                    else:
+                        logger.warning(f"No audio to send to realtime websocket")
+                        continue
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to unpack emitted_by_handler: {type(emitted_by_handler)=}, {emitted_by_handler=}, error: {e}")
+                    # Skip this iteration if we can't handle the data
                     continue
+        except Exception as e:
+            logger.error(f"emit_loop() got exception: {e}")
+            raise
 
         emit_debug_logger.on_emit(to_emit)
 
@@ -546,19 +619,26 @@ async def emit_loop(
             await handler.recorder.add_event("server", to_emit)
 
         try:
+            if isinstance(to_emit, ora.ResponseAudioDelta):
+                audio_emitted_count += 1
+            logger.info(f"Sending message #{audio_emitted_count}: {to_emit.type}")
             await websocket.send_text(to_emit.model_dump_json())
+            logger.info(f"Successfully sent message #{audio_emitted_count}")
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):
                     # This is expected when the client disconnects
                     message = f"emit_loop() stopped because WebSocket disconnected: {e}"
+                    logger.info(f"{message}")
                 else:
+                    logger.error(f"Unexpected RuntimeError: {e}")
                     raise
             else:
                 message = (
                     "emit_loop() stopped because WebSocket disconnected: "
                     f"{e.code=} {e.reason=}"
                 )
+                logger.info(f"{message}")
 
             logger.info(message)
             raise WebSocketClosedError() from e

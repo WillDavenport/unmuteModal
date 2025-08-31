@@ -57,7 +57,7 @@ const Unmute = () => {
     const checkHealth = async () => {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
+        const timeoutId = setTimeout(() => controller.abort(), 60000); // 1 minute
 
         const response = await fetch(`${backendServerUrl}/v1/health`, {
           signal: controller.signal,
@@ -65,6 +65,7 @@ const Unmute = () => {
 
         clearTimeout(timeoutId);
         if (!response.ok) {
+          console.error("Backend server is not healthy", response);
           setHealthStatus({
             connected: "yes_request_fail",
             ok: false,
@@ -92,6 +93,21 @@ const Unmute = () => {
     webSocketUrl || null,
     {
       protocols: ["realtime"],
+      heartbeat: {
+        message: JSON.stringify({ type: "ping" }),
+        returnMessage: JSON.stringify({ type: "pong" }),
+        timeout: 240000, // 4 minutes
+        interval: 240000, // 4 minutes - send heartbeat before 5min timeout
+      },
+      onOpen: () => {
+        console.log("=== FRONTEND: WebSocket connection opened ===");
+      },
+      onClose: (event) => {
+        console.log(`=== FRONTEND: WebSocket connection closed: code=${event.code}, reason=${event.reason} ===`);
+      },
+      onError: (event) => {
+        console.log("=== FRONTEND: WebSocket error:", event);
+      },
     },
     shouldConnect
   );
@@ -163,6 +179,7 @@ const Unmute = () => {
     const data = JSON.parse(lastMessage.data);
     if (data.type === "response.audio.delta") {
       const opus = base64DecodeOpus(data.delta);
+      console.log(`=== FRONTEND: Received audio delta, opus size: ${opus.length} bytes ===`);
       const ap = audioProcessor.current;
       if (!ap) return;
 
@@ -223,22 +240,24 @@ const Unmute = () => {
   // When we connect, we send the initial config (voice and instructions) to the server.
   // Also clear the chat history.
   useEffect(() => {
+    console.log(`=== FRONTEND: Ready state changed: ${readyState} ===`);
     if (readyState !== ReadyState.OPEN) return;
 
+    console.log("=== FRONTEND: WebSocket is open, sending session.update ===");
     const recordingConsent =
       localStorage.getItem(COOKIE_CONSENT_STORAGE_KEY) === "true";
 
     setRawChatHistory([]);
-    sendMessage(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          instructions: unmuteConfig.instructions,
-          voice: unmuteConfig.voice,
-          allow_recording: recordingConsent,
-        },
-      })
-    );
+    const sessionMessage = {
+      type: "session.update",
+      session: {
+        instructions: unmuteConfig.instructions,
+        voice: unmuteConfig.voice,
+        allow_recording: recordingConsent,
+      },
+    };
+    console.log("=== FRONTEND: Sending session.update:", sessionMessage);
+    sendMessage(JSON.stringify(sessionMessage));
   }, [unmuteConfig, readyState, sendMessage]);
 
   // Disconnect when the voice or instruction changes.

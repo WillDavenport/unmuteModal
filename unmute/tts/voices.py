@@ -88,7 +88,10 @@ async def text_to_speech_non_streaming(
     async def websocket_client():
         uri = f"{url}/api/tts_streaming?voice={voice}&{CFG_PARAM}"
 
-        async with websockets.connect(uri, additional_headers=HEADERS) as websocket:
+        async with await asyncio.wait_for(
+            websockets.connect(uri, additional_headers=HEADERS),
+            timeout=60.0  # Allow 60 seconds for cold start
+        ) as websocket:
             send_task = asyncio.create_task(send_messages(websocket))
             receive_task = asyncio.create_task(receive_messages(websocket))
             _, audio = await asyncio.gather(send_task, receive_task)

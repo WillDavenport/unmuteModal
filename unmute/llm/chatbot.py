@@ -59,6 +59,7 @@ class Chatbot:
             return False
 
         if not self.chat_history or self.chat_history[-1]["role"] != role:
+            logger.info(f"Chat role changed to {role=} with delta {delta=}")
             self.chat_history.append({"role": role, "content": delta})
             return True
         else:

@@ -86,7 +86,7 @@ class Quest[T]:
         try:
             if self.close is not None:
                 # We explicitely wait on the init being successful to avoid weird mixed-status.
-                logger.debug("Quest %s closing...", self.name)
+                logger.info("Quest %s closing...", self.name)
                 try:
                     if self._data.done() and self._data.exception() is None:
                         await self.close(await self.get())
@@ -94,7 +94,7 @@ class Quest[T]:
                     pass
                 self.close = None
         finally:
-            logger.debug("Quest %s canceling...", self.name)
+            logger.info("Quest %s canceling...", self.name)
             self.task.cancel()
 
 
@@ -135,13 +135,13 @@ class QuestManager:
 
     @staticmethod
     def _one_is_done(name: str, agg_future: asyncio.Future, future: asyncio.Future):
-        logger.debug("Quest %s is done.", name)
+        logger.info("Quest %s is done.", name)
         try:
             future.result()
         except asyncio.CancelledError:
-            logger.debug("Quest %s was cancelled.", name)
+            logger.info("Quest %s was cancelled.", name)
         except Exception as exc:
-            logger.debug("Quest %s failed with %r.", name, exc)
+            logger.warning("Quest %s failed with %r.", name, exc)
             if not agg_future.done():
                 agg_future.set_exception(exc)
         else:
