@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-
 export const useBackendServerUrl = () => {
-  const [backendServerUrl, setBackendServerUrl] = useState<string | null>("https://willdavenport--voice-stack-orchestratorservice-web.modal.run");
+  const useProdUrl = process.env.NEXT_PUBLIC_USE_PROD_URL === "true";
+  const backendServerUrl = useProdUrl 
+    ? "https://willdavenport--voice-stack-orchestratorservice-web.modal.run"
+    : "https://willdavenport--voice-stack-orchestratorservice-web-dev.modal.run";
 
   // // Get the backend server URL. This is a bit involved to support different deployment methods.
   // useEffect(() => {

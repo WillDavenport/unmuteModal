@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev-prod-url": "NEXT_PUBLIC_USE_PROD_URL=true next dev",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"
