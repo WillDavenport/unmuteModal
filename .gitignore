@@ -26,3 +26,4 @@ CLAUDE.md
 .claude/settings.local.json
 
 cmake-3.29.8-macos-universal.tar.gz
+cmake-3.29.8-linux-x86_64.tar.gz
