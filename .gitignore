@@ -24,3 +24,5 @@ certs/
 volumes/
 CLAUDE.md
 .claude/settings.local.json
+
+cmake-3.29.8-macos-universal.tar.gz
