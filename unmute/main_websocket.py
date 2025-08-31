@@ -487,6 +487,7 @@ async def receive_loop(
                 # Somehow the UI is sending us potentially old messages from a previous
                 # connection on reconnect, so that we might get some old OGG packets,
                 # waiting for the bit set for first packet to feed to the decoder.
+                logger.warning("Received opus packet, waiting for first packet")
                 if opus_bytes[5] & 2:
                     wait_for_first_opus = False
                 else:

@@ -687,8 +687,15 @@ class TTSService:
         env = os.environ.copy()
         cargo_bin_path = os.path.expanduser("~/.cargo/bin")
         env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
-        # Reduce noisy batched_asr logs by setting log level to off for moshi_server::batched_asr
-        env["RUST_LOG"] = "info"
+
+        # ADD THIS LINE - critical for Python module loading:
+        env["LD_LIBRARY_PATH"] = subprocess.check_output([
+            "python", "-c", 
+            "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"
+        ], text=True).strip()
+
+        # Also update RUST_LOG to match documentation:
+        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
         
         # Check if HuggingFace token is available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")

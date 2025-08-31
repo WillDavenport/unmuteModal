@@ -307,7 +307,8 @@ async def _main(
     basic_auth: tuple[str, str] | None,
     listen: bool,
 ) -> list[BenchmarkMessage] | BaseException:
-    voice = get_voice(server_url, basic_auth)
+    # voice = get_voice(server_url, basic_auth)
+    voice = "en_US-0.0.3.wav"
 
     websocket_url = f"{server_url.strip('/')}/v1/realtime"
     async with websockets.connect(
