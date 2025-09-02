@@ -54,7 +54,7 @@ from unmute.tts.voice_donation import (
     submit_voice_donation,
 )
 from unmute.tts.voices import VoiceList
-from unmute.unmute_handler import UnmuteHandler
+from unmute.conversation import conversation_manager
 
 app = FastAPI()
 
@@ -326,10 +326,11 @@ async def websocket_route(websocket: WebSocket):
             # will not connect.
             await websocket.accept(subprotocol="realtime")
 
-            handler = UnmuteHandler()
-            async with handler:
-                await handler.start_up()
-                await _run_route(websocket, handler)
+            conversation = await conversation_manager.create_conversation()
+            try:
+                await _run_route(websocket, conversation)
+            finally:
+                await conversation_manager.remove_conversation(conversation.conversation_id)
 
         except Exception as exc:
             await _report_websocket_exception(websocket, exc)
@@ -382,7 +383,7 @@ async def _report_websocket_exception(websocket: WebSocket, exc: Exception):
             logger.warning("Socket already closed.")
 
 
-async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
+async def _run_route(websocket: WebSocket, conversation):
     health = await get_health()
     if not health.ok:
         logger.info("Health check failed, closing WebSocket connection.")
@@ -396,21 +397,19 @@ async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(
-                receive_loop(websocket, handler, emit_queue), name="receive_loop()"
+                receive_loop(websocket, conversation, emit_queue), name="receive_loop()"
             )
             tg.create_task(
-                emit_loop(websocket, handler, emit_queue), name="emit_loop()"
+                emit_loop(websocket, conversation, emit_queue), name="emit_loop()"
             )
-            tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
     finally:
-        await handler.cleanup()
         logger.info("websocket_route() finished")
 
 
 async def receive_loop(
     websocket: WebSocket,
-    handler: UnmuteHandler,
+    conversation,
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Receive messages from the WebSocket.
@@ -499,9 +498,9 @@ async def receive_loop(
             )
 
             if pcm.size:
-                await handler.receive((SAMPLE_RATE, pcm[np.newaxis, :]))
+                await conversation.receive((SAMPLE_RATE, pcm[np.newaxis, :]))
         elif isinstance(message, ora.SessionUpdate):
-            await handler.update_session(message.session)
+            await conversation.update_session(message.session)
             await emit_queue.put(ora.SessionUpdated(session=message.session))
 
         elif isinstance(message, ora.UnmuteAdditionalOutputs):
@@ -512,8 +511,8 @@ async def receive_loop(
         else:
             logger.info("Ignoring message:", str(message)[:100])
 
-        if message_to_record is not None and handler.recorder is not None:
-            await handler.recorder.add_event("client", message_to_record)
+        if message_to_record is not None and conversation.recorder is not None:
+            await conversation.recorder.add_event("client", message_to_record)
 
 
 class EmitDebugLogger:
@@ -536,7 +535,7 @@ class EmitDebugLogger:
 
 async def emit_loop(
     websocket: WebSocket,
-    handler: UnmuteHandler,
+    conversation,
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Send messages to the WebSocket."""
@@ -575,7 +574,7 @@ async def emit_loop(
             to_emit = emit_queue.get_nowait()
             logger.info(f"Got queued message")
         except asyncio.QueueEmpty:
-            emitted_by_handler = await handler.emit()
+            emitted_by_handler = await conversation.emit()
 
             if emitted_by_handler is None:
                 continue
@@ -616,8 +615,8 @@ async def emit_loop(
 
         emit_debug_logger.on_emit(to_emit)
 
-        if handler.recorder is not None:
-            await handler.recorder.add_event("server", to_emit)
+        if conversation.recorder is not None:
+            await conversation.recorder.add_event("server", to_emit)
 
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):

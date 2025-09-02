@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.express as px
 from fastrtc import Stream, get_hf_turn_credentials
 
-from unmute.unmute_handler import GradioUpdate, UnmuteHandler
+from unmute.conversation import GradioUpdate, create_conversation_for_gradio
 
 if __name__ == "__main__":
     gradio_chatbot = gr.Chatbot(type="messages")
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     # rtc_configuration = get_cloudflare_rtc_configuration()
 
     stream = Stream(
-        handler=UnmuteHandler(),
+        handler=create_conversation_for_gradio(),
         modality="audio",
         mode="send-receive",
         # rtc_configuration=rtc_configuration,
