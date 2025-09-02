@@ -54,7 +54,8 @@ from unmute.tts.voice_donation import (
     submit_voice_donation,
 )
 from unmute.tts.voices import VoiceList
-from unmute.unmute_handler import UnmuteHandler
+from unmute.conversation_handler import ConversationUnmuteHandler
+from unmute.conversation import ConversationManager
 
 app = FastAPI()
 
@@ -69,6 +70,9 @@ logging.basicConfig(
 # server handle more. This is to avoid the GIL.
 MAX_CLIENTS = 4
 SEMAPHORE = asyncio.Semaphore(MAX_CLIENTS)
+
+# Global conversation manager
+CONVERSATION_MANAGER = ConversationManager()
 
 Instrumentator().instrument(app).expose(app)
 PROFILE_ACTIVE = False
@@ -326,7 +330,7 @@ async def websocket_route(websocket: WebSocket):
             # will not connect.
             await websocket.accept(subprotocol="realtime")
 
-            handler = UnmuteHandler()
+            handler = ConversationUnmuteHandler(CONVERSATION_MANAGER)
             async with handler:
                 await handler.start_up()
                 await _run_route(websocket, handler)
@@ -382,7 +386,7 @@ async def _report_websocket_exception(websocket: WebSocket, exc: Exception):
             logger.warning("Socket already closed.")
 
 
-async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
+async def _run_route(websocket: WebSocket, handler: ConversationUnmuteHandler):
     health = await get_health()
     if not health.ok:
         logger.info("Health check failed, closing WebSocket connection.")
@@ -401,7 +405,6 @@ async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
             tg.create_task(
                 emit_loop(websocket, handler, emit_queue), name="emit_loop()"
             )
-            tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
     finally:
         await handler.cleanup()
@@ -410,7 +413,7 @@ async def _run_route(websocket: WebSocket, handler: UnmuteHandler):
 
 async def receive_loop(
     websocket: WebSocket,
-    handler: UnmuteHandler,
+    handler: ConversationUnmuteHandler,
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Receive messages from the WebSocket.
@@ -536,7 +539,7 @@ class EmitDebugLogger:
 
 async def emit_loop(
     websocket: WebSocket,
-    handler: UnmuteHandler,
+    handler: ConversationUnmuteHandler,
     emit_queue: asyncio.Queue[ora.ServerEvent],
 ):
     """Send messages to the WebSocket."""

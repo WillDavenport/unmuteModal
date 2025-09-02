@@ -1418,7 +1418,8 @@ class OrchestratorService:
                 return
             
             # Import the complete websocket handling logic
-            from unmute.unmute_handler import UnmuteHandler
+            from unmute.conversation_handler import ConversationUnmuteHandler
+            from unmute.conversation import ConversationManager
             from unmute.main_websocket import receive_loop, emit_loop, debug_running_tasks, _get_health, _report_websocket_exception
             import unmute.openai_realtime_api_events as ora
             from fastapi import status
@@ -1426,7 +1427,8 @@ class OrchestratorService:
             try:
                 logger.debug("Creating handler instance")
                 # Create handler instance
-                handler = UnmuteHandler()
+                conversation_manager = ConversationManager()
+                handler = ConversationUnmuteHandler(conversation_manager)
                 
                 logger.debug("Checking health status")
                 # Check health first
@@ -1459,7 +1461,7 @@ class OrchestratorService:
                             tg.create_task(
                                 emit_loop(websocket, handler, emit_queue), name="emit_loop()"
                             )
-                            tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
+                            # No quest_manager.wait() needed with new conversation architecture
                             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
                             logger.debug("All tasks created, task group running")
                 except Exception as handler_exc:
