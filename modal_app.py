@@ -1418,15 +1418,15 @@ class OrchestratorService:
                 return
             
             # Import the complete websocket handling logic
-            from unmute.unmute_handler import UnmuteHandler
+            from unmute.conversation import conversation_manager
             from unmute.main_websocket import receive_loop, emit_loop, debug_running_tasks, _get_health, _report_websocket_exception
             import unmute.openai_realtime_api_events as ora
             from fastapi import status
             
             try:
-                logger.debug("Creating handler instance")
-                # Create handler instance
-                handler = UnmuteHandler()
+                logger.debug("Creating conversation instance")
+                # Create conversation instance
+                conversation = await conversation_manager.create_conversation()
                 
                 logger.debug("Checking health status")
                 # Check health first
@@ -1448,26 +1448,22 @@ class OrchestratorService:
                 
                 emit_queue: asyncio.Queue[ora.ServerEvent] = asyncio.Queue()
                 try:
-                    async with handler:
-                        logger.debug("Handler context entered, calling start_up")
-                        await handler.start_up()
-                        logger.info("Handler start_up completed, creating task group")
-                        async with asyncio.TaskGroup() as tg:
-                            tg.create_task(
-                                receive_loop(websocket, handler, emit_queue), name="receive_loop()"
-                            )
-                            tg.create_task(
-                                emit_loop(websocket, handler, emit_queue), name="emit_loop()"
-                            )
-                            tg.create_task(handler.quest_manager.wait(), name="quest_manager.wait()")
-                            tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
-                            logger.debug("All tasks created, task group running")
-                except Exception as handler_exc:
-                    print(f"=== ORCHESTRATOR: Exception in handler context: {handler_exc} ===")
+                    logger.debug("Conversation services already started, creating task group")
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(
+                            receive_loop(websocket, conversation, emit_queue), name="receive_loop()"
+                        )
+                        tg.create_task(
+                            emit_loop(websocket, conversation, emit_queue), name="emit_loop()"
+                        )
+                        tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
+                        logger.debug("All tasks created, task group running")
+                except Exception as conversation_exc:
+                    print(f"=== ORCHESTRATOR: Exception in conversation context: {conversation_exc} ===")
                     raise
                 finally:
-                    print("=== ORCHESTRATOR: Cleaning up handler ===")
-                    await handler.cleanup()
+                    print("=== ORCHESTRATOR: Cleaning up conversation ===")
+                    await conversation_manager.remove_conversation(conversation.conversation_id)
                     print("=== ORCHESTRATOR: websocket_route() finished ===")
                     
             except Exception as exc:
