@@ -18,6 +18,7 @@ This reduces initial TTS startup time significantly while maintaining voice vari
 
 import modal
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +359,7 @@ def install_moshi_server_with_cuda():
         "/rust-binaries": rust_binaries_volume,
     },
     secrets=secrets,
-    min_containers=0,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
 @modal.concurrent(max_inputs=10)
@@ -628,6 +629,7 @@ dim = 6
                         try:
                             while True:
                                 data = await websocket.receive_bytes()
+                                logger.info(f"=== STT: Sending data to moshi server: {len(data)} bytes ===")
                                 await moshi_ws.send(data)
                         except WebSocketDisconnect:
                             pass
@@ -636,8 +638,10 @@ dim = 6
                         try:
                             async for message in moshi_ws:
                                 if isinstance(message, bytes):
+                                    logger.info(f"=== STT: Received bytes from moshi-server, sending to client: {len(message)} bytes ===")
                                     await websocket.send_bytes(message)
                                 else:
+                                    logger.info(f"=== STT: Received text from moshi-server, sending to client: {message[:50]} ===")
                                     await websocket.send_text(message)
                         except Exception as e:
                             print(f"STT moshi_to_client error: {e}")
@@ -655,7 +659,7 @@ dim = 6
 
 
 @app.cls(
-    gpu="L4", 
+    gpu="L40S", 
     image=tts_image,
     volumes={
         "/models": models_volume, 
@@ -663,7 +667,7 @@ dim = 6
         "/rust-binaries": rust_binaries_volume,
     },
     secrets=secrets,
-    min_containers=0,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
 @modal.concurrent(max_inputs=10)
@@ -966,6 +970,7 @@ log_level = "info"
                         try:
                             while True:
                                 data = await websocket.receive_bytes()
+                                logger.info(f"=== TTS: Sending data to moshi server: {len(data)} bytes ===")
                                 await moshi_ws.send(data)
                         except WebSocketDisconnect:
                             pass
@@ -974,8 +979,10 @@ log_level = "info"
                         try:
                             async for message in moshi_ws:
                                 if isinstance(message, bytes):
+                                    logger.info(f"=== TTS: Received bytes from moshi server, sending to client: {len(message)} bytes ===")
                                     await websocket.send_bytes(message)
                                 else:
+                                    logger.info(f"=== TTS: Received text from moshi server, sending to client: {message[:50]} ===")
                                     await websocket.send_text(message)
                         except Exception as e:
                             print(f"TTS moshi_to_client error: {e}")
@@ -993,7 +1000,7 @@ log_level = "info"
 
 
 @app.cls(
-    gpu="L4",
+    gpu="L40S",
     image=llm_image,
     volumes={
         "/models": models_volume,
@@ -1001,7 +1008,7 @@ log_level = "info"
         "/root/.cache/vllm": vllm_cache_vol,
     },
     secrets=secrets,
-    min_containers=0,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
     timeout=10 * 60,  # 10 minutes for model loading
 )
@@ -1287,7 +1294,7 @@ class LLMService:
     cpu=2,
     image=orchestrator_image,
     secrets=secrets,
-    min_containers=0,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
 @modal.concurrent(max_inputs=10)
@@ -1304,9 +1311,19 @@ class OrchestratorService:
         # Set environment variables to point to Modal services
         # Use the actual Modal deployment URLs based on the app name and service classes
         base_url = "willdavenport--voice-stack"
-        os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web.modal.run"
-        os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web.modal.run"
-        os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web.modal.run"
+        
+        # Check for dev environment variable to use correct URL patterns
+        if os.environ.get("MODAL_DEV_MODE"):
+            # In modal serve mode, each service class gets its own -dev URL
+            # Pattern: https://username--appname-classname-dev.modal.run
+            os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
+            os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
+        else:
+            # Production deployment URLs include -web suffix
+            os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
+            os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         

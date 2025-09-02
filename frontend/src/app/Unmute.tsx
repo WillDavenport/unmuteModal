@@ -204,6 +204,14 @@ const Unmute = () => {
       data.type === "conversation.item.input_audio_transcription.delta"
     ) {
       // Transcription of the user speech
+      const receivedTime = new Date().toLocaleTimeString('en-US', { 
+        hour12: false, 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit', 
+        fractionalSecondDigits: 3 
+      });
+      console.log(`[STT] Received transcription delta at ${receivedTime}: "${data.delta}"`);
       setRawChatHistory((prev) => [
         ...prev,
         { role: "user", content: data.delta },

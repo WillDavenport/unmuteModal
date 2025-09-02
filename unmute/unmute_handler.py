@@ -484,6 +484,7 @@ class UnmuteHandler(AsyncStreamHandler):
                     # Ignore the marker messages
                     continue
 
+                logger.info(f"=== STT output received, putting in output queue: {data.text}, with start time: {data.start_time} ===")
                 await self.output_queue.put(
                     ora.ConversationItemInputAudioTranscriptionDelta(
                         delta=data.text,
@@ -568,53 +569,12 @@ class UnmuteHandler(AsyncStreamHandler):
         try:
             audio_started = None
             message_count = 0
-            last_message_time = asyncio.get_event_loop().time()
-            last_text_message_time = None
-            last_audio_message_time = None
-            text_message_count = 0
-            audio_message_count = 0
-            
-            # TTS Message Flow Watchdog - monitors for stopped message flow
-            async def tts_watchdog():
-                """Monitor TTS message flow and alert if it stops unexpectedly"""
-                while True:
-                    await asyncio.sleep(5.0)  # Check every 5 seconds
-                    current_watchdog_time = asyncio.get_event_loop().time()
-                    
-                    # Check if we've been receiving messages
-                    time_since_last_message = current_watchdog_time - last_message_time
-                    
-                    # Alert if no messages for 10+ seconds (indicates potential TTS server issue)
-                    if time_since_last_message > 10.0 and message_count > 0:
-                        logger.warning(f"=== TTS MESSAGE FLOW WATCHDOG ALERT ===")
-                        logger.warning(f"No TTS messages received for {time_since_last_message:.1f}s")
-                        logger.warning(f"Last message counts: total={message_count}, text={text_message_count}, audio={audio_message_count}")
-                        logger.warning(f"TTS connection state: {tts.state()}")
-                        await tts.send("Yeah it broke")
-                        
-                        # Check if TTS server may have crashed/exited
-                        if time_since_last_message > 30.0:
-                            logger.error(f"=== SUSPECTED TTS SERVER FAILURE - No messages for {time_since_last_message:.1f}s ===")
-                            logger.error("This suggests the TTS server may have crashed or exited unexpectedly")
-            
-            # Start the watchdog task
-            watchdog_task = asyncio.create_task(tts_watchdog())
 
             logger.info("=== Starting to iterate over TTS messages ===")
             async for message in tts:
-                current_time = asyncio.get_event_loop().time()
                 message_count += 1
-                last_message_time = current_time
                 
                 logger.info(f"=== Received TTS message #{message_count}: {type(message).__name__} ===")
-                
-                # Track message types and timing for flow monitoring
-                if isinstance(message, TTSTextMessage):
-                    text_message_count += 1
-                    last_text_message_time = current_time
-                elif isinstance(message, TTSAudioMessage):
-                    audio_message_count += 1
-                    last_audio_message_time = current_time
                 
                 if audio_started is not None:
                     time_since_start = self.audio_received_sec() - audio_started
@@ -663,24 +623,9 @@ class UnmuteHandler(AsyncStreamHandler):
                     logger.warning("Got unexpected message from TTS: %s", message.type)
 
         except websockets.ConnectionClosedError as e:
-            current_time = asyncio.get_event_loop().time()
             logger.error(f"=== TTS CONNECTION CLOSED WITH ERROR: {e} ===")
-            logger.error(f"TTS message flow stats: total={message_count if 'message_count' in locals() else 0}, text={text_message_count if 'text_message_count' in locals() else 0}, audio={audio_message_count if 'audio_message_count' in locals() else 0}")
-            if 'last_text_message_time' in locals() and last_text_message_time:
-                logger.error(f"Last text message was {current_time - last_text_message_time:.1f}s ago")
-            if 'last_audio_message_time' in locals() and last_audio_message_time:
-                logger.error(f"Last audio message was {current_time - last_audio_message_time:.1f}s ago")
-        finally:
-            # Cancel the watchdog task
-            if 'watchdog_task' in locals() and watchdog_task is not None:
-                watchdog_task.cancel()
-                try:
-                    await watchdog_task
-                except asyncio.CancelledError:
-                    pass
 
         logger.info("=== TTS loop ended, cleaning up ===")
-        logger.info(f"TTS session stats: processed {message_count if 'message_count' in locals() else 0} messages ({text_message_count if 'text_message_count' in locals() else 0} text, {audio_message_count if 'audio_message_count' in locals() else 0} audio)")
         
         # Push some silence to flush the Opus state.
         # Not sure that this is actually needed.

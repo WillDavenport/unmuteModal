@@ -138,14 +138,14 @@ class TtsStreamingQuery(BaseModel):
 class TextToSpeech(ServiceWithStartup):
     def __init__(
         self,
-        tts_instance: str = TTS_SERVER,
+        tts_base_url: str = TTS_SERVER,
         # For TTS, we do internal queuing, so we pass in the recorder to be able to
         # record the true time of the messages.
         recorder: Recorder | None = None,
         get_time: Callable[[], float] | None = None,
         voice: str | None = None,
     ):
-        self.tts_instance = tts_instance
+        self.tts_base_url = tts_base_url
         self.recorder = recorder
         self.websocket: websockets.ClientConnection | None = None
 
@@ -235,9 +235,14 @@ class TextToSpeech(ServiceWithStartup):
         
 
     async def start_up(self):
-        # For Modal services, connect to /ws instead of /api/tts_streaming
 
-        url = self.tts_instance + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
+        url = self.tts_base_url + TEXT_TO_SPEECH_PATH + self.query.to_url_params()
+
+        # For Modal services, connect to /ws instead of /api/tts_streaming
+        if "modal.run" in self.tts_base_url:
+            url = self.tts_base_url + "/ws" + self.query.to_url_params()
+        else:
+            url = self.tts_base_url + TEXT_TO_SPEECH_PATH
             
         logger.info(f"Connecting to TTS: {url}")
         self.websocket = await websockets.connect(
@@ -268,7 +273,7 @@ class TextToSpeech(ServiceWithStartup):
                     raise MissingServiceAtCapacity("tts")
                 else:
                     logger.warning(
-                        f"Received unexpected message type from {self.tts_instance}, {message.type}"
+                        f"Received unexpected message type from {self.tts_base_url}, {message.type}"
                     )
         except Exception as e:
             logger.error(f"Error during TTS startup: {repr(e)}")
@@ -324,7 +329,7 @@ class TextToSpeech(ServiceWithStartup):
                     logger.info(f"TTS connection health: {message_count} messages received, last message {current_time - last_message_time:.1f}s ago, websocket state: {self.websocket.state.name}")
                     last_health_check = current_time
                 # Handle different protocols for Modal vs local services
-                if "modal.run" in self.tts_instance:
+                if "modal.run" in self.tts_base_url:
                     # For Modal services, we get raw moshi-server protocol messages
                     # Try to parse as msgpack first for text messages, but skip raw audio bytes
                     try:

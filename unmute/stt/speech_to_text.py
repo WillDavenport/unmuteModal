@@ -109,6 +109,7 @@ class SpeechToText(ServiceWithStartup):
         if audio.dtype != np.float32:
             audio = audio_to_float32(audio)
 
+        logger.info(f"=== STT: Sending audio to STT function: {len(audio)} samples ===")
         self.sent_samples += len(audio)
         self.time_since_first_audio_sent.start_if_not_started()
         mt.STT_SENT_FRAMES.inc()
@@ -148,28 +149,18 @@ class SpeechToText(ServiceWithStartup):
         try:
             message_bytes = await self.websocket.recv()
             
-            # Modal services proxy raw moshi-server protocol, while local services use msgpack
-            if "modal.run" in self.stt_instance:
-                # For Modal services, expect raw moshi-server Ready message (bytes)
-                # We don't need to parse it, just verify we got something
-                if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
-                    mt.STT_ACTIVE_SESSIONS.inc()
-                    return
-                else:
-                    raise RuntimeError(f"Expected bytes from Modal STT service, got {type(message_bytes)}")
+            # For local services, expect msgpack format
+            message_dict = msgpack.unpackb(message_bytes)  # type: ignore
+            message = STTMessageAdapter.validate_python(message_dict)
+            if isinstance(message, STTReadyMessage):
+                mt.STT_ACTIVE_SESSIONS.inc()
+                return
+            elif isinstance(message, STTErrorMessage):
+                raise MissingServiceAtCapacity("stt")
             else:
-                # For local services, expect msgpack format
-                message_dict = msgpack.unpackb(message_bytes)  # type: ignore
-                message = STTMessageAdapter.validate_python(message_dict)
-                if isinstance(message, STTReadyMessage):
-                    mt.STT_ACTIVE_SESSIONS.inc()
-                    return
-                elif isinstance(message, STTErrorMessage):
-                    raise MissingServiceAtCapacity("stt")
-                else:
-                    raise RuntimeError(
-                        f"Expected ready or error message, got {message.type}"
-                    )
+                raise RuntimeError(
+                    f"Expected ready or error message, got {message.type}"
+                )
         except Exception as e:
             logger.error(f"Error during STT startup: {repr(e)}")
             # Make sure we don't leave a dangling websocket connection
