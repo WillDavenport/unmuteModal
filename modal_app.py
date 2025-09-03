@@ -195,6 +195,38 @@ llm_image = (
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
+# Sesame_TTS image: CSM-based TTS with specific requirements
+sesame_tts_image = (
+    base_deps_image
+    .apt_install("cmake", "pkg-config", "git", "curl", "ffmpeg", "build-essential")
+    .pip_install(
+        # Core CSM requirements from https://github.com/SesameAILabs/csm
+        "torch==2.4.0",
+        "torchaudio==2.4.0", 
+        "tokenizers==0.21.0",
+        "transformers==4.49.0",
+        "huggingface_hub==0.28.1",
+        "moshi==0.2.2",
+        "torchtune==0.4.0",
+        "torchao==0.9.0",
+        # Additional dependencies for Modal integration
+        "safetensors>=0.4.0",
+        "einops>=0.8.0",
+    )
+    .run_commands(
+        # Clone the CSM repository
+        "git clone https://github.com/SesameAILabs/csm.git /opt/csm",
+        # Install silentcipher dependency (private repo, handle gracefully)
+        "cd /opt/csm && pip install git+https://github.com/SesameAILabs/silentcipher@master || echo 'silentcipher install failed, continuing without it'",
+        # Set environment variable to disable Triton compilation
+        "echo 'export NO_TORCH_COMPILE=1' >> /etc/environment",
+        "echo 'CSM repository cloned and configured'"
+    )
+    # Add local files LAST
+    .add_local_python_source("unmute")
+    .add_local_file("voices.yaml", "/root/voices.yaml")
+)
+
 # Orchestrator image: just add local files to base deps
 orchestrator_image = (
     base_deps_image
@@ -1291,6 +1323,257 @@ class LLMService:
 
 
 @app.cls(
+    gpu="L4",
+    image=sesame_tts_image,
+    volumes={
+        "/models": models_volume,
+        "/root/.cache/huggingface": hf_cache_vol,
+    },
+    secrets=secrets,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
+    timeout=15 * 60,  # 15 minutes for model loading
+)
+@modal.concurrent(max_inputs=5)
+class SesameTTSService:
+    """Sesame CSM-based Text-to-Speech service"""
+    
+    @modal.enter()
+    def load_model(self):
+        """Load Sesame CSM model for TTS generation"""
+        import os
+        import sys
+        import torch
+        
+        print("Setting up Sesame TTS Service...")
+        
+        # Set environment variables
+        os.environ["NO_TORCH_COMPILE"] = "1"
+        
+        # Add CSM to Python path
+        sys.path.insert(0, "/opt/csm")
+        
+        # Import CSM modules
+        from generator import load_csm_1b, Segment
+        import torchaudio
+        
+        # Determine device
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        
+        print(f"Loading CSM model on device: {device}")
+        
+        # Load the CSM model
+        self.generator = load_csm_1b(device=device)
+        self.device = device
+        
+        # Store Segment class for use in generation
+        self.Segment = Segment
+        
+        print("Sesame TTS model loaded successfully")
+    
+    @modal.method()
+    def generate_speech(
+        self, 
+        text: str, 
+        speaker: int = 0, 
+        max_audio_length_ms: float = 10000,
+        temperature: float = 0.9,
+        topk: int = 50
+    ) -> bytes:
+        """Generate speech from text using Sesame CSM model
+        
+        Args:
+            text: Text to convert to speech
+            speaker: Speaker ID (0 or 1)
+            max_audio_length_ms: Maximum audio length in milliseconds
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            
+        Returns:
+            Audio data as bytes (WAV format)
+        """
+        import torch
+        import torchaudio
+        import io
+        
+        print(f"Generating speech for text: {text[:50]}...")
+        
+        # Generate audio using CSM
+        audio_tensor = self.generator.generate(
+            text=text,
+            speaker=speaker,
+            context=[],  # No context for simple TTS
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk
+        )
+        
+        # Convert to WAV bytes
+        audio_buffer = io.BytesIO()
+        torchaudio.save(
+            audio_buffer,
+            audio_tensor.unsqueeze(0).cpu(),
+            self.generator.sample_rate,
+            format="WAV"
+        )
+        
+        return audio_buffer.getvalue()
+    
+    @modal.method()
+    def generate_speech_with_context(
+        self,
+        text: str,
+        speaker: int,
+        context_segments: list,
+        max_audio_length_ms: float = 10000,
+        temperature: float = 0.9,
+        topk: int = 50
+    ) -> bytes:
+        """Generate speech with conversation context
+        
+        Args:
+            text: Text to convert to speech
+            speaker: Speaker ID 
+            context_segments: List of previous conversation segments
+            max_audio_length_ms: Maximum audio length in milliseconds
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            
+        Returns:
+            Audio data as bytes (WAV format)
+        """
+        import torch
+        import torchaudio
+        import io
+        
+        print(f"Generating contextual speech for text: {text[:50]}...")
+        
+        # Convert context segments to Segment objects
+        context = []
+        for seg in context_segments:
+            # Assume context segments have 'text', 'speaker', and 'audio_tensor' fields
+            context.append(self.Segment(
+                text=seg['text'],
+                speaker=seg['speaker'],
+                audio=seg['audio_tensor']
+            ))
+        
+        # Generate audio using CSM with context
+        audio_tensor = self.generator.generate(
+            text=text,
+            speaker=speaker,
+            context=context,
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk
+        )
+        
+        # Convert to WAV bytes
+        audio_buffer = io.BytesIO()
+        torchaudio.save(
+            audio_buffer,
+            audio_tensor.unsqueeze(0).cpu(),
+            self.generator.sample_rate,
+            format="WAV"
+        )
+        
+        return audio_buffer.getvalue()
+    
+    @modal.asgi_app()
+    def web(self):
+        """WebSocket endpoint for Sesame TTS service"""
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+        from fastapi.responses import Response
+        import asyncio
+        import json
+        import base64
+        
+        app = FastAPI(title="Sesame TTS Service", version="1.0.0")
+        
+        @app.get("/")
+        def root():
+            return {"service": "sesame_tts", "model": "csm-1b", "status": "ready"}
+        
+        @app.post("/generate")
+        async def generate_tts(request: dict):
+            """HTTP endpoint for TTS generation"""
+            try:
+                text = request.get("text", "")
+                speaker = request.get("speaker", 0)
+                max_length = request.get("max_audio_length_ms", 10000)
+                temperature = request.get("temperature", 0.9)
+                topk = request.get("topk", 50)
+                
+                if not text:
+                    raise HTTPException(status_code=400, detail="Text is required")
+                
+                # Generate speech
+                audio_bytes = self.generate_speech(
+                    text=text,
+                    speaker=speaker,
+                    max_audio_length_ms=max_length,
+                    temperature=temperature,
+                    topk=topk
+                )
+                
+                # Return audio as base64 encoded response
+                audio_b64 = base64.b64encode(audio_bytes).decode()
+                return {
+                    "audio": audio_b64,
+                    "format": "wav",
+                    "sample_rate": self.generator.sample_rate
+                }
+                
+            except Exception as e:
+                print(f"TTS generation error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            """WebSocket endpoint for real-time TTS"""
+            await websocket.accept()
+            print("=== SESAME_TTS: WebSocket connection accepted ===")
+            
+            try:
+                while True:
+                    # Receive text generation request
+                    data = await websocket.receive_text()
+                    request = json.loads(data)
+                    
+                    text = request.get("text", "")
+                    speaker = request.get("speaker", 0)
+                    max_length = request.get("max_audio_length_ms", 10000)
+                    temperature = request.get("temperature", 0.9)
+                    topk = request.get("topk", 50)
+                    
+                    if text:
+                        print(f"=== SESAME_TTS: Generating speech for: {text[:50]} ===")
+                        
+                        # Generate speech
+                        audio_bytes = self.generate_speech(
+                            text=text,
+                            speaker=speaker,
+                            max_audio_length_ms=max_length,
+                            temperature=temperature,
+                            topk=topk
+                        )
+                        
+                        # Send audio back as bytes
+                        await websocket.send_bytes(audio_bytes)
+                        print(f"=== SESAME_TTS: Sent {len(audio_bytes)} bytes of audio ===")
+                    
+            except WebSocketDisconnect:
+                print("=== SESAME_TTS: WebSocket disconnected ===")
+            except Exception as e:
+                print(f"=== SESAME_TTS: WebSocket error: {e} ===")
+        
+        return app
+
+
+@app.cls(
     cpu=2,
     image=orchestrator_image,
     secrets=secrets,
@@ -1486,7 +1769,7 @@ class OrchestratorService:
 def deploy():
     """Deploy the voice stack application to Modal."""
     print("Deploying voice stack application to Modal...")
-    print("Architecture: Orchestrator (CPU) + STT (L4) + LLM (L40S) + TTS (L4)")
+    print("Architecture: Orchestrator (CPU) + STT (L4) + LLM (L40S) + TTS (L4) + Sesame_TTS (L4)")
     return "Deployment complete"
 
 @app.function(image=orchestrator_image)
@@ -1498,6 +1781,7 @@ def health_check():
         "stt": "healthy", 
         "llm": "healthy",
         "tts": "healthy",
+        "sesame_tts": "healthy",
         "timestamp": "2025-01-14"
     }
 

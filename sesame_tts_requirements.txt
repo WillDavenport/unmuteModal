@@ -1,0 +1,35 @@
+# Sesame_TTS Requirements
+# Based on SesameAI Labs CSM repository: https://github.com/SesameAILabs/csm
+
+# Core CSM dependencies (exact versions from CSM repo)
+torch==2.4.0
+torchaudio==2.4.0
+tokenizers==0.21.0
+transformers==4.49.0
+huggingface_hub==0.28.1
+moshi==0.2.2
+torchtune==0.4.0
+torchao==0.9.0
+
+# Additional dependencies for Modal integration
+safetensors>=0.4.0
+einops>=0.8.0
+
+# Modal framework
+modal>=0.64.0
+
+# Web framework dependencies (for testing)
+fastapi[standard]>=0.115.12
+websockets>=12.0
+aiohttp>=3.8.0
+
+# Audio processing utilities
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Development and testing
+pytest>=8.3.5
+pytest-asyncio>=0.26.0
+
+# Note: silentcipher dependency from private repo
+# Install manually with: pip install git+https://github.com/SesameAILabs/silentcipher@master
