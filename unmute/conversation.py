@@ -20,7 +20,7 @@ from unmute.llm.llm_utils import (
     USER_SILENCE_MARKER,
     VLLMStream,
     get_openai_client,
-    rechunk_to_words,
+    rechunk_to_sentences,
 )
 from unmute.recorder import Recorder
 from unmute.service_discovery import find_instance
@@ -352,7 +352,7 @@ class Conversation:
         try:
             logger.info("Starting LLM chat completion stream")
             
-            async for delta in rechunk_to_words(llm.chat_completion(messages)):
+            async for delta in rechunk_to_sentences(llm.chat_completion(messages)):
                 await self.output_queue.put(
                     ora.UnmuteResponseTextDeltaReady(delta=delta)
                 )
@@ -364,7 +364,7 @@ class Conversation:
                     time_to_first_token = llm_stopwatch.time()
                     self.debug_dict["timing"]["to_first_token"] = time_to_first_token
                     mt.VLLM_TTFT.observe(time_to_first_token)
-                    logger.info("Sending first word to TTS: %s. Time to first token: %s", delta, time_to_first_token)
+                    logger.info("Sending first sentence to TTS: %s. Time to first token: %s", delta, time_to_first_token)
 
                 self.tts_output_stopwatch.start_if_not_started()
 
@@ -373,7 +373,7 @@ class Conversation:
                     break  # We've been interrupted
 
                 assert isinstance(delta, str)
-                logger.info(f"Sending word to TTS: '{delta}'")
+                logger.info(f"Sending sentence to TTS: '{delta}'")
                 if self.tts:
                     await self.tts.send(delta)
 
@@ -381,7 +381,7 @@ class Conversation:
                 ora.ResponseTextDone(text="".join(response_words))
             )
 
-            logger.info(f"LLM stream completed with {len(response_words)} words")
+            logger.info(f"LLM stream completed with {len(response_words)} sentences")
             logger.info("Full LLM response: %s", "".join(response_words))
 
             if self.tts is not None:

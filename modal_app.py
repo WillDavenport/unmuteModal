@@ -1037,7 +1037,7 @@ log_level = "info"
 
 
 @app.cls(
-    gpu="L40S",
+    gpu="H100",
     image=llm_image,
     volumes={
         "/models": models_volume,
@@ -1156,7 +1156,7 @@ class LLMService:
         """OpenAI-compatible API endpoint for LLM service"""
         from fastapi import FastAPI
         from fastapi.responses import StreamingResponse
-        from unmute.llm.llm_utils import get_openai_client, rechunk_to_words, VLLMStream
+        from unmute.llm.llm_utils import get_openai_client, rechunk_to_sentences, VLLMStream
         import json
         import os
         
@@ -1227,10 +1227,10 @@ class LLMService:
                 llm = VLLMStream(client, temperature=temperature)
                 
                 if stream:
-                    # Streaming response using the existing VLLMStream + rechunk_to_words
+                    # Streaming response using the existing VLLMStream + rechunk_to_sentences
                     async def generate_stream():
                         try:
-                            async for word in rechunk_to_words(llm.chat_completion(messages)):
+                            async for sentence in rechunk_to_sentences(llm.chat_completion(messages)):
                                 chunk = {
                                     "id": f"chatcmpl-{hash(str(messages))}",
                                     "object": "chat.completion.chunk",
@@ -1240,7 +1240,7 @@ class LLMService:
                                         {
                                             "index": 0,
                                             "delta": {
-                                                "content": word
+                                                "content": sentence
                                             },
                                             "finish_reason": None
                                         }
@@ -1282,10 +1282,10 @@ class LLMService:
                     return StreamingResponse(generate_stream(), media_type="text/event-stream")
                 
                 else:
-                    # Non-streaming response - collect all words
+                    # Non-streaming response - collect all sentences
                     full_text = ""
-                    async for word in rechunk_to_words(llm.chat_completion(messages)):
-                        full_text += word
+                    async for sentence in rechunk_to_sentences(llm.chat_completion(messages)):
+                        full_text += sentence
                     
                     response = {
                         "id": f"chatcmpl-{hash(str(messages))}",
@@ -1521,7 +1521,7 @@ class OrchestratorService:
 
 
 @app.cls(
-    gpu="L4", 
+    gpu="H100", 
     image=csm_tts_image,
     volumes={
         "/models": models_volume,

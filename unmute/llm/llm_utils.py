@@ -89,6 +89,76 @@ async def rechunk_to_words(iterator: AsyncIterator[str]) -> AsyncIterator[str]:
         yield prefix + buffer
 
 
+async def rechunk_to_sentences(iterator: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Rechunk the stream of text to complete sentences.
+    
+    This is more efficient for TTS generation as it allows the TTS model to 
+    generate speech for complete sentences at once, which can provide better
+    prosody and naturalness compared to word-by-word generation.
+    
+    Sentences are detected by looking for sentence-ending punctuation (.!?) 
+    followed by whitespace or end of text. The function handles edge cases like
+    abbreviations and decimal numbers.
+    
+    Args:
+        iterator: Async iterator of text deltas from LLM
+        
+    Yields:
+        Complete sentences as they are formed from the stream
+    """
+    buffer = ""
+    # Pattern to match sentence endings: period, exclamation, or question mark
+    # followed by whitespace or end of string, but not when preceded by common abbreviations
+    sentence_end_re = re.compile(r'([.!?]+)(\s+|$)')
+    
+    # Common abbreviations that shouldn't end sentences (add more as needed)
+    abbreviations = {
+        'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'etc', 'inc', 'ltd', 'corp',
+        'jr', 'sr', 'st', 'ave', 'blvd', 'dept', 'gov', 'org', 'edu', 'com'
+    }
+    
+    async for delta in iterator:
+        buffer += delta
+        
+        while True:
+            match = sentence_end_re.search(buffer)
+            if match is None:
+                break
+                
+            # Get the potential sentence
+            sentence_end_pos = match.end()
+            potential_sentence = buffer[:sentence_end_pos].strip()
+            
+            # Check if this might be an abbreviation (simple heuristic)
+            words_before_punct = potential_sentence.split()
+            if (words_before_punct and 
+                len(words_before_punct[-1]) <= 4 and  # Short word before punctuation
+                words_before_punct[-1].lower().rstrip('.!?') in abbreviations):
+                # This might be an abbreviation, look for the next sentence boundary
+                # Move past this match and continue searching
+                buffer = buffer[match.start() + 1:]
+                continue
+            
+            # Check for decimal numbers (e.g., "3.14")
+            if (match.group(1) == '.' and 
+                len(potential_sentence) > 0 and
+                potential_sentence[-2:].replace('.', '').isdigit()):
+                # This looks like a decimal number, continue searching
+                buffer = buffer[match.start() + 1:]
+                continue
+            
+            # This looks like a real sentence ending
+            if potential_sentence:
+                yield potential_sentence
+            
+            # Remove the processed sentence from buffer
+            buffer = buffer[sentence_end_pos:].lstrip()
+            
+    # Yield any remaining text as a final sentence
+    if buffer.strip():
+        yield buffer.strip()
+
+
 class LLMStream(Protocol):
     async def chat_completion(
         self, messages: list[dict[str, str]]
