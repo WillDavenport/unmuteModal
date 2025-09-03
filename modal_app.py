@@ -1481,12 +1481,133 @@ class OrchestratorService:
         return app
 
 
+# ==================== ORPHEUS TTS SERVICE ====================
+
+# Orpheus TTS image with specialized dependencies
+orpheus_tts_image = (
+    modal.Image.debian_slim(python_version="3.9")
+    .apt_install("git", "git-lfs", "curl", "ffmpeg", "libsndfile1", "build-essential")
+    .pip_install(
+        # PyTorch with CUDA 12.8 support (as specified in config.yaml)
+        "--extra-index-url", "https://download.pytorch.org/whl/cu128",
+        "torch==2.7.1",
+        
+        # Core Orpheus dependencies
+        "snac==1.2.1",
+        "batched==0.1.4",
+        "transformers>=4.0.0",
+        
+        # Audio processing
+        "librosa>=0.10.0",
+        "soundfile>=0.12.0",
+        "numpy>=1.21.0",
+        
+        # FastAPI and async support
+        "fastapi[standard]>=0.115.12",
+        "pydantic>=2.0.0",
+    )
+    .run_commands(
+        # Clone SNAC model as specified in config.yaml
+        "git lfs install",
+        "git clone https://huggingface.co/hubertsiuzdak/snac_24khz /app/snac_24khz",
+    )
+    .copy_local_dir("orpheus_tts", "/app/orpheus_tts")
+)
+
+@app.cls(
+    image=orpheus_tts_image,
+    gpu=modal.gpu.L4(),  # L4 GPU as specified in config
+    memory=10240,  # 10Gi as specified in config
+    timeout=300,
+    allow_concurrent_inputs=100,
+)
+class Orpheus_TTS_Service:
+    """
+    Orpheus TTS Service for high-quality text-to-speech generation.
+    
+    This service provides the Orpheus TTS functionality as a Modal class,
+    supporting both streaming and non-streaming audio generation.
+    """
+    
+    def __enter__(self):
+        """Initialize the Orpheus TTS model on container startup."""
+        import sys
+        sys.path.append("/app/orpheus_tts")
+        
+        from orpheus_modal import get_model
+        import logging
+        
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        
+        logger.info("Loading Orpheus TTS model...")
+        self.model = get_model()
+        logger.info("Orpheus TTS model loaded successfully")
+        
+    @modal.method()
+    async def generate_speech(
+        self, 
+        text: str, 
+        voice: str = "tara",
+        max_tokens: int = 4096,
+        temperature: float = 0.6,
+        top_p: float = 0.8
+    ) -> bytes:
+        """
+        Generate speech from text using Orpheus TTS.
+        
+        Args:
+            text: Text to convert to speech
+            voice: Voice to use (default: "tara")
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            
+        Returns:
+            Audio bytes in WAV format (24kHz, 16-bit, mono)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        try:
+            logger.info(f"Generating speech for text: {text[:100]}...")
+            
+            # Validate input length
+            if len(text) > 6144:  # MAX_CHARACTERS_INPUT from original
+                raise ValueError(f"Text too long: {len(text)} characters (max: 6144)")
+            
+            # Generate speech using the model
+            audio_bytes = await self.model.generate_speech(text, voice)
+            
+            logger.info(f"Generated {len(audio_bytes)} bytes of audio")
+            return audio_bytes
+            
+        except Exception as e:
+            logger.error(f"Error generating speech: {e}")
+            raise
+    
+    @modal.method()
+    def get_available_voices(self) -> list[str]:
+        """Get list of available voices."""
+        # Based on the original config, "tara" is the default voice
+        return ["tara"]
+    
+    @modal.method()
+    def health_check(self) -> dict:
+        """Health check for the Orpheus TTS service."""
+        return {
+            "status": "healthy",
+            "service": "Orpheus_TTS_Service",
+            "model_loaded": hasattr(self, 'model') and self.model is not None,
+            "gpu_available": True,  # L4 GPU
+        }
+
 # Additional functions for deployment and health checks
 @app.function(image=orchestrator_image)
 def deploy():
     """Deploy the voice stack application to Modal."""
     print("Deploying voice stack application to Modal...")
-    print("Architecture: Orchestrator (CPU) + STT (L4) + LLM (L40S) + TTS (L4)")
+    print("Architecture: Orchestrator (CPU) + STT (L4) + LLM (L40S) + TTS (L4) + Orpheus TTS (L4)")
     return "Deployment complete"
 
 @app.function(image=orchestrator_image)
@@ -1501,7 +1622,116 @@ def health_check():
         "timestamp": "2025-01-14"
     }
 
+# ==================== LOCAL ENTRYPOINTS ====================
+
+@app.local_entrypoint()
+def test_orpheus_tts():
+    """Test the Orpheus TTS service locally."""
+    import asyncio
+    
+    async def run_test():
+        print("Testing Orpheus TTS Service...")
+        
+        # Initialize the service
+        orpheus_service = Orpheus_TTS_Service()
+        
+        # Test text
+        test_text = "Hello, this is a test of the Orpheus TTS service. The quick brown fox jumps over the lazy dog."
+        
+        try:
+            # Generate speech
+            print(f"Generating speech for: {test_text}")
+            audio_bytes = await orpheus_service.generate_speech.aio(
+                text=test_text,
+                voice="tara"
+            )
+            
+            # Save to file
+            import os
+            output_dir = "orpheus_output"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            output_file = os.path.join(output_dir, "orpheus_test.wav")
+            with open(output_file, "wb") as f:
+                f.write(audio_bytes)
+            
+            print(f"Generated {len(audio_bytes)} bytes of audio")
+            print(f"Saved audio to: {output_file}")
+            
+            # Test health check
+            health = await orpheus_service.health_check.aio()
+            print(f"Health check: {health}")
+            
+            # Test available voices
+            voices = await orpheus_service.get_available_voices.aio()
+            print(f"Available voices: {voices}")
+            
+        except Exception as e:
+            print(f"Error testing Orpheus TTS: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Run the async test
+    asyncio.run(run_test())
+
+@app.local_entrypoint()
+def test_orpheus_batch():
+    """Test the Orpheus TTS service with multiple requests."""
+    import asyncio
+    
+    async def run_batch_test():
+        print("Testing Orpheus TTS Service with batch requests...")
+        
+        # Initialize the service
+        orpheus_service = Orpheus_TTS_Service()
+        
+        # Test texts
+        test_texts = [
+            "This is the first test sentence.",
+            "Here is another sentence to convert to speech.",
+            "The third sentence demonstrates batch processing.",
+            "Finally, this is the last sentence in the batch test."
+        ]
+        
+        try:
+            # Generate speech for all texts concurrently
+            tasks = []
+            for i, text in enumerate(test_texts):
+                task = orpheus_service.generate_speech.aio(
+                    text=text,
+                    voice="tara"
+                )
+                tasks.append((i, task))
+            
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+            
+            # Save all results
+            import os
+            output_dir = "orpheus_batch_output"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"Error in batch {i}: {result}")
+                else:
+                    output_file = os.path.join(output_dir, f"orpheus_batch_{i}.wav")
+                    with open(output_file, "wb") as f:
+                        f.write(result)
+                    print(f"Batch {i}: Generated {len(result)} bytes -> {output_file}")
+            
+        except Exception as e:
+            print(f"Error in batch test: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Run the async batch test
+    asyncio.run(run_batch_test())
+
 if __name__ == "__main__":
     # For local development
-    print("Modal Voice Stack Application")
-    print("Run with: modal serve modal_app.py")
+    print("Modal Voice Stack Application with Orpheus TTS")
+    print("Available commands:")
+    print("  modal serve modal_app.py                 # Start the full voice stack")
+    print("  modal run modal_app.py::test_orpheus_tts # Test Orpheus TTS service")
+    print("  modal run modal_app.py::test_orpheus_batch # Test batch processing")
