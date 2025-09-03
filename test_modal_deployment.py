@@ -21,7 +21,7 @@ class ModalDeploymentTester:
         self.base_url = base_url
         self.orchestrator_url = f"wss://{base_url}-orchestratorservice-web.modal.run/ws"
         self.stt_url = f"wss://{base_url}-sttservice-web.modal.run/ws"
-        self.tts_url = f"wss://{base_url}-ttsservice-web.modal.run/ws"
+        self.tts_url = f"wss://{base_url}-orpheusttsservice-web.modal.run/ws"
         self.llm_url = f"wss://{base_url}-llmservice-web.modal.run/ws"
     
     async def test_service_connectivity(self, url: str, service_name: str) -> bool:

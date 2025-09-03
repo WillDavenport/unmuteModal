@@ -62,7 +62,7 @@ def deploy_app():
         print("\n🔗 Your services are now available at:")
         print("- Orchestrator: https://your-username--voice-stack-orchestratorservice-web.modal.run/ws")
         print("- STT Service: https://your-username--voice-stack-sttservice-web.modal.run/ws")
-        print("- TTS Service: https://your-username--voice-stack-ttsservice-web.modal.run/ws") 
+        print("- TTS Service: https://your-username--voice-stack-orpheusttsservice-web.modal.run/ws") 
         print("- LLM Service: https://your-username--voice-stack-llmservice-web.modal.run/ws")
         print("\nNote: Replace 'your-username' with your actual Modal username")
         
