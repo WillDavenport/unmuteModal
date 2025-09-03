@@ -109,7 +109,6 @@ class SpeechToText(ServiceWithStartup):
         if audio.dtype != np.float32:
             audio = audio_to_float32(audio)
 
-        logger.info(f"=== STT: Sending audio to STT function: {len(audio)} samples ===")
         self.sent_samples += len(audio)
         self.time_since_first_audio_sent.start_if_not_started()
         mt.STT_SENT_FRAMES.inc()

@@ -12,12 +12,13 @@ from functools import partial, wraps
 
 from unmute import metrics as mt
 from unmute.exceptions import MissingServiceAtCapacity, MissingServiceTimeout
-from unmute.kyutai_constants import LLM_SERVER, STT_SERVER, TTS_SERVER
+from unmute.kyutai_constants import LLM_SERVER, STT_SERVER, TTS_SERVER, SESAME_TTS_SERVER
 from unmute.timer import Stopwatch
 
 logger = logging.getLogger(__name__)
 SERVICES = {
     "tts": TTS_SERVER,
+    "sesame_tts": SESAME_TTS_SERVER,
     "stt": STT_SERVER,
     "llm": LLM_SERVER,
 }

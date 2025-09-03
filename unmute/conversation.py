@@ -13,11 +13,7 @@ import websockets
 from fastrtc import AdditionalOutputs, CloseStream
 
 import unmute.openai_realtime_api_events as ora
-from unmute.exceptions import (
-    MissingServiceAtCapacity,
-    MissingServiceTimeout,
-    WebSocketClosedError,
-)
+# Removed unused imports
 from unmute.llm.chatbot import Chatbot
 from unmute.llm.llm_utils import (
     INTERRUPTION_CHAR,
@@ -30,12 +26,12 @@ from unmute.recorder import Recorder
 from unmute.service_discovery import find_instance
 from unmute.stt.speech_to_text import SpeechToText, STTMarkerMessage
 from unmute.timer import Stopwatch
-from unmute.tts.text_to_speech import TextToSpeech, TTSAudioMessage, TTSTextMessage
+from unmute.tts.text_to_speech import TTSAudioMessage, TTSTextMessage
+from unmute.tts.sesame_text_to_speech import SesameTextToSpeech
 from unmute.kyutai_constants import (
     RECORDINGS_DIR, 
     SAMPLE_RATE, 
     SAMPLES_PER_FRAME,
-    FRAME_TIME_SEC,
 )
 from unmute import metrics as mt
 import numpy as np
@@ -62,7 +58,7 @@ class Conversation:
         
         # Service connections
         self.stt: SpeechToText | None = None
-        self.tts: TextToSpeech | None = None
+        self.tts: SesameTextToSpeech | None = None
         self.chatbot = Chatbot()
         self.openai_client = get_openai_client()
         
@@ -86,7 +82,7 @@ class Conversation:
         self.waiting_for_user_start_time = 0.0
         self.input_sample_rate = SAMPLE_RATE
         self.output_sample_rate = SAMPLE_RATE
-        self._clear_queue: callable | None = None
+        self._clear_queue: callable = None
         
         # Debug and metrics
         self.debug_dict: dict[str, Any] = {
@@ -137,17 +133,17 @@ class Conversation:
             raise
 
     async def _init_tts(self, generating_message_i: int):
-        """Initialize TTS websocket connection."""
-        logger.info(f"Initializing TTS for conversation {self.conversation_id}")
+        """Initialize Sesame TTS websocket connection."""
+        logger.info(f"Initializing Sesame TTS for conversation {self.conversation_id}")
         try:
             factory = partial(
-                TextToSpeech,
+                SesameTextToSpeech,
                 recorder=self.recorder,
                 get_time=lambda: self.n_samples_received / SAMPLE_RATE,
                 voice=self.tts_voice,
             )
-            self.tts = await find_instance("tts", factory)
-            logger.info(f"TTS connection established for conversation {self.conversation_id}")
+            self.tts = await find_instance("sesame_tts", factory)
+            logger.info(f"Sesame TTS connection established for conversation {self.conversation_id}")
             
             # Start TTS task
             self.tts_task = asyncio.create_task(
@@ -155,7 +151,7 @@ class Conversation:
             )
             
         except Exception as e:
-            logger.error(f"Failed to connect to TTS service: {e}")
+            logger.error(f"Failed to connect to Sesame TTS service: {e}")
             raise
 
     async def _stt_loop(self):
@@ -582,9 +578,40 @@ class Conversation:
         """How much audio has been received in seconds."""
         return self.n_samples_received / self.input_sample_rate
 
-    def set_clear_queue_callback(self, clear_queue_fn):
+    def set_clear_queue_callback(self, clear_queue_fn: callable):
         """Set the callback to clear FastRTC's audio queue."""
         self._clear_queue = clear_queue_fn
+
+    async def generate_response(self):
+        """Public method to generate LLM response."""
+        return await self._generate_response()
+
+    async def interrupt_bot(self):
+        """Public method to interrupt the bot."""
+        return await self._interrupt_bot()
+
+    def determine_pause(self) -> bool:
+        """Public method to determine if user has paused speaking."""
+        return self._determine_pause()
+
+    async def add_chat_message_delta(
+        self,
+        delta: str,
+        role: str,
+        generating_message_i: int | None = None,
+    ) -> bool:
+        """Public method to add a partial message to chat history."""
+        from typing import Literal
+        # Type check to ensure role is valid
+        if role not in ["user", "assistant"]:
+            raise ValueError(f"Invalid role: {role}. Must be 'user' or 'assistant'")
+        # Cast to the correct type for the private method
+        role_typed = role  # type: ignore
+        return await self._add_chat_message_delta(delta, role_typed, generating_message_i)
+
+    def get_gradio_update(self):
+        """Public method to get gradio update with current conversation state."""
+        return self._get_gradio_update()
 
     async def cleanup(self):
         """Clean up all connections and tasks."""

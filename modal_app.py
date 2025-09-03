@@ -696,7 +696,7 @@ dim = 6
 
 
 @app.cls(
-    gpu="L40S", 
+    gpu="L4", 
     image=tts_image,
     volumes={
         "/models": models_volume, 
@@ -1356,9 +1356,11 @@ class OrchestratorService:
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
             os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
+            os.environ["KYUTAI_SESAME_TTS_URL"] = f"wss://{base_url}-sesame-tts-service-web-dev.modal.run"
         else:
             # Production deployment URLs include -web suffix
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
+            os.environ["KYUTAI_SESAME_TTS_URL"] = f"wss://{base_url}-sesame-tts-service-web-dev.modal.run"
             os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
         # Voice cloning is not available in Modal deployment
@@ -1528,7 +1530,7 @@ class OrchestratorService:
     min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
-@modal.concurrent(max_inputs=5)
+@modal.concurrent(max_inputs=10)
 class Sesame_TTS_Service:
     """CSM-based Text-to-Speech service using Sesame's Conversational Speech Model"""
     
@@ -1573,8 +1575,7 @@ class Sesame_TTS_Service:
         self.device = device
         print("Sesame CSM TTS Service ready!")
     
-    @modal.method()
-    def generate_speech(
+    def _generate_speech_internal(
         self,
         text: str,
         speaker: int = 0,
@@ -1584,7 +1585,8 @@ class Sesame_TTS_Service:
         topk: int = 50,
     ) -> dict:
         """
-        Generate speech from text using CSM.
+        Internal method to generate speech from text using CSM.
+        This is called directly from the websocket handler.
         
         Args:
             text: Text to convert to speech
@@ -1661,6 +1663,29 @@ class Sesame_TTS_Service:
                 "error": str(e),
                 "success": False
             }
+
+    @modal.method()
+    def generate_speech(
+        self,
+        text: str,
+        speaker: int = 0,
+        context: list = None,
+        max_audio_length_ms: float = 10_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+    ) -> dict:
+        """
+        Generate speech from text using CSM (Modal method wrapper).
+        This is the public API method that can be called remotely.
+        """
+        return self._generate_speech_internal(
+            text=text,
+            speaker=speaker,
+            context=context,
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk,
+        )
     
     @modal.method()
     def health_check(self) -> dict:
@@ -1671,6 +1696,68 @@ class Sesame_TTS_Service:
             "device": self.device,
             "sample_rate": self.generator.sample_rate if hasattr(self, 'generator') else None
         }
+    
+    @modal.asgi_app()
+    def web(self):
+        """Create FastAPI app with websocket endpoint for Sesame TTS."""
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        import json
+        
+        app = FastAPI(title="Sesame CSM TTS Service")
+        
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            """WebSocket endpoint for real-time Sesame TTS requests."""
+            await websocket.accept()
+            print("Sesame TTS WebSocket connection established")
+            
+            try:
+                while True:
+                    # Receive text generation request
+                    data = await websocket.receive_text()
+                    try:
+                        request_data = json.loads(data)
+                        print(f"Received Sesame TTS request: {request_data}")
+                        
+                        # Generate speech using the CSM model directly
+                        # Note: We call the method directly, not as a remote method
+                        result = self._generate_speech_internal(
+                            text=request_data.get("text", ""),
+                            speaker=request_data.get("speaker", 0),
+                            context=request_data.get("context", []),
+                            max_audio_length_ms=request_data.get("max_audio_length_ms", 10_000),
+                            temperature=request_data.get("temperature", 0.9),
+                            topk=request_data.get("topk", 50),
+                        )
+                        
+                        # Send response back
+                        await websocket.send_text(json.dumps(result))
+                        
+                    except json.JSONDecodeError as e:
+                        error_response = {
+                            "success": False,
+                            "error": f"Invalid JSON: {e}"
+                        }
+                        await websocket.send_text(json.dumps(error_response))
+                        
+                    except Exception as e:
+                        error_response = {
+                            "success": False,
+                            "error": f"Generation error: {e}"
+                        }
+                        await websocket.send_text(json.dumps(error_response))
+                        
+            except WebSocketDisconnect:
+                print("Sesame TTS WebSocket disconnected")
+            except Exception as e:
+                print(f"Sesame TTS WebSocket error: {e}")
+        
+        @app.get("/health")
+        async def health_endpoint():
+            """HTTP health check endpoint."""
+            return self.health_check()
+        
+        return app
 
 
 # Additional functions for deployment and health checks

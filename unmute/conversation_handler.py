@@ -3,7 +3,6 @@ New UnmuteHandler that uses the Conversation architecture.
 This replaces the quest_manager-based approach with persistent websocket connections.
 """
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -113,7 +112,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
                 self.conversation.chatbot.chat_history.append(
                     {"role": "user", "content": TTS_DEBUGGING_TEXT}
                 )
-                await self.conversation._generate_response()
+                await self.conversation.generate_response()
             return
 
         # Handle initial response generation
@@ -123,7 +122,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
             and self.conversation.chatbot.get_instructions() is not None
         ):
             logger.info("Generating initial response.")
-            await self.conversation._generate_response()
+            await self.conversation.generate_response()
 
         # Handle audio input override for testing
         if self.audio_input_override is not None:
@@ -141,7 +140,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
             if self.conversation.stt_end_of_flush_time is None:
                 await self.conversation.detect_long_silence()
 
-                if self.conversation._determine_pause():
+                if self.conversation.determine_pause():
                     logger.info("Pause detected")
                     await self.conversation.output_queue.put(ora.InputAudioBufferSpeechStopped())
 
@@ -163,8 +162,8 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
                     and self.conversation.audio_received_sec() > UNINTERRUPTIBLE_BY_VAD_TIME_SEC
                 ):
                     logger.info("Interruption by STT-VAD")
-                    await self.conversation._interrupt_bot()
-                    await self.conversation._add_chat_message_delta("", "user")
+                    await self.conversation.interrupt_bot()
+                    await self.conversation.add_chat_message_delta("", "user")
             else:
                 # Handle STT flushing completion
                 stt = self.conversation.stt
@@ -175,7 +174,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
                     logger.info(
                         "STT Flushing finished, took %.1f ms, RTF: %.1f", elapsed * 1000, rtf
                     )
-                    await self.conversation._generate_response()
+                    await self.conversation.generate_response()
 
     async def emit(self) -> HandlerOutput | None:
         """Emit the next output event."""
@@ -191,7 +190,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
             if self.conversation.last_additional_output_update < current_time - 1:
                 # If we have nothing to emit, at least update the debug dict
                 self.conversation.last_additional_output_update = current_time
-                return self.conversation._get_gradio_update()
+                return self.conversation.get_gradio_update()
             else:
                 return None
 
@@ -218,12 +217,12 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
     async def interrupt_bot(self):
         """Interrupt the bot."""
         if self.conversation:
-            await self.conversation._interrupt_bot()
+            await self.conversation.interrupt_bot()
 
     def get_gradio_update(self):
         """Get gradio update."""
         if self.conversation:
-            return self.conversation._get_gradio_update()
+            return self.conversation.get_gradio_update()
         return None
 
     @property
@@ -250,7 +249,7 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
     ) -> bool:
         """Add a chat message delta."""
         if self.conversation:
-            return await self.conversation._add_chat_message_delta(
+            return await self.conversation.add_chat_message_delta(
                 delta, role, generating_message_i
             )
         return False
