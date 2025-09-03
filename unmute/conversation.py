@@ -217,7 +217,6 @@ class Conversation:
                     break
                     
                 message_count += 1
-                logger.info(f"Received TTS message #{message_count}: {type(message).__name__}")
 
                 # Check for interruption
                 if len(self.chatbot.chat_history) > generating_message_i:
@@ -225,7 +224,6 @@ class Conversation:
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t

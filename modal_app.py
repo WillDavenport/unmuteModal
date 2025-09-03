@@ -704,7 +704,7 @@ dim = 6
         "/rust-binaries": rust_binaries_volume,
     },
     secrets=secrets,
-    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
+    min_containers=0,
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
 @modal.concurrent(max_inputs=10)
@@ -1704,6 +1704,10 @@ class Sesame_TTS_Service:
         import json
         
         app = FastAPI(title="Sesame CSM TTS Service")
+        
+        @app.get("/")
+        def root():
+            return {"service": "sesame_tts", "model": "csm-1b", "status": "ready"}
         
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):

@@ -42,7 +42,7 @@ from unmute.kyutai_constants import (
     MAX_VOICE_FILE_SIZE_MB,
     SAMPLE_RATE,
     STT_SERVER,
-    TTS_SERVER,
+    SESAME_TTS_SERVER,
     VOICE_CLONING_SERVER,
 )
 from unmute.service_discovery import async_ttl_cached
@@ -154,7 +154,7 @@ async def _get_health(
     async with asyncio.TaskGroup() as tg:
         # For Modal deployment, check root endpoints instead of specific API paths
         # This allows the health check to work with both local Moshi servers and Modal services
-        tts_endpoint = _ws_to_http(TTS_SERVER)
+        tts_endpoint = _ws_to_http(SESAME_TTS_SERVER)
         if "modal.run" in tts_endpoint:
             tts_endpoint += "/"  # Modal services use root endpoint
         else:
@@ -602,7 +602,6 @@ async def emit_loop(
                     opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
                     # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
                     if opus_bytes:
-                        logger.info(f"Sending audio to realtime websocket: {len(opus_bytes)} opus bytes")
                         to_emit = ora.ResponseAudioDelta(
                             delta=base64.b64encode(opus_bytes).decode("utf-8"),
                         )
@@ -625,9 +624,7 @@ async def emit_loop(
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):
                 audio_emitted_count += 1
-            logger.info(f"Sending message #{audio_emitted_count}: {to_emit.type}")
             await websocket.send_text(to_emit.model_dump_json())
-            logger.info(f"Successfully sent message #{audio_emitted_count}")
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):
