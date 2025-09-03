@@ -203,6 +203,43 @@ orchestrator_image = (
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
+# CSM TTS image: CSM-specific dependencies
+csm_tts_image = (
+    base_deps_image
+    .pip_install(
+        # CSM-specific dependencies from requirements.txt
+        "torch==2.4.0",
+        "torchaudio==2.4.0", 
+        "tokenizers==0.21.0",
+        "transformers==4.49.0",
+        "huggingface_hub==0.28.1",
+        "moshi==0.2.2",
+        "torchtune==0.4.0",
+        "torchao==0.9.0",
+        # Note: silentcipher will be installed from git during image build
+    )
+    .run_commands(
+        # Install silentcipher from git
+        "pip install git+https://github.com/SesameAILabs/silentcipher@master",
+        # Set environment variable to disable Triton compilation
+        "echo 'export NO_TORCH_COMPILE=1' >> /etc/environment",
+        "echo 'export NO_TORCH_COMPILE=1' >> /root/.bashrc",
+    )
+    .run_commands(
+        # Pre-download CSM models during image build to avoid startup delays
+        "echo 'Pre-downloading CSM models to cache...'",
+        # Create cache directories
+        "mkdir -p /root/.cache/huggingface/hub",
+        # Download CSM models - this will require HuggingFace authentication at runtime
+        "echo 'CSM models will be downloaded at runtime due to authentication requirements'",
+        "echo 'CSM image build completed'"
+    )
+    # Add local files LAST
+    .add_local_python_source("unmute")
+    .add_local_python_source("csm")
+    .add_local_file("voices.yaml", "/root/voices.yaml")
+)
+
 # Modal volumes for model storage
 models_volume = modal.Volume.from_name("voice-models")
 tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
@@ -1481,6 +1518,161 @@ class OrchestratorService:
         return app
 
 
+@app.cls(
+    gpu="L4", 
+    image=csm_tts_image,
+    volumes={
+        "/models": models_volume,
+    },
+    secrets=secrets,
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
+)
+@modal.concurrent(max_inputs=5)
+class Sesame_TTS_Service:
+    """CSM-based Text-to-Speech service using Sesame's Conversational Speech Model"""
+    
+    @modal.enter()
+    def load_model(self):
+        """Load CSM model weights once per container"""
+        import os
+        import torch
+        
+        print("Setting up Sesame CSM TTS Service...")
+        
+        # Set environment variable to disable Triton compilation
+        os.environ["NO_TORCH_COMPILE"] = "1"
+        
+        # Check if HuggingFace token is available
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token:
+            print(f"CSM TTS: HuggingFace token available (length: {len(hf_token)})")
+        else:
+            print("CSM TTS: No HuggingFace token found - this may cause issues downloading models")
+            raise RuntimeError("CSM TTS requires HuggingFace authentication for model access")
+        
+        # Select the best available device
+        if torch.cuda.is_available():
+            device = "cuda"
+            print(f"CSM TTS: Using CUDA device: {torch.cuda.get_device_name()}")
+        else:
+            device = "cpu"
+            print("CSM TTS: CUDA not available, using CPU (will be slow)")
+        
+        # Load CSM model
+        print("Loading CSM 1B model...")
+        try:
+            from csm import load_csm_1b
+            self.generator = load_csm_1b(device=device)
+            print(f"CSM model loaded successfully on {device}")
+            print(f"Sample rate: {self.generator.sample_rate}")
+        except Exception as e:
+            print(f"Failed to load CSM model: {e}")
+            raise RuntimeError(f"CSM model loading failed: {e}")
+        
+        self.device = device
+        print("Sesame CSM TTS Service ready!")
+    
+    @modal.method()
+    def generate_speech(
+        self,
+        text: str,
+        speaker: int = 0,
+        context: list = None,
+        max_audio_length_ms: float = 10_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+    ) -> dict:
+        """
+        Generate speech from text using CSM.
+        
+        Args:
+            text: Text to convert to speech
+            speaker: Speaker ID (0 or 1)
+            context: List of previous segments for conversation context
+            max_audio_length_ms: Maximum audio length in milliseconds
+            temperature: Sampling temperature
+            topk: Top-k sampling parameter
+            
+        Returns:
+            Dictionary with audio data and metadata
+        """
+        import torch
+        import torchaudio
+        import io
+        import base64
+        from csm import Segment
+        
+        try:
+            print(f"Generating speech for: '{text}' (speaker: {speaker})")
+            
+            # Convert context if provided
+            context_segments = []
+            if context:
+                for ctx in context:
+                    if isinstance(ctx, dict):
+                        # Convert dict to Segment
+                        audio_tensor = torch.tensor(ctx.get('audio', []))
+                        segment = Segment(
+                            text=ctx.get('text', ''),
+                            speaker=ctx.get('speaker', 0),
+                            audio=audio_tensor
+                        )
+                        context_segments.append(segment)
+                    else:
+                        context_segments.append(ctx)
+            
+            # Generate audio
+            audio_tensor = self.generator.generate(
+                text=text,
+                speaker=speaker,
+                context=context_segments,
+                max_audio_length_ms=max_audio_length_ms,
+                temperature=temperature,
+                topk=topk,
+            )
+            
+            # Convert to bytes for transmission
+            buffer = io.BytesIO()
+            torchaudio.save(
+                buffer, 
+                audio_tensor.unsqueeze(0).cpu(), 
+                self.generator.sample_rate,
+                format="wav"
+            )
+            buffer.seek(0)
+            audio_bytes = buffer.getvalue()
+            
+            # Encode as base64 for JSON serialization
+            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+            
+            return {
+                "audio_base64": audio_b64,
+                "sample_rate": self.generator.sample_rate,
+                "duration_ms": len(audio_tensor) / self.generator.sample_rate * 1000,
+                "text": text,
+                "speaker": speaker,
+                "success": True
+            }
+            
+        except Exception as e:
+            print(f"Error generating speech: {e}")
+            return {
+                "error": str(e),
+                "success": False
+            }
+    
+    @modal.method()
+    def health_check(self) -> dict:
+        """Health check endpoint"""
+        return {
+            "status": "healthy",
+            "service": "Sesame CSM TTS",
+            "device": self.device,
+            "sample_rate": self.generator.sample_rate if hasattr(self, 'generator') else None
+        }
+
+
 # Additional functions for deployment and health checks
 @app.function(image=orchestrator_image)
 def deploy():
@@ -1498,8 +1690,54 @@ def health_check():
         "stt": "healthy", 
         "llm": "healthy",
         "tts": "healthy",
+        "csm_tts": "healthy",
         "timestamp": "2025-01-14"
     }
+
+@app.local_entrypoint()
+def test_csm_tts():
+    """Test the Sesame CSM TTS service."""
+    print("Testing Sesame CSM TTS Service...")
+    
+    # Test text
+    test_text = "Hello, this is a test of the Sesame CSM text-to-speech system."
+    
+    try:
+        # Create service instance
+        service = Sesame_TTS_Service()
+        
+        # Test health check
+        health = service.health_check.remote()
+        print(f"Health check: {health}")
+        
+        # Test speech generation
+        print(f"Generating speech for: '{test_text}'")
+        result = service.generate_speech.remote(
+            text=test_text,
+            speaker=0,
+            max_audio_length_ms=10_000
+        )
+        
+        if result["success"]:
+            print(f"Speech generation successful!")
+            print(f"Sample rate: {result['sample_rate']}")
+            print(f"Duration: {result['duration_ms']:.2f}ms")
+            print(f"Audio data length: {len(result['audio_base64'])} characters")
+            
+            # Optionally save audio to file for testing
+            import base64
+            import io
+            audio_bytes = base64.b64decode(result['audio_base64'])
+            with open("csm_test_output.wav", "wb") as f:
+                f.write(audio_bytes)
+            print("Audio saved to csm_test_output.wav")
+            
+        else:
+            print(f"Speech generation failed: {result.get('error', 'Unknown error')}")
+            
+    except Exception as e:
+        print(f"Error testing CSM TTS: {e}")
+        raise
 
 if __name__ == "__main__":
     # For local development
