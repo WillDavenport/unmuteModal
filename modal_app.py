@@ -120,58 +120,49 @@ stt_image = (
 # TTS image: build steps first, then local files
 tts_image = (
     base_deps_image
-    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg")
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg", "git-lfs")
     .run_commands(
         # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
         "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
         "dpkg -i cuda-keyring_1.0-1_all.deb",
         "apt-get update -q",
         "apt-get install -y cuda-toolkit-12-1 || apt-get install -y cuda-toolkit-11-8",
-        # Install latest Rust toolchain to handle Cargo.lock version 4
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
-        ". ~/.cargo/env"
+        # Install git-lfs for Orpheus model downloads
+        "git lfs install",
     )
     .pip_install(
-        "torch>=2.1.0",
+        # PyTorch with CUDA support for Orpheus
+        "--extra-index-url https://download.pytorch.org/whl/cu128",
+        "torch==2.7.1",
         "torchaudio>=2.1.0",
         "huggingface_hub>=0.19.0",
         "safetensors>=0.4.0",
         "transformers>=4.35.0",
         "tokenizers>=0.15.0",
-        # Moshi Python package and dependencies for moshi-server
-        "moshi>=0.2.8",
+        # Orpheus-specific dependencies
+        "snac==1.2.1",
+        "batched==0.1.4",
+        # OpenAI client for LLM integration
+        "openai>=1.70.0",
+        # Keep some existing dependencies for compatibility
         "sentencepiece>=0.2.0",
         "einops>=0.8.0",
     )
     .run_commands(
-        # Set up environment variables that will be needed at runtime
-        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /etc/environment",
-        "echo 'export PATH=\"$HOME/.cargo/bin:$PATH\"' >> /root/.bashrc",
-        # Create directory for cached binaries
-        "mkdir -p /usr/local/bin",
-        # Note: moshi-server binary will be installed at startup time with CUDA support
-        "echo 'Rust environment prepared for runtime binary installation'"
-    )
-    .run_commands(
-        # Pre-download TTS models during image build to avoid startup delays
-        "echo 'Pre-downloading TTS models to cache...'",
+        # Pre-download Orpheus models during image build to avoid startup delays
+        "echo 'Pre-downloading Orpheus models to cache...'",
         # Create cache directories
         "mkdir -p /root/.cache/huggingface/hub",
-        "mkdir -p /root/.cache/huggingface/xet",
-        "mkdir -p /root/tts-voices-cache",
-        # Download essential TTS tokenizer (required for TTS to work)
-        "python -c \"from huggingface_hub import hf_hub_download; hf_hub_download('kyutai/tts-1.6b-en_fr', 'tokenizer_spm_8k_en_fr_audio.model', cache_dir='/root/.cache/huggingface/hub')\"",
-        # Create directory structure for voices (actual download will happen at runtime with persistent storage)
-        "echo 'Creating TTS voices directory structure...'",
-        "mkdir -p /root/tts-voices-cache/unmute-prod-website",
-        "echo 'TTS voices directory structure created'",
+        "mkdir -p /root/orpheus-models",
+        # Download Orpheus tokenizer and model
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('canopylabs/orpheus-3b-0.1-ft', cache_dir='/root/.cache/huggingface/hub', allow_patterns=['tokenizer*', 'config.json'])\"",
+        # Download SNAC model for audio conversion
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('hubertsiuzdak/snac_24khz', cache_dir='/root/.cache/huggingface/hub')\"",
         # Verify essential models were downloaded
-        "echo 'Verifying downloaded models...'",
+        "echo 'Verifying downloaded Orpheus models...'",
         "ls -la /root/.cache/huggingface/hub/ | head -10",
-        "ls -la /root/tts-voices-cache/ | head -10",
-        "find /root/.cache/huggingface/hub -name 'tokenizer_spm_8k_en_fr_audio.model' | head -5 || echo 'Tokenizer not found in expected location'",
-        "find /root/tts-voices-cache -name '*.safetensors' | wc -l",
-        "echo 'TTS model pre-download completed. Essential voices cached locally.'"
+        "find /root/.cache/huggingface/hub -name 'tokenizer*' | head -5",
+        "echo 'Orpheus model pre-download completed.'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
@@ -205,7 +196,8 @@ orchestrator_image = (
 
 # Modal volumes for model storage
 models_volume = modal.Volume.from_name("voice-models")
-tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
+# Orpheus TTS doesn't need persistent voice storage like Moshi
+# tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 
 # Cache volumes for LLM optimization
 hf_cache_vol = modal.Volume.from_name("huggingface-cache")
@@ -230,6 +222,7 @@ def install_moshi_server_with_cuda():
     """
     Install moshi-server binary with CUDA support at runtime.
     This function checks if a cached binary exists, and if not, compiles it with CUDA features.
+    Used by STT service - TTS now uses Orpheus.
     """
     import subprocess
     import os
@@ -277,20 +270,6 @@ def install_moshi_server_with_cuda():
     })
     
     try:
-        # Verify CUDA installation
-        print("Verifying CUDA installation...")
-        try:
-            nvcc_result = subprocess.run([
-                "nvcc", "--version"
-            ], env=env, capture_output=True, text=True, timeout=10)
-            if nvcc_result.returncode == 0:
-                print(f"CUDA nvcc found: {nvcc_result.stdout.strip()}")
-            else:
-                print(f"CUDA nvcc check failed: {nvcc_result.stderr}")
-        except Exception as e:
-            print(f"CUDA nvcc verification failed: {e}")
-            print("Continuing without CUDA verification - compilation may still work")
-        
         # Install moshi-server with CUDA features
         print("Running cargo install moshi-server@0.6.3 --features cuda...")
         start_time = time.time()
@@ -333,14 +312,6 @@ def install_moshi_server_with_cuda():
         os.makedirs("/rust-binaries", exist_ok=True)
         subprocess.run(["cp", local_binary_path, cached_binary_path], check=True)
         
-        # Verify the binary works
-        result = subprocess.run([
-            local_binary_path, "--help"
-        ], capture_output=True, text=True, timeout=10, env=env)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"Compiled binary failed verification: {result.stderr}")
-            
         print("moshi-server successfully installed and cached")
         return local_binary_path
         
@@ -662,9 +633,8 @@ dim = 6
     gpu="L40S", 
     image=tts_image,
     volumes={
-        "/models": models_volume, 
-        "/persistent-voices": tts_voices_volume,
-        "/rust-binaries": rust_binaries_volume,
+        "/models": models_volume,
+        # Orpheus uses HuggingFace cache for model storage
     },
     secrets=secrets,
     min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
@@ -672,330 +642,127 @@ dim = 6
 )
 @modal.concurrent(max_inputs=10)
 class TTSService:
-    """Text-to-Speech service using Moshi TTS model"""
+    """Text-to-Speech service using Orpheus TTS model"""
     
     @modal.enter()
     def load_model(self):
-        """Load TTS model weights once per container"""
-        import subprocess
-        import tempfile
+        """Load Orpheus TTS model weights once per container"""
         import os
         import time
         
-        print("Setting up TTS Service...")
-        
-        # Install moshi-server with CUDA support
-        moshi_server_path = install_moshi_server_with_cuda()
-        
-        # Set up environment with cargo bin in PATH
-        env = os.environ.copy()
-        cargo_bin_path = os.path.expanduser("~/.cargo/bin")
-        env["PATH"] = f"{cargo_bin_path}:{env.get('PATH', '')}"
-
-        # ADD THIS LINE - critical for Python module loading:
-        env["LD_LIBRARY_PATH"] = subprocess.check_output([
-            "python", "-c", 
-            "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"
-        ], text=True).strip()
-
-        # Also update RUST_LOG to match documentation:
-        env["RUST_LOG"] = "warn,moshi_server::batched_asr=off"
+        print("Setting up Orpheus TTS Service...")
         
         # Check if HuggingFace token is available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         if hf_token:
-            print(f"TTS: HuggingFace token available (length: {len(hf_token)})")
+            print(f"Orpheus TTS: HuggingFace token available (length: {len(hf_token)})")
         else:
-            print("TTS: No HuggingFace token found - this may cause issues downloading models")
+            print("Orpheus TTS: No HuggingFace token found - this may cause issues downloading models")
         
-        # Verify the installed binary
-        print(f"Verifying moshi-server at: {moshi_server_path}")
+        # Initialize Orpheus model
+        from unmute.tts.orpheus_tts import OrpheusModel, initialize_orpheus_model
+        
         try:
-            result = subprocess.run([moshi_server_path, "--help"], 
-                                  capture_output=True, text=True, timeout=10, env=env)
-            print(f"moshi-server help output: {result.stdout[:200]}...")  # Show first 200 chars
-            if result.returncode != 0:
-                raise RuntimeError(f"moshi-server verification failed: {result.stderr}")
-        except Exception as e:
-            print(f"Failed to verify moshi-server: {e}")
-            raise
-        
-        # Set up persistent voice storage
-        print("Setting up persistent voice storage...")
-        persistent_voices_dir = "/persistent-voices"
-        os.makedirs(persistent_voices_dir, exist_ok=True)
-        
-        # Check if voices already exist in persistent storage
-        voices_exist = (os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") and 
-                       len([f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')]) > 0) if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else False
-        
-        if not voices_exist:
-            print("Downloading essential voices to persistent storage (one-time setup)...")
-            try:
-                # Download only the essential voices directly to persistent storage
-                from huggingface_hub import snapshot_download
-                snapshot_download(
-                    'kyutai/tts-voices',
-                    cache_dir='/root/.cache/huggingface/hub',
-                    local_dir=persistent_voices_dir,
-                    allow_patterns=['unmute-prod-website/*.safetensors', 'unmute-prod-website/*.wav']
-                )
-                print("Essential voices downloaded successfully to persistent storage")
-                
-                # Verify that voices were actually downloaded
-                voice_files = [f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')] if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else []
-                if len(voice_files) == 0:
-                    raise RuntimeError("No voice files found after download - TTS will not work")
-                print(f"Verified {len(voice_files)} voice files downloaded successfully")
-                
-            except Exception as e:
-                print(f"CRITICAL ERROR: Voice download failed: {e}")
-                print("TTS service cannot start without voices - failing container startup")
-                raise RuntimeError(f"TTS service initialization failed: {e}. Container must be restarted.")
-        else:
-            print("Voices already exist in persistent storage, skipping download")
-            # Verify existing voices are still valid
-            voice_files = [f for f in os.listdir(f"{persistent_voices_dir}/unmute-prod-website") if f.endswith('.safetensors')] if os.path.exists(f"{persistent_voices_dir}/unmute-prod-website") else []
-            if len(voice_files) == 0:
-                print("CRITICAL ERROR: No voice files found in persistent storage")
-                raise RuntimeError("TTS service cannot start: No voice files available in persistent storage")
-        
-        # Create temporary config file for TTS
-        config_content = '''
-static_dir = "./static/"
-log_dir = "/tmp/unmute_logs"
-instance_name = "tts"
-authorized_ids = ["public_token"]
-
-[modules.tts_py]
-type = "Py"
-path = "/api/tts_streaming"
-text_tokenizer_file = "hf://kyutai/tts-1.6b-en_fr/tokenizer_spm_8k_en_fr_audio.model"
-batch_size = 16
-text_bos_token = 1
-
-[modules.tts_py.py]
-log_folder = "/tmp/unmute_logs"
-# Use persistent volume for voices to avoid re-downloading on each container restart
-voice_folder = "/persistent-voices"
-default_voice = "unmute-prod-website/default_voice.wav"
-cfg_coef = 2.0
-cfg_is_no_text = true
-padding_between = 1
-n_q = 24
-# Add debug logging
-log_level = "info"
-'''
-        
-        os.makedirs("/tmp/unmute_logs", exist_ok=True)
-        os.makedirs("./static", exist_ok=True)
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
-            f.write(config_content)
-            self.config_path = f.name
-        
-        # Start moshi-server as a background process
-        print("Starting TTS moshi-server...")
-        print(f"Config file: {self.config_path}")
-        
-        # Debug: print the config content
-        with open(self.config_path, 'r') as f:
-            config_content = f.read()
-            print("TTS Config content:")
-            print(config_content)
-        
-        # Find the moshi-server binary
-        moshi_server_cmd = "moshi-server"
-        if os.path.exists("/usr/local/bin/moshi-server"):
-            moshi_server_cmd = "/usr/local/bin/moshi-server"
-        elif os.path.exists(cargo_bin_path + "/moshi-server"):
-            moshi_server_cmd = cargo_bin_path + "/moshi-server"
-        
-        print(f"Using moshi-server at: {moshi_server_cmd}")
-        
-        self.proc = subprocess.Popen([
-            moshi_server_cmd, "worker",
-            "--config", self.config_path, 
-            "--port", "8089"
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        
-        # Wait for the server to be ready with health checking
-        import socket
-        import threading
-        
-        # Start a thread to monitor the process output in real-time
-        def monitor_output():
-            try:
-                while self.proc.poll() is None:
-                    line = self.proc.stdout.readline()
-                    if line:
-                        # Filter out noisy batched_asr logs
-                        line_stripped = line.strip()
-                        print(f"TTS moshi-server: {line_stripped}")
-            except Exception as e:
-                print(f"TTS output monitor error: {e}")
-        
-        output_thread = threading.Thread(target=monitor_output, daemon=True)
-        output_thread.start()
-        
-        max_attempts = 120  # 120 seconds max - TTS takes longer than STT
-        for attempt in range(max_attempts):
-            # Check if process died
-            if self.proc.poll() is not None:
-                print(f"TTS moshi-server process died with return code: {self.proc.returncode}")
-                break
-                
-            try:
-                # Try to connect to the moshi server
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
-                result = sock.connect_ex(('127.0.0.1', 8089))
-                sock.close()
-                if result == 0:
-                    print(f"TTS moshi-server ready after {attempt + 1} seconds")
-                    break
-            except Exception:
-                pass
-            # Print progress every 10 seconds
-            if (attempt + 1) % 10 == 0:
-                print(f"TTS moshi-server still starting... {attempt + 1}/{max_attempts} seconds")
-            time.sleep(1)
-        else:
-            # Check if process is still running
-            if self.proc.poll() is not None:
-                stdout, stderr = self.proc.communicate()
-                print(f"TTS moshi-server failed to start. Return code: {self.proc.returncode}")
-                print(f"TTS moshi-server stdout: {stdout}")
-                print(f"TTS moshi-server stderr: {stderr}")
-                
-                # Try to get more debug info
-                print("Checking moshi-server binary...")
-                try:
-                    version_result = subprocess.run([moshi_server_cmd, "--help"], 
-                                                  capture_output=True, text=True, timeout=10, env=env)
-                    print(f"moshi-server help output: {version_result.stdout[:200]}...")
-                    if version_result.stderr:
-                        print(f"moshi-server help stderr: {version_result.stderr}")
-                except Exception as e:
-                    print(f"Failed to get moshi-server help: {e}")
-                
-                raise RuntimeError(f"TTS moshi-server process died during startup with return code {self.proc.returncode}")
-            else:
-                print("TTS moshi-server taking longer than expected to start, continuing anyway...")
+            print("Loading Orpheus TTS model...")
+            self.orpheus_model = OrpheusModel()
+            self.orpheus_model.load()
             
-        print("TTS model loaded successfully")
+            # Initialize the global SNAC model
+            initialize_orpheus_model()
+            
+            print("Orpheus TTS model loaded successfully")
+            
+        except Exception as e:
+            print(f"CRITICAL ERROR: Orpheus TTS model loading failed: {e}")
+            raise RuntimeError(f"Orpheus TTS service initialization failed: {e}. Container must be restarted.")
+
     
     @modal.asgi_app()
     def web(self):
-        """WebSocket endpoint for TTS service"""
+        """WebSocket endpoint for Orpheus TTS service"""
         from fastapi import FastAPI, WebSocket, WebSocketDisconnect
         import asyncio
+        import msgpack
+        import json
         
-        app = FastAPI(title="TTS Service", version="1.0.0")
+        app = FastAPI(title="Orpheus TTS Service", version="1.0.0")
         
         @app.get("/")
         def root():
-            return {"service": "tts", "model": "kyutai-tts", "status": "ready"}
+            return {"service": "tts", "model": "orpheus-tts", "status": "ready"}
         
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
-            print("=== TTS_SERVICE: WebSocket connection attempt ===")
-            
-            # First check if our internal moshi server is ready before accepting the connection
-            import socket
-            import asyncio
-            max_wait_attempts = 120  # 120 seconds max to allow for moshi-server startup
-            for attempt in range(max_wait_attempts):
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(1.0)
-                    result = sock.connect_ex(('127.0.0.1', 8089))
-                    sock.close()
-                    if result == 0:
-                        print(f"=== TTS_SERVICE: Internal moshi server ready after {attempt + 1} attempts ===")
-                        break
-                except Exception:
-                    pass
-                print(f"=== TTS_SERVICE: Waiting for internal moshi server, attempt {attempt + 1}/{max_wait_attempts} ===")
-                await asyncio.sleep(1)  # Use async sleep instead of blocking sleep
-            else:
-                print("=== TTS_SERVICE: Internal moshi server not ready after 120 seconds ===")
-                # We must accept the websocket first before we can close it
-                await websocket.accept()
-                await websocket.close(code=1011, reason="Internal TTS server not ready")
-                return
+            print("=== ORPHEUS_TTS_SERVICE: WebSocket connection attempt ===")
             
             await websocket.accept()
-            print("=== TTS_SERVICE: WebSocket connection accepted, internal server ready ===")
+            print("=== ORPHEUS_TTS_SERVICE: WebSocket connection accepted ===")
             
             try:
-                # Connect to the local moshi server and proxy messages
-                import websockets
-                try:
-                    print("=== TTS_SERVICE: Connecting to internal moshi server ===")
-                    moshi_connection = await websockets.connect(
-                        "ws://localhost:8089/api/tts_streaming?format=PcmMessagePack",
-                        additional_headers={"kyutai-api-key": "public_token"}
-                    )
-                    print("=== TTS_SERVICE: Successfully connected to internal moshi server ===")
-                except ConnectionRefusedError as e:
-                    print(f"=== TTS_SERVICE: Failed to connect to internal moshi server: {e} ===")
-                    await websocket.close(code=1011, reason="Internal TTS server not ready")
-                    return
-                except Exception as e:
-                    print(f"=== TTS_SERVICE: Unexpected error connecting to moshi server: {e} ===")
-                    await websocket.close(code=1011, reason="Internal TTS server error")
-                    return
+                # Send initial Ready message to client
+                ready_message = {"type": "Ready"}
+                await websocket.send_text(json.dumps(ready_message))
+                print("=== ORPHEUS_TTS_SERVICE: Sent Ready message ===")
                 
-                async with moshi_connection as moshi_ws:
-                    # First, wait for and forward the initial Ready message from moshi-server
+                while True:
                     try:
-                        initial_message = await asyncio.wait_for(moshi_ws.recv(), timeout=30.0)
-                        print(f"TTS: Received initial message from moshi-server: {type(initial_message)}")
-                        if isinstance(initial_message, bytes):
-                            await websocket.send_bytes(initial_message)
-                        else:
-                            await websocket.send_text(initial_message)
-                    except asyncio.TimeoutError:
-                        print("TTS: Timeout waiting for initial Ready message from moshi-server")
-                        await websocket.close(code=1011, reason="Internal TTS server timeout")
-                        return
-                    except Exception as e:
-                        print(f"TTS: Error receiving initial message: {e}")
-                        await websocket.close(code=1011, reason="Internal TTS server error")
-                        return
-                    
-                    # Now proxy messages between client and moshi server
-                    async def client_to_moshi():
+                        # Receive message from client
+                        data = await websocket.receive_bytes()
+                        print(f"=== ORPHEUS_TTS_SERVICE: Received data: {len(data)} bytes ===")
+                        
+                        # Unpack the message
                         try:
-                            while True:
-                                data = await websocket.receive_bytes()
-                                logger.info(f"=== TTS: Sending data to moshi server: {len(data)} bytes ===")
-                                await moshi_ws.send(data)
-                        except WebSocketDisconnect:
-                            pass
-                    
-                    async def moshi_to_client():
-                        try:
-                            async for message in moshi_ws:
-                                if isinstance(message, bytes):
-                                    logger.info(f"=== TTS: Received bytes from moshi server, sending to client: {len(message)} bytes ===")
-                                    await websocket.send_bytes(message)
-                                else:
-                                    logger.info(f"=== TTS: Received text from moshi server, sending to client: {message[:50]} ===")
-                                    await websocket.send_text(message)
+                            message = msgpack.unpackb(data)
+                            print(f"=== ORPHEUS_TTS_SERVICE: Unpacked message type: {message.get('type', 'unknown')} ===")
+                            
+                            if message.get("type") == "Text":
+                                text = message.get("text", "")
+                                voice = message.get("voice", "tara")
+                                
+                                print(f"=== ORPHEUS_TTS_SERVICE: Processing text: {text[:50]}... with voice: {voice} ===")
+                                
+                                # Generate audio using Orpheus
+                                try:
+                                    async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
+                                        # Send audio chunk to client
+                                        audio_message = {
+                                            "type": "Audio",
+                                            "pcm": audio_chunk
+                                        }
+                                        packed_message = msgpack.packb(audio_message)
+                                        await websocket.send_bytes(packed_message)
+                                        print(f"=== ORPHEUS_TTS_SERVICE: Sent audio chunk: {len(audio_chunk)} bytes ===")
+                                        
+                                except Exception as e:
+                                    print(f"=== ORPHEUS_TTS_SERVICE: Error generating audio: {e} ===")
+                                    error_message = {
+                                        "type": "Error",
+                                        "message": f"Audio generation failed: {str(e)}"
+                                    }
+                                    packed_error = msgpack.packb(error_message)
+                                    await websocket.send_bytes(packed_error)
+                                    
+                            elif message.get("type") == "Eos":
+                                print("=== ORPHEUS_TTS_SERVICE: Received EOS message ===")
+                                # Send EOS response
+                                eos_response = {"type": "Eos"}
+                                packed_eos = msgpack.packb(eos_response)
+                                await websocket.send_bytes(packed_eos)
+                                
                         except Exception as e:
-                            print(f"TTS moshi_to_client error: {e}")
-                    
-                    # Run both directions concurrently
-                    await asyncio.gather(
-                        client_to_moshi(),
-                        moshi_to_client(),
-                        return_exceptions=True
-                    )
+                            print(f"=== ORPHEUS_TTS_SERVICE: Error unpacking message: {e} ===")
+                            continue
+                            
+                    except WebSocketDisconnect:
+                        print("=== ORPHEUS_TTS_SERVICE: Client disconnected ===")
+                        break
+                    except Exception as e:
+                        print(f"=== ORPHEUS_TTS_SERVICE: WebSocket error: {e} ===")
+                        break
+                        
             except Exception as e:
-                print(f"TTS websocket error: {e}")
-        
+                print(f"=== ORPHEUS_TTS_SERVICE: Connection error: {e} ===")
+                
         return app
 
 
