@@ -130,6 +130,14 @@ stt_image = (
 tts_image = (
     base_deps_image
     .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg", "git-lfs")
+    .env({
+        # H100 optimization environment variables
+        "TORCH_CUDNN_V8_API_ENABLED": "1",
+        "CUDA_LAUNCH_BLOCKING": "0",  # Allow async CUDA operations
+        "TORCH_COMPILE_DEBUG": "0",  # Disable debug for performance
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+        "CUDA_VISIBLE_DEVICES": "0",  # Use first GPU
+    })
     .run_commands(
         # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
         "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
@@ -663,14 +671,16 @@ dim = 6
     image=tts_image,
     volumes=tts_volumes,
     secrets=secrets,
-    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
-    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
-    timeout=15 * 60,  # 15 minutes for Orpheus model download and initialization
-    # Optimize for H100 performance
-    cpu=4.0,  # More CPU cores for parallel processing
-    memory=32768,  # 32GB RAM for large model
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "1")),  # Keep at least 1 warm
+    scaledown_window=300,  # 5 minutes - faster scaling for better utilization
+    timeout=20 * 60,  # 20 minutes for model optimization and compilation
+    # H100-optimized configuration
+    cpu=8.0,  # More CPU cores for streaming and async processing
+    memory=40960,  # 40GB RAM for H100 optimization and FP8 conversions
+    # Enable container keep-warm for better performance
+    keep_warm=1,  # Keep 1 container warm for instant response
 )
-@modal.concurrent(max_inputs=10)
+@modal.concurrent(max_inputs=16)  # Increased concurrency for H100
 class TTSService:
     """Text-to-Speech service using Orpheus TTS model"""
     

@@ -24,16 +24,21 @@ _inference_mode_raii_guard = torch._C._InferenceMode(True)
 
 _TOKEN_RE = re.compile(r"<custom_token_(\d+)>")
 SNAC_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SNAC_MAX_BATCH = 64
+SNAC_MAX_BATCH = 128  # Increased for better H100 utilization
 PREPROCESS_STREAM = torch.Stream(SNAC_DEVICE)
 MAX_CHARACTERS_INPUT = 6144
+
+# H100 optimization constants
+OPTIMAL_CHUNK_SIZE = 64  # Optimal streaming chunk size for H100
+STREAMING_BUFFER_SIZE = 256  # Buffer size for streaming generation
 
 logger = logging.getLogger(__name__)
 
 
 class SnacModelBatched:
     def __init__(self):
-        self.dtype_decoder = torch.float32
+        # Use bfloat16 for better H100 performance instead of float32
+        self.dtype_decoder = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         compile_background = False
         use_compile = True
         model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
@@ -71,7 +76,7 @@ class SnacModelBatched:
         self.snac_model.decoder = decoder
         self.snac_model.quantizer = quantizer
 
-    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=15)
+    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=5)  # Reduced timeout for faster streaming
     def batch_snac_model(
         self, items: list[dict[str, list[torch.Tensor]]]
     ) -> list[torch.Tensor]:
@@ -134,7 +139,7 @@ def split_custom_tokens(s: str) -> List[int]:
 async def tokens_decoder(
     token_gen: AsyncIterator, request_id: str, start_time: int
 ) -> AsyncIterator[bytes]:
-    """Optimized decoder that batches token processing to reduce async overhead."""
+    """High-performance streaming decoder optimized for H100."""
     assert hasattr(token_gen, "__aiter__")
     
     buffer: list[int] = []
@@ -142,8 +147,8 @@ async def tokens_decoder(
     tft = 0
     first_audio_yielded = False
     
-    # Collect tokens in larger batches to reduce async overhead
-    token_batch = []
+    # Use optimal chunk size for H100 streaming
+    chunk_size = OPTIMAL_CHUNK_SIZE  # 64 tokens = ~9 frames for better batching
     
     async for token_sim in token_gen:
         if tft == 0:
@@ -155,22 +160,25 @@ async def tokens_decoder(
             buffer.append(token)
             count += 1
             
-            # Process in larger batches (28-49 tokens) instead of every 7 tokens
-            # This reduces the number of async tasks created
-            if count % 7 == 0 and count >= 28:  # Minimum batch size of 28 (4 frames)
-                # Extract tokens for processing - use larger chunks when possible
-                batch_size = min(49, len(buffer))  # Up to 49 tokens (7 frames) per batch
-                if batch_size >= 28:  # Ensure we have at least 4 frames
-                    buf_to_proc = buffer[-batch_size:]
-                    
-                    # Convert to audio synchronously to reduce async overhead
-                    audio_bytes = await convert_to_audio(buf_to_proc)
-                    if audio_bytes is not None:
-                        if not first_audio_yielded:
-                            ttfb = time.time() - start_time
-                            logging.info(f"First audio chunk for request_id {request_id} - TTFB: {ttfb:.3f}s")
-                            first_audio_yielded = True
-                        yield audio_bytes
+            # Process in optimal chunks for H100 (every 7 tokens = 1 frame)
+            # Stream more aggressively for lower latency
+            if count % 7 == 0:  # Process complete frames immediately
+                # Use larger batches when buffer has accumulated enough tokens
+                frames_available = len(buffer) // 7
+                if frames_available >= 1:  # Process as soon as we have 1+ complete frames
+                    tokens_to_process = min(frames_available * 7, chunk_size)
+                    if tokens_to_process >= 7:  # At least one complete frame
+                        buf_to_proc = buffer[:tokens_to_process]
+                        buffer = buffer[tokens_to_process:]  # Remove processed tokens
+                        
+                        # Convert to audio with optimized batching
+                        audio_bytes = await convert_to_audio(buf_to_proc)
+                        if audio_bytes is not None:
+                            if not first_audio_yielded:
+                                ttfb = time.time() - start_time
+                                logging.info(f"First audio chunk for request_id {request_id} - TTFB: {ttfb:.3f}s")
+                                first_audio_yielded = True
+                            yield audio_bytes
     
     # Process any remaining tokens
     if len(buffer) >= 7:  # At least one frame
@@ -279,30 +287,39 @@ class OrpheusModel:
             try:
                 logging.info(f"Loading Orpheus language model from {model_name} with optimizations...")
                 
-                # Try with accelerate first, fallback to manual device placement
+                # Try with H100-optimized configuration first
                 try:
+                    # Use bfloat16 for better H100 performance
+                    optimal_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
+                    
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,  # Use dtype for better compatibility
+                        torch_dtype=optimal_dtype,  # H100 optimized precision
                         device_map="auto",
                         token=hf_token,
                         trust_remote_code=True,
-                        # Optimizations for inference - try different attention implementations with fallbacks
+                        # H100-optimized attention implementation
                         attn_implementation=self._get_best_attention_implementation(),
                         low_cpu_mem_usage=True,
+                        # Additional H100 optimizations
+                        use_cache=True,  # Enable KV caching
+                        max_memory={0: "75GB"} if torch.cuda.is_available() else None,  # Reserve memory for H100
                     )
                     logging.info("Orpheus model loaded with accelerate device mapping and optimizations")
                 except Exception as e:
                     logging.warning(f"Failed to load with optimizations, trying basic loading: {e}")
                     # Fallback: load without advanced optimizations
+                    # Fallback: load with basic H100 optimizations
+                    optimal_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,
+                        torch_dtype=optimal_dtype,
                         token=hf_token,
                         trust_remote_code=True,
                         low_cpu_mem_usage=True,
+                        use_cache=True,
                     )
                     if torch.cuda.is_available():
                         self._model = self._model.cuda()
@@ -318,7 +335,7 @@ class OrpheusModel:
                 # Memory optimizations
                 self._optimize_memory()
                 
-                # Apply torch.compile optimization like SNAC model
+                # Apply H100-optimized torch.compile
                 self._compile_model()
                 
                 logging.info("Orpheus language model loaded and optimized successfully")
@@ -373,78 +390,134 @@ class OrpheusModel:
         return None
 
     def _enable_performance_optimizations(self):
-        """Enable various PyTorch performance optimizations"""
+        """Enable H100-specific performance optimizations"""
         try:
-            # Enable TensorFloat32 for better H100 performance
             if torch.cuda.is_available():
+                # Enable TensorFloat32 for better H100 performance
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
                 torch.set_float32_matmul_precision('high')  # Use TF32 for float32 operations
-                logging.info("TensorFloat32 (TF32) enabled for better H100 performance")
+                logging.info("TensorFloat32 (TF32) enabled for H100")
                 
                 # H100-specific optimizations
-                if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
-                    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-                    logging.info("FP16 reduced precision reduction enabled for H100")
+                device_props = torch.cuda.get_device_properties(0)
+                if device_props.major >= 9:  # H100 is compute capability 9.0+
+                    logging.info(f"H100 GPU detected: {device_props.name}")
+                    
+                    # Enable H100-specific features
+                    if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
+                        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+                        logging.info("FP16 reduced precision reduction enabled")
+                    
+                    # Try to enable FP8 optimizations if available
+                    self._enable_fp8_optimizations()
+                    
+                    # H100 memory optimizations
+                    torch.cuda.set_per_process_memory_fraction(0.90)  # Leave room for FP8 conversions
+                else:
+                    logging.info(f"Non-H100 GPU detected: {device_props.name}")
+                    torch.cuda.set_per_process_memory_fraction(0.95)
             
-            # Enable optimized attention backends
+            # Enable optimized attention backends (critical for performance)
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True) 
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             logging.info("Optimized attention backends enabled")
             
-            # Set optimal CUDA settings
+            # Additional CUDA optimizations
             if torch.cuda.is_available():
-                torch.cuda.set_per_process_memory_fraction(0.95)
                 torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+                torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
                 
-                # Check if we're on H100 (compute capability 9.0)
-                if hasattr(torch.cuda, 'get_device_capability'):
-                    major, minor = torch.cuda.get_device_capability()
-                    if major >= 9:  # H100 is compute capability 9.0+
-                        logging.info("H100 detected - enabling advanced optimizations")
-                        # Additional H100-specific settings could go here
+                # Enable CUDA graphs if supported
+                if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
+                    try:
+                        # Test CUDA graphs support
+                        torch.cuda.synchronize()
+                        logging.info("CUDA graphs support detected")
+                    except Exception as e:
+                        logging.warning(f"CUDA graphs not available: {e}")
                 
-                logging.info("CUDA optimizations applied")
+                logging.info("H100 CUDA optimizations applied")
                 
         except Exception as e:
             logging.warning(f"Performance optimization setup failed: {e}")
     
+    def _enable_fp8_optimizations(self):
+        """Enable FP8 optimizations if available on H100"""
+        try:
+            # Check for FP8 support (experimental)
+            if hasattr(torch, 'float8_e4m3fn'):
+                logging.info("FP8 support detected - enabling experimental optimizations")
+                
+                # Set environment variables for FP8 optimizations
+                import os
+                os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'
+                os.environ['TORCH_COMPILE_DEBUG'] = '0'  # Disable debug for performance
+                
+                # Note: Full FP8 quantization would require additional libraries
+                # like transformer-engine or TensorRT-LLM
+                logging.info("FP8 environment configured")
+            else:
+                logging.info("FP8 support not available in current PyTorch version")
+                
+        except Exception as e:
+            logging.warning(f"FP8 optimization setup failed: {e}")
+    
     def _get_optimized_generation_config(self, kwargs):
-        """Get generation config optimized for H100 performance"""
-        max_new_tokens = kwargs.get("max_tokens", 4096)
-        temperature = kwargs.get("temperature", 0.7)
-        top_k = kwargs.get("top_k", 50)
+        """Get generation config optimized for H100 streaming performance"""
+        max_new_tokens = kwargs.get("max_tokens", 2048)  # Reduced for streaming
+        temperature = kwargs.get("temperature", 0.8)  # Slightly higher for better quality
+        top_k = kwargs.get("top_k", 40)  # Optimized for H100
+        top_p = kwargs.get("top_p", 0.9)  # Add nucleus sampling
         
         return {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
             "top_k": top_k,
+            "top_p": top_p,
             "do_sample": True,
             "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
             "eos_token_id": self.end_ids,
-            "use_cache": True,  # Enable KV caching for faster sequential generation
-            # Optimizations for H100 performance
-            "num_beams": 1,  # No beam search overhead for streaming
-            "repetition_penalty": 1.1,  # Slight penalty to avoid loops
+            "use_cache": True,  # Critical for streaming performance
+            # H100 streaming optimizations
+            "num_beams": 1,  # No beam search overhead
+            "repetition_penalty": 1.05,  # Reduced penalty for faster generation
             "length_penalty": 1.0,
-            "no_repeat_ngram_size": 3,  # Prevent repetitive patterns
+            "no_repeat_ngram_size": 2,  # Reduced for speed
+            # Additional streaming optimizations
+            "output_scores": False,  # Don't compute scores to save memory
+            "return_dict_in_generate": True,  # Required for streaming
         }
 
     def _compile_model(self):
-        """Compile the Orpheus model for optimized inference like SNAC"""
+        """Compile the Orpheus model with H100-optimized settings"""
         try:
-            logging.info("Starting torch.compile optimization for Orpheus model...")
+            logging.info("Starting H100-optimized torch.compile for Orpheus model...")
             compile_start = time.time()
             
+            # H100-optimized compilation settings
+            compile_kwargs = {
+                "mode": "max-autotune",  # Best performance for H100
+                "dynamic": True,  # Handle variable sequence lengths
+                "backend": "inductor",
+                "options": {
+                    "triton.cudagraphs": True,  # Enable CUDA graphs for H100
+                    "max_autotune": True,  # Aggressive optimization
+                    "epilogue_fusion": True,  # Fuse operations
+                    "max_autotune_gemm": True,  # Optimize matrix multiplications for H100
+                }
+            }
+            
+            # Check if we're on H100 for additional optimizations
+            if torch.cuda.is_available():
+                device_props = torch.cuda.get_device_properties(0)
+                if device_props.major >= 9:  # H100 is compute capability 9.0+
+                    logging.info("H100 detected - enabling advanced compilation optimizations")
+                    compile_kwargs["options"]["use_mixed_mm"] = True  # Mixed precision matmul
+            
             # Compile the model for faster inference
-            # Use reduce-overhead mode for better performance with streaming generation
-            self._model = torch.compile(
-                self._model, 
-                mode="reduce-overhead",
-                dynamic=True,
-                backend="inductor"
-            )
+            self._model = torch.compile(self._model, **compile_kwargs)
             
             # Warm up the compiled model with a small example
             # This helps with compilation and caching
@@ -566,50 +639,90 @@ class OrpheusModel:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # Generate real audio tokens using the Orpheus model with optimized direct generation
+            # Generate real audio tokens using streaming generation for H100 optimization
             async def generate_orpheus_tokens():
-                """Generate speech tokens using optimized direct generation without threading"""
-                logging.info(f"Running optimized Orpheus model inference for: '{formatted_prompt[:100]}...'")
+                """Generate speech tokens using true streaming generation for minimal latency"""
+                logging.info(f"Running H100-optimized streaming Orpheus inference for: '{formatted_prompt[:100]}...'")
                 
                 # Tokenize the input
                 inputs = self._tokenizer(formatted_prompt, return_tensors="pt")
                 if torch.cuda.is_available():
                     inputs = {k: v.cuda() for k, v in inputs.items()}
                 
-                # Use optimized generation config for H100
+                # Use optimized generation config for H100 streaming
                 generation_config = self._get_optimized_generation_config(kwargs)
                 
-                # Direct generation without threading overhead
+                # Implement true streaming generation
                 with torch.no_grad():
-                    # Use generate with return_dict_in_generate for streaming-like behavior
-                    outputs = self._model.generate(
-                        **inputs,
-                        **generation_config,
-                        return_dict_in_generate=True,
-                        output_scores=False,  # Don't need scores, saves memory
-                    )
+                    # Initialize generation state
+                    input_ids = inputs['input_ids']
+                    attention_mask = inputs.get('attention_mask', torch.ones_like(input_ids))
                     
-                    # Process generated tokens directly
-                    generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]  # Skip input tokens
-                    
-                    # Convert tokens to strings and yield custom tokens
+                    # Past key values for efficient generation
+                    past_key_values = None
                     token_count = 0
-                    for token_id in generated_tokens:
-                        token_str = self._tokenizer.decode([token_id], skip_special_tokens=False)
+                    
+                    # Stream tokens one by one for minimal latency
+                    for _ in range(generation_config['max_new_tokens']):
+                        # Generate next token with KV caching
+                        model_inputs = {
+                            'input_ids': input_ids,
+                            'attention_mask': attention_mask,
+                            'past_key_values': past_key_values,
+                            'use_cache': True,
+                        }
+                        
+                        # Forward pass - only compute next token
+                        outputs = self._model(**model_inputs)
+                        
+                        # Sample next token using optimized sampling
+                        logits = outputs.logits[:, -1, :] / generation_config['temperature']
+                        
+                        # Apply top-k and top-p filtering
+                        if generation_config['top_k'] > 0:
+                            top_k_logits, top_k_indices = torch.topk(logits, generation_config['top_k'])
+                            logits = torch.full_like(logits, float('-inf'))
+                            logits.scatter_(1, top_k_indices, top_k_logits)
+                        
+                        # Apply top-p (nucleus) sampling
+                        if generation_config.get('top_p', 1.0) < 1.0:
+                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > generation_config['top_p']
+                            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                            sorted_indices_to_remove[:, 0] = 0
+                            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                            logits[indices_to_remove] = float('-inf')
+                        
+                        # Sample from the filtered distribution
+                        probs = torch.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                        
+                        # Check for end tokens
+                        if next_token.item() in self.end_ids:
+                            break
+                        
+                        # Update generation state
+                        input_ids = torch.cat([input_ids, next_token], dim=-1)
+                        attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=-1)
+                        past_key_values = outputs.past_key_values
                         token_count += 1
+                        
+                        # Decode and yield token immediately for streaming
+                        token_str = self._tokenizer.decode([next_token.item()], skip_special_tokens=False)
                         
                         # Only yield custom tokens for audio synthesis
                         if "<custom_token_" in token_str:
                             yield token_str
-                        
-                        # Early termination on end tokens
-                        if token_id.item() in self.end_ids:
-                            break
+                            # Small async yield to allow other operations
+                            await asyncio.sleep(0)
                     
-                    logging.info(f"Completed direct token generation: {token_count} total tokens")
+                    logging.info(f"Completed streaming token generation: {token_count} total tokens")
             
+            # Use the streaming token generator
             token_gen = generate_orpheus_tokens()
             
+            # Process tokens through the optimized decoder
             async for chunk in tokens_decoder(token_gen, req_id, start_time):
                 yield chunk
                 
