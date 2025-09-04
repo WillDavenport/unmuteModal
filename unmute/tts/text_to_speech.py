@@ -2,10 +2,11 @@ import asyncio
 import urllib.parse
 from logging import getLogger
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Union, cast
+import numpy as np
 
 import msgpack
 import websockets
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 import unmute.openai_realtime_api_events as ora
 from unmute import metrics as mt
@@ -335,10 +336,10 @@ class TextToSpeech(ServiceWithStartup):
                     try:
                         message_dict = msgpack.unpackb(cast(Any, message_bytes))
                         message: TTSMessage = TTSMessageAdapter.validate_python(message_dict)
-                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError):
+                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError, ValidationError):
                         # Raw bytes from moshi-server are PCM audio data that we should skip
                         # The original working version skipped these and it worked fine
-                        logger.warning("Received unexpected message type from TTS: %s, value error: %s", message_bytes )
+                        logger.warning("Received unexpected message type from TTS: %s", message_bytes)
                         logger.debug(f"First 50 bytes: {message_bytes[:50]}")
                         continue
                 else:
@@ -445,3 +446,205 @@ class TextToSpeech(ServiceWithStartup):
         else:
             logger.info("=== TTS __aiter__() finished - no remaining messages ===")
         await self.shutdown()
+
+
+class OrpheusTextToSpeech(ServiceWithStartup):
+    """
+    Orpheus TTS adapter that handles complete text input instead of streaming.
+    Designed to work with the Orpheus TTS model which expects full text prompts.
+    """
+
+    def __init__(
+        self,
+        tts_base_url: str = TTS_SERVER,
+        recorder: Recorder | None = None,
+        get_time: Callable[[], float] | None = None,
+        voice: str | None = None,
+    ):
+        self.tts_base_url = tts_base_url
+        self.recorder = recorder
+        self.get_time = get_time or (lambda: 0.0)
+        self.voice = voice or "tara"
+        
+        # Connection state
+        self.websocket: websockets.ClientConnection | None = None
+        self.shutdown_lock = asyncio.Lock()
+        self.shutdown_complete = asyncio.Event()
+        
+        # Timing and metrics
+        self.time_since_request_sent = Stopwatch(autostart=False)
+        self.waiting_first_audio: bool = True
+        self.received_samples = 0
+        self.received_samples_yielded = 0
+        
+        # Simple generation tracking - no complex queuing needed for Orpheus
+        self.generation_complete = asyncio.Event()
+        
+        logger.info(f"Initialized OrpheusTextToSpeech with voice: {self.voice}")
+
+    def state(self) -> WebsocketState:
+        if not self.websocket:
+            return "not_created"
+        else:
+            d: dict[websockets.protocol.State, WebsocketState] = {
+                websockets.protocol.State.CONNECTING: "connecting",
+                websockets.protocol.State.OPEN: "connected",
+                websockets.protocol.State.CLOSING: "closing",
+                websockets.protocol.State.CLOSED: "closed",
+            }
+            return d[self.websocket.state]
+
+    async def start_up(self):
+        """Initialize connection to Orpheus TTS service."""
+        # For Modal Orpheus services, connect to /ws endpoint
+        if "modal.run" in self.tts_base_url:
+            url = f"{self.tts_base_url}/ws"
+        else:
+            url = f"{self.tts_base_url}/orpheus"
+            
+        logger.info(f"Connecting to Orpheus TTS: {url}")
+        
+        try:
+            self.websocket = await websockets.connect(
+                url,
+                additional_headers=HEADERS,
+            )
+            logger.info("Connected to Orpheus TTS successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to Orpheus TTS: {e}")
+            raise
+
+    async def send_complete_text(self, text: str) -> None:
+        """Send complete text to Orpheus TTS for audio generation."""
+        if not self.websocket:
+            logger.error("Cannot send text - Orpheus TTS websocket not connected")
+            return
+            
+        if self.shutdown_lock.locked():
+            logger.warning("Cannot send text - Orpheus TTS shutting down")
+            return
+            
+        text = prepare_text_for_tts(text)
+        if not text.strip():
+            logger.warning("Empty text after preprocessing, not sending to Orpheus TTS")
+            return
+            
+        logger.info(f"Sending complete text to Orpheus TTS: '{text}'")
+        self.time_since_request_sent.start_if_not_started()
+        mt.TTS_SESSIONS.inc()
+        mt.TTS_ACTIVE_SESSIONS.inc()
+        
+        try:
+            # Send request to Orpheus TTS with proper message type
+            request_data = {
+                "type": "Text",
+                "text": text,
+                "voice": self.voice,
+            }
+            
+            await self.websocket.send(msgpack.packb(request_data))
+            logger.info("Text sent to Orpheus TTS successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to send text to Orpheus TTS: {e}")
+            raise
+
+    async def send(self, message: str) -> None:
+        """Legacy method for compatibility - not used with Orpheus."""
+        logger.warning("send() method called on OrpheusTextToSpeech - this should use send_complete_text() instead")
+
+    def queue_eos(self) -> None:
+        """Legacy method for compatibility - not needed with Orpheus."""
+        logger.debug("queue_eos() called on OrpheusTextToSpeech - not needed for complete text generation")
+
+    async def shutdown(self):
+        """Clean up Orpheus TTS connection."""
+        async with self.shutdown_lock:
+            if self.shutdown_complete.is_set():
+                return
+                
+            logger.info("Shutting down Orpheus TTS")
+            
+            mt.TTS_ACTIVE_SESSIONS.dec()
+            mt.TTS_AUDIO_DURATION.observe(self.received_samples / SAMPLE_RATE)
+            if self.time_since_request_sent.started:
+                mt.TTS_GEN_DURATION.observe(self.time_since_request_sent.time())
+
+            self.shutdown_complete.set()
+            self.generation_complete.set()
+
+            if self.websocket:
+                await self.websocket.close()
+                self.websocket = None
+
+            logger.info("Orpheus TTS shutdown completed")
+
+    async def __aiter__(self) -> AsyncIterator[TTSMessage]:
+        """Iterate over TTS messages from Orpheus.
+        
+        Orpheus TTS outputs raw 16-bit PCM audio bytes at 24kHz directly,
+        like the working Baseten example.
+        """
+        if self.websocket is None:
+            raise RuntimeError("Orpheus TTS websocket not connected")
+            
+        logger.info("Starting Orpheus TTS message iteration")
+        
+        try:
+            # Process raw audio bytes from Orpheus TTS
+            async for message_bytes in self.websocket:
+                if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
+                    # Orpheus outputs raw 16-bit PCM bytes at 24kHz
+                    # Convert to float32 samples for the audio pipeline (same as other TTS services)
+                    try:
+                        audio_data = np.frombuffer(message_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                        
+                        if self.waiting_first_audio and self.time_since_request_sent.started:
+                            self.waiting_first_audio = False
+                            ttft = self.time_since_request_sent.time()
+                            mt.TTS_TTFT.observe(ttft)
+                            logger.info("Time to first audio from Orpheus: %.1f ms", ttft * 1000)
+                        
+                        # Create TTS audio message with float32 PCM data
+                        audio_message = TTSAudioMessage(
+                            type="Audio",
+                            pcm=audio_data.tolist()
+                        )
+                        
+                        self.received_samples += len(audio_data)
+                        mt.TTS_RECV_FRAMES.inc()
+                        
+                        if self.recorder is not None:
+                            await self.recorder.add_event(
+                                "server",
+                                ora.UnmuteResponseAudioDeltaReady(
+                                    number_of_samples=len(audio_data)
+                                ),
+                            )
+                        
+                        logger.debug(f"Yielding audio message with {len(audio_data)} samples")
+                        yield audio_message
+                        
+                    except ValueError as e:
+                        logger.error(f"Failed to convert Orpheus PCM bytes to float array: {e}")
+                        continue
+                        
+                else:
+                    logger.debug(f"Received non-bytes message from Orpheus: {type(message_bytes)}")
+                    continue
+                    
+        except websockets.ConnectionClosedOK:
+            logger.info("Orpheus TTS connection closed normally")
+        except websockets.ConnectionClosedError as e:
+            if self.shutdown_complete.is_set():
+                logger.info("Orpheus TTS connection closed during intentional shutdown")
+            else:
+                logger.error(f"Orpheus TTS connection lost unexpectedly: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Orpheus TTS connection error: {type(e).__name__}: {e}")
+            raise
+        finally:
+            self.generation_complete.set()
+            await self.shutdown()

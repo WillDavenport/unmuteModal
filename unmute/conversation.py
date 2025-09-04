@@ -30,7 +30,7 @@ from unmute.recorder import Recorder
 from unmute.service_discovery import find_instance
 from unmute.stt.speech_to_text import SpeechToText, STTMarkerMessage
 from unmute.timer import Stopwatch
-from unmute.tts.text_to_speech import TextToSpeech, TTSAudioMessage, TTSTextMessage
+from unmute.tts.text_to_speech import TextToSpeech, TTSAudioMessage, TTSTextMessage, OrpheusTextToSpeech
 from unmute.kyutai_constants import (
     RECORDINGS_DIR, 
     SAMPLE_RATE, 
@@ -62,7 +62,7 @@ class Conversation:
         
         # Service connections
         self.stt: SpeechToText | None = None
-        self.tts: TextToSpeech | None = None
+        self.tts: TextToSpeech | OrpheusTextToSpeech | None = None
         self.chatbot = Chatbot()
         self.openai_client = get_openai_client()
         
@@ -137,25 +137,25 @@ class Conversation:
             raise
 
     async def _init_tts(self, generating_message_i: int):
-        """Initialize TTS websocket connection."""
-        logger.info(f"Initializing TTS for conversation {self.conversation_id}")
+        """Initialize Orpheus TTS websocket connection."""
+        logger.info(f"Initializing Orpheus TTS for conversation {self.conversation_id}")
         try:
             factory = partial(
-                TextToSpeech,
+                OrpheusTextToSpeech,
                 recorder=self.recorder,
                 get_time=lambda: self.n_samples_received / SAMPLE_RATE,
                 voice=self.tts_voice,
             )
             self.tts = await find_instance("tts", factory)
-            logger.info(f"TTS connection established for conversation {self.conversation_id}")
+            logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
             
             # Start TTS task
             self.tts_task = asyncio.create_task(
-                self._tts_loop(generating_message_i), name=f"tts_loop_{self.conversation_id}"
+                self._tts_loop(generating_message_i), name=f"orpheus_tts_loop_{self.conversation_id}"
             )
             
         except Exception as e:
-            logger.error(f"Failed to connect to TTS service: {e}")
+            logger.error(f"Failed to connect to Orpheus TTS service: {e}")
             raise
 
     async def _stt_loop(self):
@@ -228,6 +228,8 @@ class Conversation:
                     logger.info("Response interrupted, breaking TTS loop")
                     break
 
+                logger.info(f"TTS message type: {type(message)}")
+                
                 if isinstance(message, TTSAudioMessage):
                     logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
                     t = self.tts_output_stopwatch.stop()
@@ -328,8 +330,8 @@ class Conversation:
             self.llm_finished_event.set()
 
     async def _stream_llm_to_tts(self, generating_message_i: int):
-        """Stream LLM response to TTS service."""
-        logger.info(f"Streaming LLM to TTS for conversation {self.conversation_id}")
+        """Generate complete LLM response and send to Orpheus TTS service."""
+        logger.info(f"Generating complete LLM response for Orpheus TTS (conversation {self.conversation_id})")
         
         llm_stopwatch = Stopwatch()
         llm = VLLMStream(
@@ -358,6 +360,7 @@ class Conversation:
         try:
             logger.info("Starting LLM chat completion stream")
             
+            # Collect the entire response before sending to TTS
             async for delta in rechunk_to_words(llm.chat_completion(messages)):
                 await self.output_queue.put(
                     ora.UnmuteResponseTextDeltaReady(delta=delta)
@@ -370,32 +373,33 @@ class Conversation:
                     time_to_first_token = llm_stopwatch.time()
                     self.debug_dict["timing"]["to_first_token"] = time_to_first_token
                     mt.VLLM_TTFT.observe(time_to_first_token)
-                    logger.info("Sending first word to TTS: %s. Time to first token: %s", delta, time_to_first_token)
-
-                self.tts_output_stopwatch.start_if_not_started()
+                    logger.info("First token received: %s. Time to first token: %s", delta, time_to_first_token)
 
                 if len(self.chatbot.chat_history) > generating_message_i:
                     logger.info("Response interrupted, breaking LLM loop")
                     break  # We've been interrupted
 
                 assert isinstance(delta, str)
-                logger.info(f"Sending word to TTS: '{delta}'")
-                if self.tts:
-                    await self.tts.send(delta)
+
+            # Send complete response to Orpheus TTS
+            complete_response = "".join(response_words)
+            logger.info(f"LLM generation completed with {len(response_words)} words. Sending complete text to Orpheus TTS.")
+            logger.info("Complete LLM response: %s", complete_response)
 
             await self.output_queue.put(
-                ora.ResponseTextDone(text="".join(response_words))
+                ora.ResponseTextDone(text=complete_response)
             )
 
-            logger.info(f"LLM stream completed with {len(response_words)} words")
-            logger.info("Full LLM response: %s", "".join(response_words))
-
-            if self.tts is not None:
-                logger.info("Queuing TTS EOS after text messages")
-                self.tts.queue_eos()
-                logger.info("TTS EOS queued successfully")
+            # Send the complete text to Orpheus TTS for audio generation
+            if self.tts is not None and complete_response.strip():
+                logger.info("Sending complete response to Orpheus TTS")
+                self.tts_output_stopwatch.start_if_not_started()
+                await self.tts.send_complete_text(complete_response)
             else:
-                logger.warning("TTS is None, cannot queue EOS")
+                if not complete_response.strip():
+                    logger.warning("Empty response, not sending to TTS")
+                else:
+                    logger.warning("TTS is None, cannot send response")
                 
         except asyncio.CancelledError:
             mt.VLLM_INTERRUPTS.inc()

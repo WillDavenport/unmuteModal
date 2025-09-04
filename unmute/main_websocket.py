@@ -547,7 +547,6 @@ async def emit_loop(
     emit_debug_logger = EmitDebugLogger()
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
-    audio_emitted_count = 0
     last_keepalive = asyncio.get_event_loop().time()
     KEEPALIVE_INTERVAL = 240  # 4 minutes - send keepalive before 5min timeout
 
@@ -624,10 +623,7 @@ async def emit_loop(
 
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):
-                audio_emitted_count += 1
-            logger.info(f"Sending message #{audio_emitted_count}: {to_emit.type}")
-            await websocket.send_text(to_emit.model_dump_json())
-            logger.info(f"Successfully sent message #{audio_emitted_count}")
+                await websocket.send_text(to_emit.model_dump_json())
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):

@@ -25,10 +25,20 @@ logger = logging.getLogger(__name__)
 # Modal app definition
 app = modal.App("voice-stack")
 
+# Configuration constants
+MINUTES = 60
+HOURS = 60 * MINUTES
+CACHE_DIR = "/root/.cache/huggingface"  # Use standard HF cache location
+VOLUME_CACHE_DIR = "/hf-cache"  # Volume mount point (separate from build cache)
+
 # Define the base image with common dependencies (NO local files yet)
 base_deps_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "curl", "ffmpeg", "libsndfile1", "build-essential")
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",  # Faster downloads from Hugging Face
+        "HF_HOME": CACHE_DIR,
+    })
     .pip_install(
         # Core FastAPI and web dependencies
         "fastapi[standard]>=0.115.12",
@@ -100,16 +110,15 @@ stt_image = (
     .run_commands(
         # Pre-download STT models during image build to avoid startup delays
         "echo 'Pre-downloading STT models to cache...'",
-        # Create cache directories
-        "mkdir -p /root/.cache/huggingface/hub",
-        "mkdir -p /root/.cache/huggingface/xet",
+        # Create cache directories using CACHE_DIR
+        f"mkdir -p {CACHE_DIR}",
         # Download STT model files with simple retry logic
-        "python -c \"import time; from huggingface_hub import hf_hub_download; [hf_hub_download('kyutai/stt-1b-en_fr-candle', f, cache_dir='/root/.cache/huggingface/hub') for f in ['model.safetensors', 'tokenizer_en_fr_audio_8000.model', 'mimi-pytorch-e351c8d8@125.safetensors']]\"",
+        f"python -c \"import time; from huggingface_hub import hf_hub_download; [hf_hub_download('kyutai/stt-1b-en_fr-candle', f, cache_dir='{CACHE_DIR}') for f in ['model.safetensors', 'tokenizer_en_fr_audio_8000.model', 'mimi-pytorch-e351c8d8@125.safetensors']]\"",
         # Verify models were downloaded
         "echo 'Verifying downloaded STT models...'",
-        "find /root/.cache/huggingface/hub -name 'model.safetensors' | head -5",
-        "find /root/.cache/huggingface/hub -name 'tokenizer_en_fr_audio_8000.model' | head -5",
-        "find /root/.cache/huggingface/hub -name 'mimi-pytorch-e351c8d8@125.safetensors' | head -5",
+        f"find {CACHE_DIR} -name 'model.safetensors' | head -5",
+        f"find {CACHE_DIR} -name 'tokenizer_en_fr_audio_8000.model' | head -5",
+        f"find {CACHE_DIR} -name 'mimi-pytorch-e351c8d8@125.safetensors' | head -5",
         "echo 'STT model pre-download completed'"
     )
     # Add local files LAST
@@ -131,14 +140,15 @@ tts_image = (
         "git lfs install",
     )
     .pip_install(
-        # PyTorch with CUDA support for Orpheus
-        "--extra-index-url https://download.pytorch.org/whl/cu128",
+        # PyTorch with CUDA support for Orpheus - use latest stable
         "torch==2.7.1",
         "torchaudio>=2.1.0",
-        "huggingface_hub>=0.19.0",
+        "huggingface_hub[hf_transfer]>=0.19.0",  # Include hf_transfer for faster downloads
         "safetensors>=0.4.0",
         "transformers>=4.35.0",
         "tokenizers>=0.15.0",
+        # Required for device mapping with large models
+        "accelerate>=0.20.0",
         # Orpheus-specific dependencies
         "snac==1.2.1",
         "batched==0.1.4",
@@ -147,27 +157,39 @@ tts_image = (
         # Keep some existing dependencies for compatibility
         "sentencepiece>=0.2.0",
         "einops>=0.8.0",
+        # Additional optimization packages (flash-attn removed due to compatibility issues)
+        # "flash-attn>=2.0.0",  # Commented out due to CUDA symbol conflicts
+        "xformers>=0.0.20",   # Memory-efficient attention (fallback)
     )
     .run_commands(
-        # Pre-download Orpheus models during image build to avoid startup delays
-        "echo 'Pre-downloading Orpheus models to cache...'",
-        # Create cache directories
-        "mkdir -p /root/.cache/huggingface/hub",
+        # Pre-download publicly available models during image build
+        "echo 'Pre-downloading publicly available models to cache...'",
+        # Create cache directories using CACHE_DIR
+        f"mkdir -p {CACHE_DIR}",
         "mkdir -p /root/orpheus-models",
-        # Download Orpheus tokenizer and model
-        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('canopylabs/orpheus-3b-0.1-ft', cache_dir='/root/.cache/huggingface/hub', allow_patterns=['tokenizer*', 'config.json'])\"",
-        # Download SNAC model for audio conversion
-        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('hubertsiuzdak/snac_24khz', cache_dir='/root/.cache/huggingface/hub')\"",
-        # Verify essential models were downloaded
-        "echo 'Verifying downloaded Orpheus models...'",
-        "ls -la /root/.cache/huggingface/hub/ | head -10",
-        "find /root/.cache/huggingface/hub -name 'tokenizer*' | head -5",
-        "echo 'Orpheus model pre-download completed.'"
+        # Download SNAC model for audio conversion (publicly available)
+        f"python -c \"from huggingface_hub import snapshot_download; snapshot_download('hubertsiuzdak/snac_24khz', cache_dir='{CACHE_DIR}')\"",
+        # Pre-download Orpheus tokenizer and config (publicly available parts)
+        "echo 'Pre-downloading Orpheus tokenizer and config...'",
+        f"python -c \"from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('canopylabs/orpheus-3b-0.1-ft', cache_dir='{CACHE_DIR}', use_auth_token=False)\" || echo 'Tokenizer download failed (expected without token)'",
+        # Note: Full Orpheus model requires authentication, will be downloaded at runtime
+        "echo 'Note: Full Orpheus model (canopylabs/orpheus-3b-0.1-ft) requires HF token, will download at runtime'",
+        # Verify SNAC model was downloaded
+        "echo 'Verifying downloaded models...'",
+        f"ls -la {CACHE_DIR}/ | head -10",
+        "echo 'Public model pre-download completed.'"
     )
     # Add local files LAST
     .add_local_python_source("unmute")
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
+
+# Import dependencies for TTS image context
+with tts_image.imports():
+    import torch
+    import transformers
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
 
 # LLM image: additional deps first, then local files
 llm_image = (
@@ -194,27 +216,33 @@ orchestrator_image = (
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
-# Modal volumes for model storage
-models_volume = modal.Volume.from_name("voice-models")
+# Modal volumes for model storage - following Modal best practices
+models_volume = modal.Volume.from_name("voice-models", create_if_missing=True)
 # Orpheus TTS doesn't need persistent voice storage like Moshi
 # tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 
-# Cache volumes for LLM optimization
-hf_cache_vol = modal.Volume.from_name("huggingface-cache")
-vllm_cache_vol = modal.Volume.from_name("vllm-cache")
+# HuggingFace cache volume for persistent model storage
+hf_cache_volume = modal.Volume.from_name("hf-hub-cache", create_if_missing=True)
+vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 # Cache volume for Rust binaries (shared between STT and TTS)
-rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache")
+rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache", create_if_missing=True)
+
+# Volume mappings for TTS service
+tts_volumes = {
+    "/models": models_volume,
+    VOLUME_CACHE_DIR: hf_cache_volume,  # Use volume mount point (separate from build cache)
+}
 
 # Model configuration for Mistral
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 MODEL_REVISION = "main"  # Pin to specific revision when available
 FAST_BOOT = True  # Set to False for better performance if you have persistent replicas
 
-# Modal secrets for API keys and auth tokens
+# Modal secrets for API keys and auth tokens - following Modal best practices
 secrets = [
     modal.Secret.from_name("voice-auth"),
-    modal.Secret.from_name("huggingface-secret"),  # Add HF token for model access
+    modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"]),  # Ensure HF_TOKEN is available
 ]
 
 
@@ -328,6 +356,7 @@ def install_moshi_server_with_cuda():
     volumes={
         "/models": models_volume,
         "/rust-binaries": rust_binaries_volume,
+        VOLUME_CACHE_DIR: hf_cache_volume,  # Use volume mount point (separate from build cache)
     },
     secrets=secrets,
     min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
@@ -630,15 +659,16 @@ dim = 6
 
 
 @app.cls(
-    gpu="L40S", 
+    gpu="H100", 
     image=tts_image,
-    volumes={
-        "/models": models_volume,
-        # Orpheus uses HuggingFace cache for model storage
-    },
+    volumes=tts_volumes,
     secrets=secrets,
     min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
+    timeout=15 * 60,  # 15 minutes for Orpheus model download and initialization
+    # Optimize for H100 performance
+    cpu=4.0,  # More CPU cores for parallel processing
+    memory=32768,  # 32GB RAM for large model
 )
 @modal.concurrent(max_inputs=10)
 class TTSService:
@@ -656,8 +686,82 @@ class TTSService:
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         if hf_token:
             print(f"Orpheus TTS: HuggingFace token available (length: {len(hf_token)})")
+            # Set environment variables for huggingface_hub
+            os.environ["HF_TOKEN"] = hf_token
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
         else:
             print("Orpheus TTS: No HuggingFace token found - this may cause issues downloading models")
+            print("Orpheus TTS: Please ensure 'huggingface-secret' is configured in Modal")
+        
+        # Pre-download Orpheus model at runtime (when token is available)
+        try:
+            print("Checking for cached Orpheus model...")
+            from huggingface_hub import snapshot_download
+            import os
+            import shutil
+            
+            # Check both build-time cache and volume cache
+            build_cache_path = CACHE_DIR  # Build-time cache
+            volume_cache_path = VOLUME_CACHE_DIR  # Volume cache
+            
+            # Ensure volume cache directory exists
+            os.makedirs(volume_cache_path, exist_ok=True)
+            
+            # Check if model is already in volume cache (persistent)
+            volume_cached_dirs = [d for d in os.listdir(volume_cache_path) if 'orpheus' in d.lower()] if os.path.exists(volume_cache_path) else []
+            build_cached_dirs = [d for d in os.listdir(build_cache_path) if 'orpheus' in d.lower()] if os.path.exists(build_cache_path) else []
+            
+            if volume_cached_dirs:
+                print(f"Found cached Orpheus model in volume: {volume_cached_dirs}")
+                # Use volume cache as primary cache location
+                cache_path = volume_cache_path
+            elif build_cached_dirs:
+                print(f"Found cached Orpheus model in build cache: {build_cached_dirs}")
+                # Copy from build cache to volume cache for persistence
+                print("Copying model from build cache to volume cache...")
+                for cached_dir in build_cached_dirs:
+                    src_path = os.path.join(build_cache_path, cached_dir)
+                    dst_path = os.path.join(volume_cache_path, cached_dir)
+                    if os.path.exists(src_path) and not os.path.exists(dst_path):
+                        shutil.copytree(src_path, dst_path)
+                        print(f"Copied {cached_dir} to volume cache")
+                cache_path = volume_cache_path
+            else:
+                print("No cached Orpheus model found, downloading to volume cache...")
+                cache_path = volume_cache_path
+            
+            # Download or verify the full Orpheus model with authentication
+            print(f"Downloading/verifying Orpheus model to: {cache_path}")
+            snapshot_download(
+                'canopylabs/orpheus-3b-0.1-ft',
+                cache_dir=cache_path,
+                token=hf_token,
+                local_files_only=False,  # Allow download if not cached
+                resume_download=True     # Resume partial downloads
+            )
+            print("Orpheus model ready (downloaded or verified from cache)")
+            
+            # Set environment variable to use volume cache
+            os.environ["HF_HOME"] = volume_cache_path
+            
+        except Exception as e:
+            print(f"WARNING: Failed to download Orpheus model: {e}")
+            print("Will attempt to use cached version or fallback")
+            # Check if we have any cached version in either location
+            try:
+                import os
+                volume_dirs = os.listdir(volume_cache_path) if os.path.exists(volume_cache_path) else []
+                build_dirs = os.listdir(build_cache_path) if os.path.exists(build_cache_path) else []
+                print(f"Available cached models - Volume: {volume_dirs}, Build: {build_dirs}")
+                
+                # Prefer volume cache, fallback to build cache
+                if volume_dirs:
+                    os.environ["HF_HOME"] = volume_cache_path
+                elif build_dirs:
+                    os.environ["HF_HOME"] = build_cache_path
+                    
+            except Exception as cache_e:
+                print(f"Could not check cache: {cache_e}")
         
         # Initialize Orpheus model
         from unmute.tts.orpheus_tts import OrpheusModel, initialize_orpheus_model
@@ -676,6 +780,51 @@ class TTSService:
             print(f"CRITICAL ERROR: Orpheus TTS model loading failed: {e}")
             raise RuntimeError(f"Orpheus TTS service initialization failed: {e}. Container must be restarted.")
 
+    @modal.method()
+    def generate_speech(self, text: str, voice: str = "tara"):
+        """Generate speech from text - test method for direct access"""
+        import asyncio
+        import base64
+        
+        print(f"Generating speech for text: '{text}' with voice: '{voice}'")
+        
+        async def generate_audio():
+            audio_chunks = []
+            chunk_count = 0
+            
+            async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
+                audio_chunks.append(audio_chunk)
+                chunk_count += 1
+                print(f"Generated audio chunk {chunk_count}: {len(audio_chunk)} bytes")
+            
+            if not audio_chunks:
+                return {
+                    "success": False,
+                    "error": "No audio chunks generated"
+                }
+            
+            # Combine all audio chunks (raw 16-bit PCM bytes)
+            combined_audio = b''.join(audio_chunks)
+            
+            # Convert to base64 for transport
+            audio_base64 = base64.b64encode(combined_audio).decode('utf-8')
+            
+            # Calculate approximate duration (24kHz sample rate, 16-bit PCM)
+            sample_rate = 24000
+            bytes_per_sample = 2  # 16-bit = 2 bytes
+            duration_ms = (len(combined_audio) / bytes_per_sample / sample_rate) * 1000
+            
+            return {
+                "success": True,
+                "audio_base64": audio_base64,
+                "sample_rate": sample_rate,
+                "duration_ms": duration_ms,
+                "chunk_count": chunk_count,
+                "total_bytes": len(combined_audio)
+            }
+        
+        # Run the async generation
+        return asyncio.run(generate_audio())
     
     @modal.asgi_app()
     def web(self):
@@ -699,10 +848,11 @@ class TTSService:
             print("=== ORPHEUS_TTS_SERVICE: WebSocket connection accepted ===")
             
             try:
-                # Send initial Ready message to client
+                # Send initial Ready message to client in MessagePack format (not JSON)
                 ready_message = {"type": "Ready"}
-                await websocket.send_text(json.dumps(ready_message))
-                print("=== ORPHEUS_TTS_SERVICE: Sent Ready message ===")
+                packed_ready = msgpack.packb(ready_message)
+                await websocket.send_bytes(packed_ready)
+                print("=== ORPHEUS_TTS_SERVICE: Sent Ready message (MessagePack format) ===")
                 
                 while True:
                     try:
@@ -724,14 +874,9 @@ class TTSService:
                                 # Generate audio using Orpheus
                                 try:
                                     async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
-                                        # Send audio chunk to client
-                                        audio_message = {
-                                            "type": "Audio",
-                                            "pcm": audio_chunk
-                                        }
-                                        packed_message = msgpack.packb(audio_message)
-                                        await websocket.send_bytes(packed_message)
-                                        print(f"=== ORPHEUS_TTS_SERVICE: Sent audio chunk: {len(audio_chunk)} bytes ===")
+                                        # Send raw PCM bytes directly (like Baseten API)
+                                        # Orpheus outputs 16-bit PCM at 24kHz, send as raw bytes
+                                        await websocket.send_bytes(audio_chunk)
                                         
                                 except Exception as e:
                                     print(f"=== ORPHEUS_TTS_SERVICE: Error generating audio: {e} ===")
@@ -771,7 +916,7 @@ class TTSService:
     image=llm_image,
     volumes={
         "/models": models_volume,
-        "/root/.cache/huggingface": hf_cache_vol,
+        VOLUME_CACHE_DIR: hf_cache_volume,  # Use volume mount point (separate from build cache)
         "/root/.cache/vllm": vllm_cache_vol,
     },
     secrets=secrets,
@@ -1267,6 +1412,260 @@ def health_check():
         "tts": "healthy",
         "timestamp": "2025-01-14"
     }
+
+@app.local_entrypoint()
+def test_orpheus_tts():
+    """Test the Orpheus TTS service."""
+    import time
+    
+    start_time = time.time()
+    print("Testing Orpheus TTS Service...")
+    print("Note: Timeout increased to 15 minutes to allow for model download")
+    print("Note: Subsequent runs will be faster due to model caching")
+    
+    # Test text
+    test_text = "This is a test of the Orpheus TTS service in our Modal deployment."
+    
+    try:
+        # Create service instance and test the new generate_speech method
+        service = TTSService()
+        
+        print(f"Generating speech for: '{test_text}'")
+        print("Note: Model loading happens automatically when container starts (@modal.enter)")
+        print("This may take up to 15 minutes on first run while downloading the 3B model...")
+        
+        # Call the generate_speech method (this will trigger @modal.enter() automatically)
+        generation_start = time.time()
+        result = service.generate_speech.remote(test_text, "tara")
+        generation_time = time.time() - generation_start
+        
+        if result["success"]:
+            print(f"Speech generation successful!")
+            print(f"Generation time: {generation_time:.2f}s")
+            print(f"Sample rate: {result['sample_rate']} Hz")
+            print(f"Duration: {result['duration_ms']:.2f}ms")
+            print(f"Chunks generated: {result['chunk_count']}")
+            print(f"Total audio bytes: {result['total_bytes']}")
+            print(f"Audio data length (base64): {len(result['audio_base64'])} characters")
+            
+            # Optionally save audio to file for testing
+            import base64
+            audio_bytes = base64.b64decode(result['audio_base64'])
+            with open("orpheus_test_output.raw", "wb") as f:
+                f.write(audio_bytes)
+            print("Raw audio saved to orpheus_test_output.raw")
+            print("To play: ffplay -f s16le -ar 24000 -ac 1 orpheus_test_output.raw")
+            
+            # Also create a WAV file for easier playback
+            try:
+                import wave
+                import numpy as np
+                
+                # Convert bytes to numpy array
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                
+                with wave.open("orpheus_test_output.wav", "wb") as wav_file:
+                    wav_file.setnchannels(1)  # Mono
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(24000)  # 24kHz
+                    wav_file.writeframes(audio_bytes)
+                
+                print("WAV audio saved to orpheus_test_output.wav")
+                
+            except ImportError:
+                print("Note: Install 'wave' package to generate WAV files")
+            except Exception as e:
+                print(f"Warning: Could not create WAV file: {e}")
+            
+        else:
+            print(f"Speech generation failed: {result.get('error', 'Unknown error')}")
+            
+    except Exception as e:
+        print(f"Error testing Orpheus TTS: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise
+    finally:
+        total_time = time.time() - start_time
+        print(f"Total test time: {total_time:.2f}s")
+
+
+@app.local_entrypoint()
+def test_orpheus_tts_websocket():
+    """Test the Orpheus TTS service via WebSocket interface."""
+    import time
+    
+    start_time = time.time()
+    print("Testing Orpheus TTS Service via WebSocket...")
+    
+    import asyncio
+    import msgpack
+    import base64
+    import websockets
+    
+    async def test_websocket():
+        # Test text
+        test_text = "Hello, this is a WebSocket test of the Orpheus TTS service."
+        test_voice = "tara"
+        
+        # Get the TTS service URL (this would be set when deployed)
+        # For testing, we'll use the dev URL pattern
+        base_url = "willdavenport--voice-stack"
+        tts_url = f"wss://{base_url}-ttsservice-web-dev.modal.run/ws"
+        
+        print(f"Connecting to TTS service at: {tts_url}")
+        
+        # Retry logic for connection (service might be downloading model)
+        max_retries = 5
+        retry_delay = 30  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Connection attempt {attempt + 1}/{max_retries}...")
+                if attempt > 0:
+                    print(f"Waiting {retry_delay}s before retry (service may be downloading model)...")
+                    await asyncio.sleep(retry_delay)
+                
+                return await _attempt_websocket_connection(tts_url, test_text, test_voice)
+                
+            except (TimeoutError, ConnectionRefusedError, OSError) as e:
+                if attempt == max_retries - 1:
+                    print(f"All connection attempts failed. Last error: {e}")
+                    return False
+                else:
+                    print(f"Connection attempt {attempt + 1} failed: {e}")
+                    print("This is likely because the Orpheus model is still downloading...")
+                    continue
+            except Exception as e:
+                print(f"Unexpected error on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    return False
+                continue
+        
+        return False
+    
+    async def _attempt_websocket_connection(tts_url, test_text, test_voice):
+        try:
+            connection_start = time.time()
+            # Set a longer timeout for the initial connection (model might be loading)
+            async with websockets.connect(tts_url, open_timeout=60) as websocket:
+                connection_time = time.time() - connection_start
+                print(f"Connected to Orpheus TTS WebSocket (took {connection_time:.2f}s)")
+                
+                # Wait for Ready message
+                ready_start = time.time()
+                ready_data = await websocket.recv()
+                ready_time = time.time() - ready_start
+                ready_message = msgpack.unpackb(ready_data)
+                print(f"Received Ready message: {ready_message} (took {ready_time:.2f}s)")
+                
+                if ready_message.get("type") != "Ready":
+                    print(f"Warning: Expected Ready message, got: {ready_message}")
+                
+                # Send text message
+                text_message = {
+                    "type": "Text",
+                    "text": test_text,
+                    "voice": test_voice
+                }
+                
+                send_start = time.time()
+                packed_message = msgpack.packb(text_message)
+                await websocket.send(packed_message)
+                send_time = time.time() - send_start
+                print(f"Sent text message: '{test_text}' with voice: '{test_voice}' (took {send_time:.3f}s)")
+                
+                # Collect audio chunks (raw bytes from Orpheus)
+                audio_chunks = []
+                chunk_count = 0
+                first_chunk_time = None
+                audio_start_time = time.time()
+                
+                try:
+                    while True:
+                        # Receive raw bytes directly from Orpheus TTS
+                        data = await asyncio.wait_for(websocket.recv(), timeout=60.0)  # Increased timeout
+                        
+                        if first_chunk_time is None:
+                            first_chunk_time = time.time() - audio_start_time
+                        
+                        # Orpheus sends raw PCM bytes, not msgpack messages
+                        if isinstance(data, bytes) and len(data) > 0:
+                            audio_chunks.append(data)
+                            chunk_count += 1
+                            print(f"Received raw audio chunk {chunk_count}: {len(data)} bytes")
+                        else:
+                            # Check if it might be a control message
+                            try:
+                                message = msgpack.unpackb(data)
+                                if message.get("type") == "Error":
+                                    error_msg = message.get("message", "Unknown error")
+                                    print(f"Received error from TTS: {error_msg}")
+                                    return False
+                                elif message.get("type") == "Eos":
+                                    print("Received End of Stream message")
+                                    break
+                                else:
+                                    print(f"Received unexpected message type: {message.get('type')}")
+                            except:
+                                # Not a msgpack message, might be end of stream
+                                print(f"Received non-audio data: {type(data)} length {len(data) if hasattr(data, '__len__') else 'unknown'}")
+                                break
+                            
+                except asyncio.TimeoutError:
+                    print("Timeout waiting for audio data - stream ended")
+                
+                audio_generation_time = time.time() - audio_start_time
+                
+                if audio_chunks:
+                    # Combine all audio chunks
+                    combined_audio = b''.join(audio_chunks)
+                    total_bytes = len(combined_audio)
+                    
+                    print(f"WebSocket test successful!")
+                    print(f"Time to first audio chunk: {first_chunk_time:.2f}s")
+                    print(f"Total audio generation time: {audio_generation_time:.2f}s")
+                    print(f"Total audio chunks: {chunk_count}")
+                    print(f"Total audio bytes: {total_bytes}")
+                    
+                    # Calculate approximate duration (24kHz, 16-bit PCM)
+                    sample_rate = 24000
+                    bytes_per_sample = 2
+                    duration_ms = (total_bytes / bytes_per_sample / sample_rate) * 1000
+                    print(f"Approximate duration: {duration_ms:.2f}ms")
+                    
+                    # Calculate real-time factor (generation time vs audio duration)
+                    rtf = audio_generation_time / (duration_ms / 1000)
+                    print(f"Real-time factor: {rtf:.2f}x (lower is better)")
+                    
+                    # Save audio file
+                    with open("orpheus_websocket_test_output.raw", "wb") as f:
+                        f.write(combined_audio)
+                    print("Audio saved to orpheus_websocket_test_output.raw")
+                    print("To play: ffplay -f s16le -ar 24000 -ac 1 orpheus_websocket_test_output.raw")
+                    
+                    return True
+                else:
+                    print("No audio chunks received!")
+                    return False
+                    
+        except Exception as e:
+            print(f"WebSocket connection attempt failed: {e}")
+            raise  # Re-raise to be caught by retry logic
+    
+    # Run the async test
+    try:
+        result = asyncio.run(test_websocket())
+        if result:
+            print("✅ Orpheus TTS WebSocket test PASSED")
+        else:
+            print("❌ Orpheus TTS WebSocket test FAILED")
+    except Exception as e:
+        print(f"❌ Orpheus TTS WebSocket test ERROR: {e}")
+    finally:
+        total_time = time.time() - start_time
+        print(f"Total WebSocket test time: {total_time:.2f}s")
+
 
 if __name__ == "__main__":
     # For local development
