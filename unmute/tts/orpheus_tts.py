@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 
 class SnacModelBatched:
     def __init__(self):
-        self.dtype_decoder = torch.float32
+        # Use bfloat16 on H100 for faster decode while preserving quality
+        self.dtype_decoder = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         compile_background = False
-        use_compile = True
+        # Disable torch.compile for low TTFT; JIT adds large initial latency
+        use_compile = False
         model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
         model = model.to(SNAC_DEVICE)
 
@@ -71,7 +73,8 @@ class SnacModelBatched:
         self.snac_model.decoder = decoder
         self.snac_model.quantizer = quantizer
 
-    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=15)
+    # Keep batching but shorten timeout to reduce per-chunk latency
+    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=2)
     def batch_snac_model(
         self, items: list[dict[str, list[torch.Tensor]]]
     ) -> list[torch.Tensor]:
@@ -272,12 +275,12 @@ class OrpheusModel:
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,  # Use dtype for better compatibility
+                        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                         device_map="auto",
                         token=hf_token,
                         trust_remote_code=True,
-                        # Optimizations for inference - try different attention implementations with fallbacks
-                        attn_implementation=self._get_best_attention_implementation(),
+                        # Prefer SDPA on H100; avoid flash-attn import/compat overhead
+                        attn_implementation="sdpa",
                         low_cpu_mem_usage=True,
                     )
                     logging.info("Orpheus model loaded with accelerate device mapping and optimizations")
@@ -287,7 +290,7 @@ class OrpheusModel:
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,
+                        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                         token=hf_token,
                         trust_remote_code=True,
                         low_cpu_mem_usage=True,
@@ -306,8 +309,10 @@ class OrpheusModel:
                 # Memory optimizations
                 self._optimize_memory()
                 
-                # Apply torch.compile optimization like SNAC model
-                self._compile_model()
+                # Disable torch.compile to avoid long JIT latency unless explicitly enabled
+                import os as _os
+                if _os.environ.get("ORPHEUS_TORCH_COMPILE", "0") == "1":
+                    self._compile_model()
                 
                 logging.info("Orpheus language model loaded and optimized successfully")
             except Exception as e:
@@ -427,26 +432,20 @@ class OrpheusModel:
         try:
             logging.info("Applying memory optimizations...")
             
-            # Enable gradient checkpointing if available (saves memory during forward pass)
-            if hasattr(self._model, 'gradient_checkpointing_enable'):
-                self._model.gradient_checkpointing_enable()
-                logging.info("Gradient checkpointing enabled")
+            # Disable gradient checkpointing for inference to avoid extra compute
+            if hasattr(self._model, 'gradient_checkpointing_disable'):
+                self._model.gradient_checkpointing_disable()
+                logging.info("Gradient checkpointing disabled for inference")
             
             # Set model to use optimized attention if available
             if hasattr(self._model.config, 'use_cache'):
                 self._model.config.use_cache = True
                 logging.info("Model cache enabled")
                 
-            # Enable memory efficient attention if supported
+            # Clear cache before starting
             if torch.cuda.is_available():
-                # Clear cache before starting
                 torch.cuda.empty_cache()
                 logging.info("CUDA cache cleared")
-                
-                # Set memory fraction to leave room for other operations
-                if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
-                    torch.cuda.set_per_process_memory_fraction(0.95)
-                    logging.info("CUDA memory fraction set to 95%")
             
         except Exception as e:
             logging.warning(f"Memory optimization failed, continuing: {e}")
@@ -505,24 +504,22 @@ class OrpheusModel:
                 
                 # Use optimized generation with transformers generate() method
                 with torch.no_grad():
-                    max_new_tokens = kwargs.get("max_tokens", 4096)
-                    temperature = kwargs.get("temperature", 0.7)
-                    top_k = kwargs.get("top_k", 50)
+                    max_new_tokens = kwargs.get("max_tokens", 2048)
+                    temperature = kwargs.get("temperature", 0.0)  # greedy for lower variance latency
+                    top_k = kwargs.get("top_k", 0)
                     
                     generation_config = {
                         "max_new_tokens": max_new_tokens,
                         "temperature": temperature,
                         "top_k": top_k,
-                        "do_sample": True,
+                        "do_sample": False,
                         "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
                         "eos_token_id": self.end_ids,
                         "use_cache": True,  # Enable KV caching for faster sequential generation
                         # Additional optimizations for faster generation
                         "num_beams": 1,  # Greedy/sampling only, no beam search overhead
                         "early_stopping": True,
-                        "repetition_penalty": 1.1,  # Slight penalty to avoid loops
-                        "length_penalty": 1.0,
-                        "no_repeat_ngram_size": 3,  # Prevent repetitive patterns
+                        # no repetition penalties to avoid extra compute on hot path
                     }
                     
                     # Use streaming generation for real-time output
@@ -531,7 +528,7 @@ class OrpheusModel:
                     
                     streamer = TextIteratorStreamer(
                         self._tokenizer, 
-                        timeout=60.0,
+                        timeout=30.0,
                         skip_prompt=True,
                         skip_special_tokens=False
                     )
