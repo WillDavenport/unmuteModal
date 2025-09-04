@@ -134,52 +134,64 @@ def split_custom_tokens(s: str) -> List[int]:
 async def tokens_decoder(
     token_gen: AsyncIterator, request_id: str, start_time: int
 ) -> AsyncIterator[bytes]:
-    """Decoder that pipelines convert_to_audio calls but enforces strict in-order yields."""
+    """Optimized decoder that batches token processing to reduce async overhead."""
     assert hasattr(token_gen, "__aiter__")
-    audio_queue = asyncio.Queue()
-
-    async def producer(token_gen: AsyncIterator):
-        buffer: list[int] = []
-        count = 0
-        tft = 0
-        async for token_sim in token_gen:
-            if tft == 0:
-                tft = time.time()
-            for tok_str in split_custom_tokens(token_sim):
-                token = turn_token_into_id(int(tok_str), count)
-                buffer.append(token)
-                count += 1
-                # every 7 tokens → one frame; once we have at least 28 tokens, we extract the last 28
-                if count % 7 == 0 and count > 27:
-                    buf_to_proc = buffer[-28:]
-                    task = asyncio.create_task(convert_to_audio(buf_to_proc))
-                    audio_queue.put_nowait(task)
-        audio_queue.put_nowait(None)
-        elapsed = time.time() - start_time
-        time_to_first_token = tft - start_time
-        time_of_generation = time.time() - tft
-        token_generation_speed = count / time_of_generation
-        logging.info(
-            f"Finished `{request_id}`, total tokens : {count}, time: {elapsed:.2f}s. "
-            f"tokens/s generation: {token_generation_speed:.2f} (ttft: {time_to_first_token:.2f}s, generation time: {time_of_generation:.2f}s)"
-            f" real-time factor once streaming started: {(token_generation_speed / 100):.2f} "
-        )
-
-    producer_task = asyncio.create_task(producer(token_gen))
-
-    while True:
-        # wait for the next audio conversion to finish
-        task: None | Awaitable[bytes | None] = await audio_queue.get()
-        if task is None:
-            break
-        audio_bytes = await task
-        if audio_bytes is not None:
-            yield audio_bytes
-        audio_queue.task_done()
-    assert audio_queue.empty(), (
-        f"audio queue is not empty: e.g. {audio_queue.get_nowait()}"
+    
+    buffer: list[int] = []
+    count = 0
+    tft = 0
+    first_audio_yielded = False
+    
+    # Collect tokens in larger batches to reduce async overhead
+    token_batch = []
+    
+    async for token_sim in token_gen:
+        if tft == 0:
+            tft = time.time()
+        
+        # Collect tokens for batch processing
+        for tok_str in split_custom_tokens(token_sim):
+            token = turn_token_into_id(int(tok_str), count)
+            buffer.append(token)
+            count += 1
+            
+            # Process in larger batches (28-49 tokens) instead of every 7 tokens
+            # This reduces the number of async tasks created
+            if count % 7 == 0 and count >= 28:  # Minimum batch size of 28 (4 frames)
+                # Extract tokens for processing - use larger chunks when possible
+                batch_size = min(49, len(buffer))  # Up to 49 tokens (7 frames) per batch
+                if batch_size >= 28:  # Ensure we have at least 4 frames
+                    buf_to_proc = buffer[-batch_size:]
+                    
+                    # Convert to audio synchronously to reduce async overhead
+                    audio_bytes = await convert_to_audio(buf_to_proc)
+                    if audio_bytes is not None:
+                        if not first_audio_yielded:
+                            ttfb = time.time() - start_time
+                            logging.info(f"First audio chunk for request_id {request_id} - TTFB: {ttfb:.3f}s")
+                            first_audio_yielded = True
+                        yield audio_bytes
+    
+    # Process any remaining tokens
+    if len(buffer) >= 7:  # At least one frame
+        remaining_tokens = (len(buffer) // 7) * 7  # Round down to complete frames
+        if remaining_tokens > 0:
+            buf_to_proc = buffer[:remaining_tokens]
+            audio_bytes = await convert_to_audio(buf_to_proc)
+            if audio_bytes is not None:
+                yield audio_bytes
+    
+    # Log performance metrics
+    elapsed = time.time() - start_time
+    time_to_first_token = tft - start_time if tft > 0 else elapsed
+    time_of_generation = time.time() - tft if tft > 0 else elapsed
+    token_generation_speed = count / time_of_generation if time_of_generation > 0 else 0
+    
+    logging.info(
+        f"Finished `{request_id}`, total tokens: {count}, time: {elapsed:.2f}s. "
+        f"tokens/s generation: {token_generation_speed:.2f} (ttft: {time_to_first_token:.2f}s, generation time: {time_of_generation:.2f}s) "
+        f"real-time factor: {(time_of_generation / (count / 100) if count > 0 else 0):.2f}x"
     )
-    await producer_task
 
 
 @torch.inference_mode()
@@ -369,6 +381,11 @@ class OrpheusModel:
                 torch.backends.cudnn.allow_tf32 = True
                 torch.set_float32_matmul_precision('high')  # Use TF32 for float32 operations
                 logging.info("TensorFloat32 (TF32) enabled for better H100 performance")
+                
+                # H100-specific optimizations
+                if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
+                    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+                    logging.info("FP16 reduced precision reduction enabled for H100")
             
             # Enable optimized attention backends
             torch.backends.cuda.enable_math_sdp(True)
@@ -380,10 +397,39 @@ class OrpheusModel:
             if torch.cuda.is_available():
                 torch.cuda.set_per_process_memory_fraction(0.95)
                 torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+                
+                # Check if we're on H100 (compute capability 9.0)
+                if hasattr(torch.cuda, 'get_device_capability'):
+                    major, minor = torch.cuda.get_device_capability()
+                    if major >= 9:  # H100 is compute capability 9.0+
+                        logging.info("H100 detected - enabling advanced optimizations")
+                        # Additional H100-specific settings could go here
+                
                 logging.info("CUDA optimizations applied")
                 
         except Exception as e:
             logging.warning(f"Performance optimization setup failed: {e}")
+    
+    def _get_optimized_generation_config(self, kwargs):
+        """Get generation config optimized for H100 performance"""
+        max_new_tokens = kwargs.get("max_tokens", 4096)
+        temperature = kwargs.get("temperature", 0.7)
+        top_k = kwargs.get("top_k", 50)
+        
+        return {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "do_sample": True,
+            "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
+            "eos_token_id": self.end_ids,
+            "use_cache": True,  # Enable KV caching for faster sequential generation
+            # Optimizations for H100 performance
+            "num_beams": 1,  # No beam search overhead for streaming
+            "repetition_penalty": 1.1,  # Slight penalty to avoid loops
+            "length_penalty": 1.0,
+            "no_repeat_ngram_size": 3,  # Prevent repetitive patterns
+        }
 
     def _compile_model(self):
         """Compile the Orpheus model for optimized inference like SNAC"""
@@ -451,6 +497,26 @@ class OrpheusModel:
         except Exception as e:
             logging.warning(f"Memory optimization failed, continuing: {e}")
 
+    def _monitor_gpu_utilization(self):
+        """Monitor GPU performance during generation"""
+        if torch.cuda.is_available():
+            try:
+                memory_allocated = torch.cuda.memory_allocated() / 1e9
+                memory_reserved = torch.cuda.memory_reserved() / 1e9
+                
+                device_props = torch.cuda.get_device_properties(0)
+                total_memory = device_props.total_memory / 1e9
+                
+                logging.info(f"GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB, "
+                           f"Total: {total_memory:.2f}GB")
+                logging.info(f"GPU Utilization: {(memory_allocated / total_memory * 100):.1f}%")
+                
+                # Log device info
+                logging.info(f"GPU Device: {device_props.name}, Compute Capability: {device_props.major}.{device_props.minor}")
+                
+            except Exception as e:
+                logging.warning(f"GPU monitoring failed: {e}")
+
     def _format_prompt_slow(self, prompt, voice="tara"):
         if voice:
             adapted_prompt = f"{voice}: {prompt}"
@@ -493,9 +559,16 @@ class OrpheusModel:
             
             start_time = time.time()
             
-            # Generate real audio tokens using the Orpheus model with optimized batched generation
+            # Monitor GPU state before generation
+            self._monitor_gpu_utilization()
+            
+            # Clear CUDA cache to ensure optimal memory usage
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Generate real audio tokens using the Orpheus model with optimized direct generation
             async def generate_orpheus_tokens():
-                """Generate speech tokens using optimized batched generation"""
+                """Generate speech tokens using optimized direct generation without threading"""
                 logging.info(f"Running optimized Orpheus model inference for: '{formatted_prompt[:100]}...'")
                 
                 # Tokenize the input
@@ -503,71 +576,37 @@ class OrpheusModel:
                 if torch.cuda.is_available():
                     inputs = {k: v.cuda() for k, v in inputs.items()}
                 
-                # Use optimized generation with transformers generate() method
+                # Use optimized generation config for H100
+                generation_config = self._get_optimized_generation_config(kwargs)
+                
+                # Direct generation without threading overhead
                 with torch.no_grad():
-                    max_new_tokens = kwargs.get("max_tokens", 4096)
-                    temperature = kwargs.get("temperature", 0.7)
-                    top_k = kwargs.get("top_k", 50)
-                    
-                    generation_config = {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": temperature,
-                        "top_k": top_k,
-                        "do_sample": True,
-                        "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
-                        "eos_token_id": self.end_ids,
-                        "use_cache": True,  # Enable KV caching for faster sequential generation
-                        # Additional optimizations for faster generation
-                        "num_beams": 1,  # Greedy/sampling only, no beam search overhead
-                        "early_stopping": True,
-                        "repetition_penalty": 1.1,  # Slight penalty to avoid loops
-                        "length_penalty": 1.0,
-                        "no_repeat_ngram_size": 3,  # Prevent repetitive patterns
-                    }
-                    
-                    # Use streaming generation for real-time output
-                    from transformers import TextIteratorStreamer
-                    import threading
-                    
-                    streamer = TextIteratorStreamer(
-                        self._tokenizer, 
-                        timeout=60.0,
-                        skip_prompt=True,
-                        skip_special_tokens=False
+                    # Use generate with return_dict_in_generate for streaming-like behavior
+                    outputs = self._model.generate(
+                        **inputs,
+                        **generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=False,  # Don't need scores, saves memory
                     )
                     
-                    generation_config["streamer"] = streamer
+                    # Process generated tokens directly
+                    generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]  # Skip input tokens
                     
-                    # Run generation in a separate thread to avoid blocking
-                    generation_thread = threading.Thread(
-                        target=self._model.generate,
-                        kwargs={**inputs, **generation_config}
-                    )
-                    generation_thread.start()
-                    
-                    # Stream tokens as they're generated
+                    # Convert tokens to strings and yield custom tokens
                     token_count = 0
-                    for token_str in streamer:
-                        if token_str is None:
-                            break
-                            
+                    for token_id in generated_tokens:
+                        token_str = self._tokenizer.decode([token_id], skip_special_tokens=False)
                         token_count += 1
                         
                         # Only yield custom tokens for audio synthesis
                         if "<custom_token_" in token_str:
                             yield token_str
-                            # Remove the artificial delay - let the model generate at its natural pace
                         
-                        # Log progress less frequently to reduce overhead
-                        if token_count % 50 == 0:
-                            logging.debug(f"Generated {token_count} tokens so far...")
+                        # Early termination on end tokens
+                        if token_id.item() in self.end_ids:
+                            break
                     
-                    # Wait for generation to complete
-                    generation_thread.join(timeout=120.0)
-                    if generation_thread.is_alive():
-                        logging.warning("Generation thread did not complete within timeout")
-                    
-                    logging.info(f"Completed optimized token generation: {token_count} total tokens")
+                    logging.info(f"Completed direct token generation: {token_count} total tokens")
             
             token_gen = generate_orpheus_tokens()
             
@@ -577,6 +616,77 @@ class OrpheusModel:
         except Exception as e:
             logging.error(f"Error in Orpheus TTS request_id {req_id}: {e}")
             raise
+
+    async def benchmark_performance(self, test_texts=None):
+        """Comprehensive performance benchmark for Orpheus TTS"""
+        if test_texts is None:
+            test_texts = [
+                "Short test.",
+                "Medium length test sentence with more words to evaluate performance.",
+                "Very long test sentence with many words to test the performance impact of longer inputs on the Orpheus TTS system and measure real-time factors."
+            ]
+        
+        logging.info("Starting Orpheus TTS performance benchmark...")
+        
+        for i, text in enumerate(test_texts):
+            logging.info(f"Benchmarking text {i+1}/{len(test_texts)}: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+            
+            start_time = time.time()
+            audio_chunks = []
+            first_chunk_time = None
+            chunk_count = 0
+            
+            try:
+                async for chunk in self.generate_speech_stream(text, request_id=f"benchmark_{i+1}"):
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time() - start_time
+                    audio_chunks.append(chunk)
+                    chunk_count += 1
+                
+                total_time = time.time() - start_time
+                
+                # Estimate audio duration (16kHz, 16-bit samples)
+                total_audio_bytes = sum(len(chunk) for chunk in audio_chunks)
+                audio_duration = total_audio_bytes / (2 * 24000)  # 24kHz sampling rate
+                rtf = total_time / audio_duration if audio_duration > 0 else float('inf')
+                
+                # Log results
+                logging.info(f"Benchmark Results for text {i+1}:")
+                logging.info(f"  Text length: {len(text)} characters")
+                logging.info(f"  TTFB (Time to First Byte): {first_chunk_time:.3f}s")
+                logging.info(f"  Total generation time: {total_time:.3f}s")
+                logging.info(f"  Audio duration: {audio_duration:.3f}s")
+                logging.info(f"  Real-time factor: {rtf:.2f}x")
+                logging.info(f"  Audio chunks generated: {chunk_count}")
+                logging.info(f"  Total audio bytes: {total_audio_bytes:,}")
+                
+                # Performance assessment
+                if first_chunk_time < 0.15:
+                    ttfb_status = "EXCELLENT"
+                elif first_chunk_time < 1.0:
+                    ttfb_status = "GOOD"
+                elif first_chunk_time < 2.0:
+                    ttfb_status = "ACCEPTABLE"
+                else:
+                    ttfb_status = "NEEDS IMPROVEMENT"
+                
+                if rtf < 1.0:
+                    rtf_status = "EXCELLENT (faster than real-time)"
+                elif rtf < 2.0:
+                    rtf_status = "GOOD"
+                elif rtf < 5.0:
+                    rtf_status = "ACCEPTABLE"
+                else:
+                    rtf_status = "NEEDS IMPROVEMENT"
+                
+                logging.info(f"  TTFB Assessment: {ttfb_status}")
+                logging.info(f"  RTF Assessment: {rtf_status}")
+                logging.info("-" * 60)
+                
+            except Exception as e:
+                logging.error(f"Benchmark failed for text {i+1}: {e}")
+        
+        logging.info("Orpheus TTS performance benchmark completed.")
 
 
 # Global SNAC model instance
