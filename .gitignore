@@ -27,3 +27,8 @@ CLAUDE.md
 
 cmake-3.29.8-macos-universal.tar.gz
 cmake-3.29.8-linux-x86_64.tar.gz
+
+orpheus_test_output.wav
+orpheus_test_output.raw
+orpheus_websocket_test_output.wav
+orpheus_websocket_test_output.raw
