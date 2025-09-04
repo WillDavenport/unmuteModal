@@ -145,7 +145,7 @@ tts_image = (
         "torchaudio>=2.1.0",
         "huggingface_hub[hf_transfer]>=0.19.0",  # Include hf_transfer for faster downloads
         "safetensors>=0.4.0",
-        "transformers>=4.35.0",
+        "transformers>=4.51.1",
         "tokenizers>=0.15.0",
         # Required for device mapping with large models
         "accelerate>=0.20.0",
@@ -161,6 +161,8 @@ tts_image = (
         # "flash-attn>=2.0.0",  # Commented out due to CUDA symbol conflicts
         "xformers>=0.0.20",   # Memory-efficient attention (fallback)
     )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.9"})
     .run_commands(
         # Pre-download publicly available models during image build
         "echo 'Pre-downloading publicly available models to cache...'",
@@ -775,6 +777,33 @@ class TTSService:
             initialize_orpheus_model()
             
             print("Orpheus TTS model loaded successfully")
+            # Perform a quick warm-up to materialize kernels and reduce TTFT on first request
+            import asyncio as _asyncio
+            async def _warmup():
+                try:
+                    agen = self.orpheus_model.generate_speech_stream("warm up", "tara", max_tokens=64)
+                    # Pull just one audio chunk then cancel
+                    try:
+                        chunk = await _asyncio.wait_for(agen.__anext__(), timeout=10)
+                        _ = len(chunk)
+                    except StopAsyncIteration:
+                        pass
+                    finally:
+                        # Drain/close generator if needed
+                        try:
+                            await agen.aclose()
+                        except Exception:
+                            pass
+                    print("Orpheus TTS warm-up completed")
+                except Exception as _e:
+                    print(f"Warm-up skipped due to: {_e}")
+            try:
+                _asyncio.run(_warmup())
+            except RuntimeError:
+                # If already in an event loop context, create a new loop
+                loop = _asyncio.new_event_loop()
+                loop.run_until_complete(_warmup())
+                loop.close()
             
         except Exception as e:
             print(f"CRITICAL ERROR: Orpheus TTS model loading failed: {e}")
