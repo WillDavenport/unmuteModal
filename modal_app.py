@@ -19,6 +19,7 @@ This reduces initial TTS startup time significantly while maintaining voice vari
 import modal
 import logging
 import os
+from typing import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,8 @@ tts_image = (
         # Orpheus-specific dependencies
         "snac==1.2.1",
         "batched==0.1.4",
+        # Additional for integrated Orpheus
+        "httpx>=0.27.0",
         # OpenAI client for LLM integration
         "openai>=1.70.0",
         # Keep some existing dependencies for compatibility
@@ -169,6 +172,8 @@ tts_image = (
         "mkdir -p /root/orpheus-models",
         # Download SNAC model for audio conversion (publicly available)
         f"python -c \"from huggingface_hub import snapshot_download; snapshot_download('hubertsiuzdak/snac_24khz', cache_dir='{CACHE_DIR}')\"",
+        # Also pre-import SNAC to ensure it's cached
+        "python -c \"from snac import SNAC; SNAC.from_pretrained('hubertsiuzdak/snac_24khz')\"",
         # Pre-download Orpheus tokenizer and config (publicly available parts)
         "echo 'Pre-downloading Orpheus tokenizer and config...'",
         f"python -c \"from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('canopylabs/orpheus-3b-0.1-ft', cache_dir='{CACHE_DIR}', use_auth_token=False)\" || echo 'Tokenizer download failed (expected without token)'",
@@ -658,10 +663,580 @@ dim = 6
         return app
 
 
-# TTSService has been removed - we now use the Orpheus FastAPI Modal service directly
-# The service is defined in unmute/tts/orpheus_fastapi_modal.py
-# Deploy it with: modal deploy unmute/tts/orpheus_fastapi_modal.py
-# Deploy the companion llama.cpp service with: modal deploy unmute/tts/orpheus_llama_modal.py
+# Orpheus llama.cpp server configuration
+ORPHEUS_MODEL = "lex-au/Orpheus-3b-FT-Q8_0.gguf"
+ORPHEUS_CTX_SIZE = 8192
+ORPHEUS_N_GPU_LAYERS = 29
+
+# Create Orpheus-specific image for llama.cpp server
+orpheus_llama_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "git",
+        "build-essential",
+        "cmake",
+        "curl",
+        "wget",
+        "libcurl4-openssl-dev",
+    )
+    # Install CUDA toolkit for GPU support
+    .run_commands(
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
+        "dpkg -i cuda-keyring_1.0-1_all.deb",
+        "apt-get update -q",
+        "apt-get install -y cuda-toolkit-12-4 || apt-get install -y cuda-toolkit-12-1",
+        "rm cuda-keyring_1.0-1_all.deb"
+    )
+    # Build and install llama.cpp with CUDA support
+    .run_commands(
+        # Clone llama.cpp repository
+        "git clone https://github.com/ggerganov/llama.cpp /opt/llama.cpp",
+        "cd /opt/llama.cpp && git checkout b4410",  # Use stable version
+        
+        # Build with CUDA support
+        "cd /opt/llama.cpp && mkdir build && cd build && "
+        "cmake .. -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && "
+        "cmake --build . --config Release -j$(nproc)",
+        
+        # Make binaries accessible
+        "ln -s /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server",
+        "ln -s /opt/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli",
+    )
+    # Install Python dependencies for model management
+    .pip_install(
+        "huggingface_hub>=0.19.0",
+        "requests>=2.31.0",
+        "fastapi>=0.103.1",
+        "uvicorn>=0.23.2",
+        "httpx>=0.27.0",
+        "pydantic>=2.3.0",
+        "aiofiles>=24.0.0",
+    )
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "PYTHONUNBUFFERED": "1",
+        "CUDA_VISIBLE_DEVICES": "0",
+    })
+)
+
+
+@app.cls(
+    image=orpheus_llama_image,
+    gpu="l40s",  # Use L40S GPU for better LLM performance
+    container_idle_timeout=10 * MINUTES,
+    timeout=60 * MINUTES,
+    volumes={
+        "/models": models_volume,
+    },
+    secrets=secrets,
+    allow_concurrent_inputs=5,
+)
+class OrpheusLlamaCppServer:
+    """llama.cpp server for Orpheus model inference"""
+    
+    def __init__(self):
+        self.server_process = None
+        self.model_path = None
+        self.port = 8080
+        
+    @modal.enter()
+    async def initialize(self):
+        """Initialize and start the llama.cpp server"""
+        import subprocess
+        import time
+        from pathlib import Path
+        from huggingface_hub import hf_hub_download
+        
+        logger.info("Initializing Orpheus llama.cpp server...")
+        
+        # Download the model if not already cached
+        model_dir = Path("/models")
+        model_dir.mkdir(exist_ok=True)
+        
+        model_file = model_dir / ORPHEUS_MODEL.split("/")[-1]
+        
+        if not model_file.exists():
+            logger.info(f"Downloading model: {ORPHEUS_MODEL}")
+            try:
+                # Download from HuggingFace
+                hf_hub_download(
+                    repo_id="/".join(ORPHEUS_MODEL.split("/")[:-1]),
+                    filename=ORPHEUS_MODEL.split("/")[-1],
+                    local_dir=str(model_dir),
+                    local_dir_use_symlinks=False,
+                )
+            except Exception as e:
+                logger.error(f"Failed to download model: {e}")
+                # Try alternative download method
+                import requests
+                model_url = f"https://huggingface.co/{'/'.join(ORPHEUS_MODEL.split('/')[:-1])}/resolve/main/{ORPHEUS_MODEL.split('/')[-1]}"
+                response = requests.get(model_url, stream=True)
+                response.raise_for_status()
+                
+                with open(model_file, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+        
+        self.model_path = str(model_file)
+        logger.info(f"Model ready at: {self.model_path}")
+        
+        # Start llama.cpp server
+        cmd = [
+            "llama-server",
+            "-m", self.model_path,
+            "-c", str(ORPHEUS_CTX_SIZE),
+            "-n", "8192",  # max tokens to predict
+            "-ngl", str(ORPHEUS_N_GPU_LAYERS),  # GPU layers
+            "--host", "0.0.0.0",
+            "--port", str(self.port),
+            "--n-gpu-layers", str(ORPHEUS_N_GPU_LAYERS),
+            "--threads", "8",
+            "--batch-size", "512",
+            "--ubatch-size", "512",
+            "--cache-type-k", "f16",
+            "--cache-type-v", "f16",
+            "--log-disable",  # Reduce logging noise
+        ]
+        
+        logger.info(f"Starting llama.cpp server with command: {' '.join(cmd)}")
+        
+        self.server_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        
+        # Wait for server to be ready
+        import socket
+        max_attempts = 60
+        for attempt in range(max_attempts):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                result = sock.connect_ex(('127.0.0.1', self.port))
+                sock.close()
+                if result == 0:
+                    logger.info(f"llama.cpp server ready after {attempt + 1} seconds")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            raise RuntimeError("llama.cpp server failed to start")
+        
+        logger.info("Orpheus llama.cpp server initialized successfully")
+    
+    @modal.exit()
+    def cleanup(self):
+        """Clean up the server process"""
+        if self.server_process:
+            logger.info("Shutting down llama.cpp server...")
+            self.server_process.terminate()
+            try:
+                self.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
+    
+    @modal.asgi_app()
+    def asgi_app(self):
+        """Create FastAPI app that proxies to llama.cpp server"""
+        from fastapi import FastAPI, HTTPException, Request, Response
+        from fastapi.responses import StreamingResponse
+        import httpx
+        import json
+        
+        app = FastAPI(title="Orpheus llama.cpp Server")
+        
+        # Create HTTP client for proxying
+        client = httpx.AsyncClient(
+            base_url=f"http://localhost:{self.port}",
+            timeout=httpx.Timeout(120.0),
+        )
+        
+        @app.post("/v1/completions")
+        async def completions(request: Request):
+            """Proxy completions endpoint to llama.cpp server"""
+            try:
+                body = await request.json()
+                
+                # Forward to llama.cpp server
+                response = await client.post(
+                    "/completion",
+                    json=body,
+                )
+                response.raise_for_status()
+                
+                return response.json()
+                
+            except Exception as e:
+                logger.error(f"Error in completions endpoint: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.post("/v1/completions/stream")
+        async def completions_stream(request: Request):
+            """Streaming completions endpoint"""
+            try:
+                body = await request.json()
+                body["stream"] = True
+                
+                async def stream_generator():
+                    async with client.stream("POST", "/completion", json=body) as response:
+                        async for line in response.aiter_lines():
+                            if line:
+                                yield f"data: {line}\n\n"
+                    yield "data: [DONE]\n\n"
+                
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type="text/event-stream",
+                )
+                
+            except Exception as e:
+                logger.error(f"Error in streaming completions: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.get("/health")
+        async def health():
+            """Health check endpoint"""
+            try:
+                response = await client.get("/health")
+                return {"status": "healthy", "llama_cpp": response.json()}
+            except Exception:
+                return {"status": "healthy", "llama_cpp": "ready"}
+        
+        @app.get("/")
+        def root():
+            return {"service": "orpheus-llama-cpp", "model": ORPHEUS_MODEL, "status": "ready"}
+        
+        return app
+
+
+@app.cls(
+    image=tts_image,
+    gpu="l4",  # Use L4 GPU for TTS
+    container_idle_timeout=5 * MINUTES,
+    timeout=30 * MINUTES,
+    volumes=tts_volumes,
+    secrets=secrets,
+    allow_concurrent_inputs=10,
+)
+class OrpheusFastAPIService:
+    """Orpheus FastAPI TTS Service integrated into main Modal app"""
+    
+    def __init__(self):
+        self.snac_model = None
+        self.llama_client = None
+        self.device = None
+        self.cuda_stream = None
+        
+    @modal.enter()
+    async def initialize(self):
+        """Initialize the Orpheus FastAPI service"""
+        import torch
+        from snac import SNAC
+        import httpx
+        
+        logger.info("Initializing Orpheus FastAPI service...")
+        
+        # Set up device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {self.device}")
+        
+        # Initialize SNAC model for audio generation
+        logger.info("Loading SNAC model...")
+        self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
+        self.snac_model = self.snac_model.to(self.device)
+        
+        # Set up CUDA stream for parallel processing if available
+        if self.device == "cuda":
+            self.cuda_stream = torch.cuda.Stream()
+            logger.info("CUDA stream initialized for parallel processing")
+        
+        # Initialize HTTP client for llama.cpp server communication
+        self.llama_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0),
+            limits=httpx.Limits(max_keepalive_connections=5)
+        )
+        
+        # Get configuration from environment/secrets
+        self.api_config = {
+            "max_tokens": int(os.environ.get("ORPHEUS_MAX_TOKENS", "8192")),
+            "temperature": float(os.environ.get("ORPHEUS_TEMPERATURE", "0.6")),
+            "top_p": float(os.environ.get("ORPHEUS_TOP_P", "0.9")),
+            "repetition_penalty": 1.1,
+            "sample_rate": int(os.environ.get("ORPHEUS_SAMPLE_RATE", "24000")),
+        }
+        
+        logger.info(f"Orpheus FastAPI service initialized with config: {self.api_config}")
+    
+    async def generate_speech_stream(self, text: str, voice: str = "tara") -> AsyncIterator[bytes]:
+        """Stream speech generation for real-time output"""
+        import torch
+        import numpy as np
+        from typing import AsyncIterator
+        
+        try:
+            logger.info(f"Starting streaming speech generation for: '{text[:100]}...'")
+            
+            # Format the prompt
+            formatted_prompt = self._format_prompt(text, voice)
+            
+            # Get llama endpoint - use the OrpheusLlamaCppServer instance
+            llama_endpoint = self._get_llama_endpoint()
+            
+            # Stream tokens from llama.cpp
+            async for token_batch in self._stream_tokens(formatted_prompt, llama_endpoint):
+                # Convert token batch to audio
+                audio_chunk = await self._tokens_to_audio(token_batch, 1.0)
+                if audio_chunk:
+                    yield audio_chunk
+                    
+            logger.info("Streaming speech generation completed")
+            
+        except Exception as e:
+            logger.error(f"Error in streaming speech generation: {e}")
+            raise
+    
+    def _format_prompt(self, text: str, voice: str) -> str:
+        """Format the text prompt for the Orpheus model"""
+        start_token = "<custom_token_128259>"
+        end_tokens = "<custom_token_128009><custom_token_128260><custom_token_128261><custom_token_128257>"
+        prompt = f"{start_token}{voice}: {text}{end_tokens}"
+        return prompt
+    
+    def _get_llama_endpoint(self) -> str:
+        """Get the endpoint for the llama.cpp server"""
+        # Use the internal OrpheusLlamaCppServer endpoint
+        base_url = "willdavenport--voice-stack"
+        if os.environ.get("MODAL_DEV_MODE"):
+            return f"https://{base_url}-orpheusllamacppserver-asgi-app-dev.modal.run/v1/completions"
+        else:
+            return f"https://{base_url}-orpheusllamacppserver-asgi-app.modal.run/v1/completions"
+    
+    async def _stream_tokens(self, prompt: str, endpoint: str):
+        """Stream tokens from llama.cpp API"""
+        from typing import AsyncIterator
+        import json
+        
+        try:
+            request_data = {
+                "prompt": prompt,
+                "max_tokens": self.api_config["max_tokens"],
+                "temperature": self.api_config["temperature"],
+                "top_p": self.api_config["top_p"],
+                "repeat_penalty": self.api_config["repetition_penalty"],
+                "stop": ["<custom_token_128009>", "<custom_token_128260>",
+                        "<custom_token_128261>", "<custom_token_128257>"],
+                "stream": True,
+            }
+            
+            async with self.llama_client.stream("POST", endpoint, json=request_data) as response:
+                response.raise_for_status()
+                buffer = ""
+                
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])
+                            if "choices" in data:
+                                text = data["choices"][0].get("text", "")
+                                buffer += text
+                                
+                                # Extract and yield complete token batches
+                                tokens = self._extract_tokens_from_buffer(buffer)
+                                if tokens:
+                                    yield tokens
+                                    buffer = self._clean_buffer(buffer)
+                                    
+                        except json.JSONDecodeError:
+                            continue
+                            
+        except Exception as e:
+            logger.error(f"Error streaming tokens: {e}")
+            raise
+    
+    def _extract_tokens_from_buffer(self, buffer: str) -> list:
+        """Extract complete tokens from streaming buffer"""
+        import re
+        
+        pattern = r"<custom_token_(\d+)>"
+        matches = re.findall(pattern, buffer)
+        
+        tokens = []
+        for match in matches:
+            token_id = int(match)
+            if token_id != 0:
+                tokens.append(token_id)
+        
+        # Return tokens in batches of 7 (one frame)
+        if len(tokens) >= 7:
+            batch_size = (len(tokens) // 7) * 7
+            return tokens[:batch_size]
+        
+        return []
+    
+    def _clean_buffer(self, buffer: str) -> str:
+        """Remove processed tokens from buffer"""
+        import re
+        pattern = r"<custom_token_\d+>"
+        processed = re.sub(pattern, "", buffer, count=7)
+        return processed
+    
+    async def _tokens_to_audio(self, tokens: list, speed: float = 1.0) -> bytes:
+        """Convert tokens to audio using SNAC model"""
+        import torch
+        import numpy as np
+        
+        if not tokens or len(tokens) < 7:
+            return b""
+        
+        try:
+            # Process tokens into SNAC codes
+            num_frames = len(tokens) // 7
+            frame_tokens = tokens[:num_frames * 7]
+            
+            # Convert tokens to SNAC codes format
+            codes_0 = []
+            codes_1 = []
+            codes_2 = []
+            
+            for i in range(0, len(frame_tokens), 7):
+                frame = frame_tokens[i:i+7]
+                if len(frame) == 7:
+                    codes_0.append(self._token_to_code(frame[0], 0))
+                    codes_1.extend([self._token_to_code(frame[1], 1),
+                                   self._token_to_code(frame[4], 4)])
+                    codes_2.extend([self._token_to_code(frame[2], 2),
+                                   self._token_to_code(frame[3], 3),
+                                   self._token_to_code(frame[5], 5),
+                                   self._token_to_code(frame[6], 6)])
+            
+            # Convert to tensors
+            codes = [
+                torch.tensor(codes_0, dtype=torch.int32, device=self.device).unsqueeze(0),
+                torch.tensor(codes_1, dtype=torch.int32, device=self.device).unsqueeze(0),
+                torch.tensor(codes_2, dtype=torch.int32, device=self.device).unsqueeze(0),
+            ]
+            
+            # Validate codes are in range
+            for code_tensor in codes:
+                if torch.any(code_tensor < 0) or torch.any(code_tensor > 4096):
+                    logger.warning("Invalid token IDs detected, skipping audio generation")
+                    return b""
+            
+            # Generate audio with SNAC
+            with torch.inference_mode():
+                if self.cuda_stream:
+                    with torch.cuda.stream(self.cuda_stream):
+                        audio_hat = self.snac_model.decode(codes)
+                else:
+                    audio_hat = self.snac_model.decode(codes)
+                
+                # Extract the relevant audio slice
+                audio_slice = audio_hat[:, :, 2048:4096]
+                
+                # Convert to int16 audio bytes
+                if self.device == "cuda":
+                    audio_int16 = (audio_slice * 32767).to(torch.int16)
+                    audio_bytes = audio_int16.cpu().numpy().tobytes()
+                else:
+                    audio_np = audio_slice.detach().cpu().numpy()
+                    audio_int16 = (audio_np * 32767).astype(np.int16)
+                    audio_bytes = audio_int16.tobytes()
+                
+                return audio_bytes
+                
+        except Exception as e:
+            logger.error(f"Error converting tokens to audio: {e}")
+            return b""
+    
+    def _token_to_code(self, token_id: int, index: int) -> int:
+        """Convert token ID to SNAC code"""
+        return token_id - 10 - ((index % 7) * 4096)
+    
+    @modal.asgi_app()
+    def web(self):
+        """WebSocket endpoint for TTS service"""
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        import msgpack
+        
+        app = FastAPI(title="Orpheus TTS Service", version="1.0.0")
+        
+        @app.get("/")
+        def root():
+            return {"service": "tts", "model": "orpheus-fastapi", "status": "ready"}
+        
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            """WebSocket endpoint compatible with modal_app.py expectations"""
+            print("=== ORPHEUS_TTS: WebSocket connection attempt ===")
+            
+            await websocket.accept()
+            print("=== ORPHEUS_TTS: WebSocket connection accepted ===")
+            
+            try:
+                # Send initial Ready message
+                ready_message = {"type": "Ready"}
+                packed_ready = msgpack.packb(ready_message)
+                await websocket.send_bytes(packed_ready)
+                print("=== ORPHEUS_TTS: Sent Ready message ===")
+                
+                while True:
+                    try:
+                        # Receive message from client
+                        data = await websocket.receive_bytes()
+                        print(f"=== ORPHEUS_TTS: Received data: {len(data)} bytes ===")
+                        
+                        # Unpack the message
+                        try:
+                            message = msgpack.unpackb(data)
+                            print(f"=== ORPHEUS_TTS: Message type: {message.get('type', 'unknown')} ===")
+                            
+                            if message.get("type") == "Text":
+                                text = message.get("text", "")
+                                voice = message.get("voice", "tara")
+                                
+                                print(f"=== ORPHEUS_TTS: Processing text: {text[:50]}... with voice: {voice} ===")
+                                
+                                # Generate audio using Orpheus
+                                try:
+                                    async for audio_chunk in self.generate_speech_stream(text, voice):
+                                        # Send raw PCM bytes directly
+                                        await websocket.send_bytes(audio_chunk)
+                                        
+                                except Exception as e:
+                                    print(f"=== ORPHEUS_TTS: Error generating audio: {e} ===")
+                                    error_message = {
+                                        "type": "Error",
+                                        "message": f"Audio generation failed: {str(e)}"
+                                    }
+                                    packed_error = msgpack.packb(error_message)
+                                    await websocket.send_bytes(packed_error)
+                                    
+                            elif message.get("type") == "Eos":
+                                print("=== ORPHEUS_TTS: Received EOS message ===")
+                                eos_response = {"type": "Eos"}
+                                packed_eos = msgpack.packb(eos_response)
+                                await websocket.send_bytes(packed_eos)
+                                
+                        except Exception as e:
+                            print(f"=== ORPHEUS_TTS: Error unpacking message: {e} ===")
+                            continue
+                            
+                    except WebSocketDisconnect:
+                        print("=== ORPHEUS_TTS: Client disconnected ===")
+                        break
+                    except Exception as e:
+                        print(f"=== ORPHEUS_TTS: WebSocket error: {e} ===")
+                        break
+                        
+            except Exception as e:
+                print(f"=== ORPHEUS_TTS: Connection error: {e} ===")
+        
+        return app
+
 
 @app.cls(
     gpu="L40S",
@@ -981,17 +1556,15 @@ class OrchestratorService:
             # In modal serve mode, each service class gets its own -dev URL
             # Pattern: https://username--appname-classname-dev.modal.run
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the Orpheus FastAPI Modal service directly
-            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
-            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
+            # Use the integrated Orpheus TTS service
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-web-dev.modal.run"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
         else:
             # Production deployment URLs
-            os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the Orpheus FastAPI Modal service directly
-            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
-            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
-            os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
+            os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web.modal.run"
+            # Use the integrated Orpheus TTS service
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-web.modal.run"
+            os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web.modal.run"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         
