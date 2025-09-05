@@ -5,6 +5,7 @@ Based on Baseten Truss examples for optimal performance
 
 from typing import Any, Iterator, List, Awaitable, AsyncIterator
 from transformers import AutoTokenizer
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 import torch
 import fastapi
 from snac import SNAC
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 class SnacModelBatched:
     def __init__(self):
-        self.dtype_decoder = torch.float32
+        self.dtype_decoder = torch.bfloat16
         compile_background = False
         use_compile = True
         model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
@@ -71,7 +72,7 @@ class SnacModelBatched:
         self.snac_model.decoder = decoder
         self.snac_model.quantizer = quantizer
 
-    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=15)
+    @batched.dynamically(batch_size=SNAC_MAX_BATCH, timeout_ms=5)
     def batch_snac_model(
         self, items: list[dict[str, list[torch.Tensor]]]
     ) -> list[torch.Tensor]:
@@ -229,6 +230,7 @@ class OrpheusModel:
         self._tokenizer = None
         self.start_id = [128259]
         self.end_ids = [128009, 128260, 128261, 128257]
+        self.allowed_custom_token_ids: set[int] | None = None
 
     def load(self, model_name="canopylabs/orpheus-3b-0.1-ft") -> None:
         """Load the Orpheus model and tokenizer with optimizations"""
@@ -272,29 +274,31 @@ class OrpheusModel:
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,  # Use dtype for better compatibility
-                        device_map="auto",
+                        torch_dtype=torch.bfloat16,
+                        device_map=None,
                         token=hf_token,
                         trust_remote_code=True,
                         # Optimizations for inference - try different attention implementations with fallbacks
                         attn_implementation=self._get_best_attention_implementation(),
                         low_cpu_mem_usage=True,
                     )
-                    logging.info("Orpheus model loaded with accelerate device mapping and optimizations")
+                    if torch.cuda.is_available():
+                        self._model = self._model.to("cuda")
+                    logging.info("Orpheus model loaded on GPU with bfloat16")
                 except Exception as e:
                     logging.warning(f"Failed to load with optimizations, trying basic loading: {e}")
                     # Fallback: load without advanced optimizations
                     self._model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         cache_dir="/root/.cache/huggingface/hub",
-                        dtype=torch.float16,
+                        torch_dtype=torch.bfloat16,
                         token=hf_token,
                         trust_remote_code=True,
                         low_cpu_mem_usage=True,
                     )
                     if torch.cuda.is_available():
-                        self._model = self._model.cuda()
-                        logging.info("Orpheus model loaded and moved to CUDA manually")
+                        self._model = self._model.to("cuda")
+                        logging.info("Orpheus model loaded and moved to CUDA manually (bfloat16)")
                     else:
                         logging.info("Orpheus model loaded on CPU")
                 
@@ -306,10 +310,42 @@ class OrpheusModel:
                 # Memory optimizations
                 self._optimize_memory()
                 
-                # Apply torch.compile optimization like SNAC model
-                self._compile_model()
+                # Skip torch.compile for the LM; it can hurt iterative generate() performance
                 
                 logging.info("Orpheus language model loaded and optimized successfully")
+                # Set common generation configuration once to avoid per-call overhead
+                try:
+                    gen_cfg = self._model.generation_config
+                    gen_cfg.use_cache = True
+                    gen_cfg.pad_token_id = (
+                        self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+                    )
+                    gen_cfg.eos_token_id = self.end_ids
+                    gen_cfg.num_beams = 1
+                except Exception as e:
+                    logging.warning(f"Could not set generation_config: {e}")
+
+                # Warm up kernels to reduce TTFT
+                try:
+                    logging.info("Warming up Orpheus model with a short generate()...")
+                    warmup_inputs = self._tokenizer(
+                        "tara: hello", return_tensors="pt"
+                    )
+                    if torch.cuda.is_available():
+                        warmup_inputs = {k: v.to("cuda") for k, v in warmup_inputs.items()}
+                    with torch.inference_mode():
+                        _ = self._model.generate(
+                            **warmup_inputs,
+                            max_new_tokens=16,
+                            do_sample=False,
+                            pad_token_id=(
+                                self._tokenizer.pad_token_id or self._tokenizer.eos_token_id
+                            ),
+                            eos_token_id=self.end_ids,
+                        )
+                    logging.info("Warmup complete")
+                except Exception as e:
+                    logging.warning(f"Warmup generate failed (continuing): {e}")
             except Exception as e:
                 logging.error(f"Failed to load Orpheus language model: {e}")
                 raise
@@ -324,6 +360,19 @@ class OrpheusModel:
             ) == self._format_prompt_slow("hello world", "tara")
             
             logging.info(f"Orpheus tokenizer loaded successfully, fast format: {self.use_fast_fmt}")
+            # Build allowed custom token id set from tokenizer vocab to constrain generation
+            try:
+                vocab = self._tokenizer.get_vocab()
+                allowed = []
+                for tok, idx in vocab.items():
+                    if tok.startswith("<custom_token_") and tok.endswith(">"):
+                        allowed.append(idx)
+                if not allowed:
+                    logging.warning("No custom tokens found in tokenizer vocab; generation may be slow")
+                self.allowed_custom_token_ids = set(allowed)
+                logging.info(f"Found {len(self.allowed_custom_token_ids)} custom tokens in vocab")
+            except Exception as e:
+                logging.warning(f"Failed to build custom token id set: {e}")
             
             # Initialize the global SNAC model
             global model_snac
@@ -427,10 +476,10 @@ class OrpheusModel:
         try:
             logging.info("Applying memory optimizations...")
             
-            # Enable gradient checkpointing if available (saves memory during forward pass)
-            if hasattr(self._model, 'gradient_checkpointing_enable'):
-                self._model.gradient_checkpointing_enable()
-                logging.info("Gradient checkpointing enabled")
+            # Ensure gradient checkpointing is disabled for inference
+            if hasattr(self._model, 'gradient_checkpointing_disable'):
+                self._model.gradient_checkpointing_disable()
+                logging.info("Gradient checkpointing disabled for inference")
             
             # Set model to use optimized attention if available
             if hasattr(self._model.config, 'use_cache'):
@@ -498,22 +547,32 @@ class OrpheusModel:
                 """Generate speech tokens using optimized batched generation"""
                 logging.info(f"Running optimized Orpheus model inference for: '{formatted_prompt[:100]}...'")
                 
-                # Tokenize the input
-                inputs = self._tokenizer(formatted_prompt, return_tensors="pt")
-                if torch.cuda.is_available():
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
+                # Build numeric input_ids with start/end token sequences to encourage early audio token emission
+                adapted = f"{voice}: {prompt}" if voice else prompt
+                core_ids = self._tokenizer.encode(adapted, add_special_tokens=False)
+                full_ids = self.start_id + core_ids + self.end_ids
+                input_ids = torch.tensor([full_ids], dtype=torch.long, device=self._model.device)
+                attention_mask = torch.ones_like(input_ids, device=self._model.device)
+                inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                try:
+                    logging.info(
+                        f"LM device={self._model.device}, dtype={getattr(self._model, 'dtype', 'n/a')} | inputs device={input_ids.device}, shape={tuple(input_ids.shape)}"
+                    )
+                except Exception:
+                    pass
                 
                 # Use optimized generation with transformers generate() method
-                with torch.no_grad():
-                    max_new_tokens = kwargs.get("max_tokens", 4096)
-                    temperature = kwargs.get("temperature", 0.7)
-                    top_k = kwargs.get("top_k", 50)
+                with torch.inference_mode():
+                    max_new_tokens = kwargs.get("max_tokens", 2048)
+                    # Use greedy to reduce variability and encourage steady emission of custom tokens
+                    temperature = 0.0
+                    top_k = 0
                     
                     generation_config = {
                         "max_new_tokens": max_new_tokens,
                         "temperature": temperature,
                         "top_k": top_k,
-                        "do_sample": True,
+                        "do_sample": False,
                         "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
                         "eos_token_id": self.end_ids,
                         "use_cache": True,  # Enable KV caching for faster sequential generation
@@ -524,6 +583,18 @@ class OrpheusModel:
                         "length_penalty": 1.0,
                         "no_repeat_ngram_size": 3,  # Prevent repetitive patterns
                     }
+                    # Constrain logits to Orpheus custom tokens to drive immediate audio token emission
+                    logits_processors = LogitsProcessorList()
+                    if self.allowed_custom_token_ids:
+                        allowed_ids_tensor = torch.tensor(sorted(self.allowed_custom_token_ids), device=self._model.device)
+
+                        class KeepOnlyCustomTokens(LogitsProcessor):
+                            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+                                mask = torch.full_like(scores, float('-inf'))
+                                mask[:, allowed_ids_tensor] = 0.0
+                                return scores + mask
+
+                        logits_processors.append(KeepOnlyCustomTokens())
                     
                     # Use streaming generation for real-time output
                     from transformers import TextIteratorStreamer
@@ -541,7 +612,7 @@ class OrpheusModel:
                     # Run generation in a separate thread to avoid blocking
                     generation_thread = threading.Thread(
                         target=self._model.generate,
-                        kwargs={**inputs, **generation_config}
+                        kwargs={**inputs, **generation_config, "logits_processor": logits_processors}
                     )
                     generation_thread.start()
                     
