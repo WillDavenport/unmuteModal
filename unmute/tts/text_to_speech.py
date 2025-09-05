@@ -1,4 +1,5 @@
 import asyncio
+import os
 import urllib.parse
 from logging import getLogger
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Union, cast
@@ -450,8 +451,8 @@ class TextToSpeech(ServiceWithStartup):
 
 class OrpheusTextToSpeech(ServiceWithStartup):
     """
-    Orpheus TTS adapter that handles complete text input instead of streaming.
-    Designed to work with the Orpheus TTS model which expects full text prompts.
+    Orpheus TTS adapter that uses the Modal-based Orpheus FastAPI service.
+    Handles complete text input and streams audio output from the Modal service.
     """
 
     def __init__(
@@ -480,6 +481,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         # Simple generation tracking - no complex queuing needed for Orpheus
         self.generation_complete = asyncio.Event()
         
+        # Store the llama endpoint if configured
+        self.llama_endpoint = None
+        if "ORPHEUS_LLAMA_ENDPOINT" in os.environ:
+            self.llama_endpoint = os.environ["ORPHEUS_LLAMA_ENDPOINT"]
+        
         logger.info(f"Initialized OrpheusTextToSpeech with voice: {self.voice}")
 
     def state(self) -> WebsocketState:
@@ -495,59 +501,67 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             return d[self.websocket.state]
 
     async def start_up(self):
-        """Initialize connection to Orpheus TTS service."""
-        # For Modal Orpheus services, connect to /ws endpoint
+        """Initialize connection to Orpheus FastAPI Modal service."""
+        # For Modal Orpheus FastAPI services, connect to the streaming endpoint
         if "modal.run" in self.tts_base_url:
-            url = f"{self.tts_base_url}/ws"
+            url = f"{self.tts_base_url}/v1/audio/speech/stream/ws"
         else:
-            url = f"{self.tts_base_url}/orpheus"
+            # Fallback for local testing
+            url = f"{self.tts_base_url}/v1/audio/speech/stream/ws"
             
-        logger.info(f"Connecting to Orpheus TTS: {url}")
+        logger.info(f"Connecting to Orpheus FastAPI TTS: {url}")
         
         try:
+            # Add query parameters for the voice and other settings
+            params = {
+                "voice": self.voice,
+                "model": "orpheus",
+                "speed": "1.0",
+            }
+            if self.llama_endpoint:
+                params["llama_endpoint"] = self.llama_endpoint
+                
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            full_url = f"{url}?{query_string}"
+            
             self.websocket = await websockets.connect(
-                url,
+                full_url,
                 additional_headers=HEADERS,
             )
-            logger.info("Connected to Orpheus TTS successfully")
+            logger.info("Connected to Orpheus FastAPI TTS successfully")
             
         except Exception as e:
-            logger.error(f"Failed to connect to Orpheus TTS: {e}")
+            logger.error(f"Failed to connect to Orpheus FastAPI TTS: {e}")
             raise
 
     async def send_complete_text(self, text: str) -> None:
-        """Send complete text to Orpheus TTS for audio generation."""
+        """Send complete text to Orpheus FastAPI Modal service for audio generation."""
         if not self.websocket:
-            logger.error("Cannot send text - Orpheus TTS websocket not connected")
+            logger.error("Cannot send text - Orpheus FastAPI websocket not connected")
             return
             
         if self.shutdown_lock.locked():
-            logger.warning("Cannot send text - Orpheus TTS shutting down")
+            logger.warning("Cannot send text - Orpheus FastAPI shutting down")
             return
             
         text = prepare_text_for_tts(text)
         if not text.strip():
-            logger.warning("Empty text after preprocessing, not sending to Orpheus TTS")
+            logger.warning("Empty text after preprocessing, not sending to Orpheus FastAPI")
             return
             
-        logger.info(f"Sending complete text to Orpheus TTS: '{text}'")
+        logger.info(f"Sending complete text to Orpheus FastAPI: '{text}'")
         self.time_since_request_sent.start_if_not_started()
         mt.TTS_SESSIONS.inc()
         mt.TTS_ACTIVE_SESSIONS.inc()
         
         try:
-            # Send request to Orpheus TTS with proper message type
-            request_data = {
-                "type": "Text",
-                "text": text,
-                "voice": self.voice,
-            }
-            
-            await self.websocket.send(msgpack.packb(request_data))
-            logger.info("Text sent to Orpheus TTS successfully")
+            # Send text directly to the WebSocket for streaming generation
+            # The Modal service expects plain text over WebSocket for streaming
+            await self.websocket.send(text)
+            logger.info("Text sent to Orpheus FastAPI successfully")
             
         except Exception as e:
-            logger.error(f"Failed to send text to Orpheus TTS: {e}")
+            logger.error(f"Failed to send text to Orpheus FastAPI: {e}")
             raise
 
     async def send(self, message: str) -> None:
@@ -581,22 +595,21 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.info("Orpheus TTS shutdown completed")
 
     async def __aiter__(self) -> AsyncIterator[TTSMessage]:
-        """Iterate over TTS messages from Orpheus.
+        """Iterate over TTS messages from Orpheus FastAPI Modal service.
         
-        Orpheus TTS outputs raw 16-bit PCM audio bytes at 24kHz directly,
-        like the working Baseten example.
+        The Modal service streams raw 16-bit PCM audio bytes at 24kHz.
         """
         if self.websocket is None:
-            raise RuntimeError("Orpheus TTS websocket not connected")
+            raise RuntimeError("Orpheus FastAPI websocket not connected")
             
-        logger.info("Starting Orpheus TTS message iteration")
+        logger.info("Starting Orpheus FastAPI message iteration")
         
         try:
-            # Process raw audio bytes from Orpheus TTS
+            # Process raw audio bytes from Orpheus FastAPI Modal service
             async for message_bytes in self.websocket:
                 if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
-                    # Orpheus outputs raw 16-bit PCM bytes at 24kHz
-                    # Convert to float32 samples for the audio pipeline (same as other TTS services)
+                    # Orpheus FastAPI outputs raw 16-bit PCM bytes at 24kHz
+                    # Convert to float32 samples for the audio pipeline
                     try:
                         audio_data = np.frombuffer(message_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                         
@@ -604,7 +617,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                             self.waiting_first_audio = False
                             ttft = self.time_since_request_sent.time()
                             mt.TTS_TTFT.observe(ttft)
-                            logger.info("Time to first audio from Orpheus: %.1f ms", ttft * 1000)
+                            logger.info("Time to first audio from Orpheus FastAPI: %.1f ms", ttft * 1000)
                         
                         # Create TTS audio message with float32 PCM data
                         audio_message = TTSAudioMessage(
@@ -627,23 +640,23 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         yield audio_message
                         
                     except ValueError as e:
-                        logger.error(f"Failed to convert Orpheus PCM bytes to float array: {e}")
+                        logger.error(f"Failed to convert Orpheus FastAPI PCM bytes to float array: {e}")
                         continue
                         
                 else:
-                    logger.debug(f"Received non-bytes message from Orpheus: {type(message_bytes)}")
+                    logger.debug(f"Received non-bytes message from Orpheus FastAPI: {type(message_bytes)}")
                     continue
                     
         except websockets.ConnectionClosedOK:
-            logger.info("Orpheus TTS connection closed normally")
+            logger.info("Orpheus FastAPI connection closed normally")
         except websockets.ConnectionClosedError as e:
             if self.shutdown_complete.is_set():
-                logger.info("Orpheus TTS connection closed during intentional shutdown")
+                logger.info("Orpheus FastAPI connection closed during intentional shutdown")
             else:
-                logger.error(f"Orpheus TTS connection lost unexpectedly: {e}")
+                logger.error(f"Orpheus FastAPI connection lost unexpectedly: {e}")
                 raise
         except Exception as e:
-            logger.error(f"Orpheus TTS connection error: {type(e).__name__}: {e}")
+            logger.error(f"Orpheus FastAPI connection error: {type(e).__name__}: {e}")
             raise
         finally:
             self.generation_complete.set()
