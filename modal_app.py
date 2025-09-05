@@ -763,65 +763,68 @@ class TTSService:
             except Exception as cache_e:
                 print(f"Could not check cache: {cache_e}")
         
-        # Initialize Orpheus model
-        from unmute.tts.orpheus_tts import OrpheusModel, initialize_orpheus_model
-        
-        try:
-            print("Loading Orpheus TTS model...")
-            self.orpheus_model = OrpheusModel()
-            self.orpheus_model.load()
-            
-            # Initialize the global SNAC model
-            initialize_orpheus_model()
-            
-            print("Orpheus TTS model loaded successfully")
-            
-        except Exception as e:
-            print(f"CRITICAL ERROR: Orpheus TTS model loading failed: {e}")
-            raise RuntimeError(f"Orpheus TTS service initialization failed: {e}. Container must be restarted.")
+        # Initialize connection to companion services
+        # The actual Orpheus model runs in separate Modal services:
+        # - orpheus_fastapi_modal.py: Main TTS service
+        # - orpheus_llama_modal.py: LLM inference service
+        print("Orpheus TTS service ready to proxy requests to Modal services")
+        self.orpheus_initialized = True
 
     @modal.method()
     def generate_speech(self, text: str, voice: str = "tara"):
-        """Generate speech from text - test method for direct access"""
+        """Generate speech from text - proxy to Orpheus FastAPI Modal service"""
         import asyncio
         import base64
+        import httpx
         
-        print(f"Generating speech for text: '{text}' with voice: '{voice}'")
+        print(f"Proxying speech generation request for text: '{text}' with voice: '{voice}'")
         
         async def generate_audio():
-            audio_chunks = []
-            chunk_count = 0
+            # Get the Orpheus FastAPI service URL
+            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "https://orpheus-fastapi-tts.modal.run")
             
-            async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
-                audio_chunks.append(audio_chunk)
-                chunk_count += 1
-                print(f"Generated audio chunk {chunk_count}: {len(audio_chunk)} bytes")
-            
-            if not audio_chunks:
-                return {
-                    "success": False,
-                    "error": "No audio chunks generated"
-                }
-            
-            # Combine all audio chunks (raw 16-bit PCM bytes)
-            combined_audio = b''.join(audio_chunks)
-            
-            # Convert to base64 for transport
-            audio_base64 = base64.b64encode(combined_audio).decode('utf-8')
-            
-            # Calculate approximate duration (24kHz sample rate, 16-bit PCM)
-            sample_rate = 24000
-            bytes_per_sample = 2  # 16-bit = 2 bytes
-            duration_ms = (len(combined_audio) / bytes_per_sample / sample_rate) * 1000
-            
-            return {
-                "success": True,
-                "audio_base64": audio_base64,
-                "sample_rate": sample_rate,
-                "duration_ms": duration_ms,
-                "chunk_count": chunk_count,
-                "total_bytes": len(combined_audio)
-            }
+            # Make request to the Orpheus FastAPI Modal service
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                try:
+                    response = await client.post(
+                        f"{orpheus_url}/v1/audio/speech",
+                        json={
+                            "input": text,
+                            "voice": voice,
+                            "model": "orpheus",
+                            "response_format": "wav",
+                            "speed": 1.0
+                        }
+                    )
+                    response.raise_for_status()
+                    
+                    # Get the audio data
+                    audio_data = response.content
+                    
+                    # Convert to base64 for transport
+                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                    
+                    # Calculate approximate duration (24kHz sample rate, 16-bit PCM)
+                    sample_rate = 24000
+                    bytes_per_sample = 2  # 16-bit = 2 bytes
+                    # Note: WAV header is typically 44 bytes
+                    pcm_bytes = len(audio_data) - 44 if len(audio_data) > 44 else len(audio_data)
+                    duration_ms = (pcm_bytes / bytes_per_sample / sample_rate) * 1000
+                    
+                    return {
+                        "success": True,
+                        "audio_base64": audio_base64,
+                        "sample_rate": sample_rate,
+                        "duration_ms": duration_ms,
+                        "total_bytes": len(audio_data)
+                    }
+                    
+                except Exception as e:
+                    print(f"Error calling Orpheus FastAPI service: {e}")
+                    return {
+                        "success": False,
+                        "error": str(e)
+                    }
         
         # Run the async generation
         return asyncio.run(generate_audio())
@@ -871,12 +874,23 @@ class TTSService:
                                 
                                 print(f"=== ORPHEUS_TTS_SERVICE: Processing text: {text[:50]}... with voice: {voice} ===")
                                 
-                                # Generate audio using Orpheus
+                                # Proxy to Orpheus FastAPI Modal service via WebSocket
                                 try:
-                                    async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
-                                        # Send raw PCM bytes directly (like Baseten API)
-                                        # Orpheus outputs 16-bit PCM at 24kHz, send as raw bytes
-                                        await websocket.send_bytes(audio_chunk)
+                                    import websockets as ws
+                                    orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
+                                    
+                                    # Connect to Orpheus FastAPI streaming endpoint
+                                    stream_url = f"{orpheus_url}/v1/audio/speech/stream/ws?voice={voice}"
+                                    
+                                    async with ws.connect(stream_url) as orpheus_ws:
+                                        # Send text to Orpheus service
+                                        await orpheus_ws.send(text)
+                                        
+                                        # Stream audio chunks back to client
+                                        async for audio_chunk in orpheus_ws:
+                                            if isinstance(audio_chunk, bytes):
+                                                # Send raw PCM bytes directly
+                                                await websocket.send_bytes(audio_chunk)
                                         
                                 except Exception as e:
                                     print(f"=== ORPHEUS_TTS_SERVICE: Error generating audio: {e} ===")
