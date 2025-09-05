@@ -129,7 +129,7 @@ stt_image = (
 # TTS image: build steps first, then local files
 tts_image = (
     base_deps_image
-    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg", "git-lfs", "portaudio19-dev")
+    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg", "git-lfs")
     .run_commands(
         # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
         "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
@@ -160,12 +160,6 @@ tts_image = (
         # Additional optimization packages (flash-attn removed due to compatibility issues)
         # "flash-attn>=2.0.0",  # Commented out due to CUDA symbol conflicts
         "xformers>=0.0.20",   # Memory-efficient attention (fallback)
-        # Orpheus-FastAPI dependencies
-        "requests==2.31.0",
-        "python-dotenv==1.0.0",
-        "sounddevice==0.4.6",
-        # Local VLLM server for /v1/completions
-        "vllm==0.9.1",
     )
     .run_commands(
         # Pre-download publicly available models during image build
@@ -682,100 +676,155 @@ class TTSService:
     
     @modal.enter()
     def load_model(self):
-        """Initialize Orpheus-FastAPI engine and local VLLM /v1/completions server."""
+        """Load Orpheus TTS model weights once per container"""
         import os
         import time
-        import socket
-        import threading
-        import subprocess
-
-        print("Setting up Orpheus-FastAPI TTS Service...")
-
-        # Start local VLLM server that exposes /v1/completions for Orpheus tokens
-        MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
-        VLLM_PORT = 8093
-
-        env = os.environ.copy()
+        
+        print("Setting up Orpheus TTS Service...")
+        
+        # Check if HuggingFace token is available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         if hf_token:
-            env["HF_TOKEN"] = hf_token
-            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
-            print(f"TTS (LLM): HuggingFace token configured (length: {len(hf_token)})")
+            print(f"Orpheus TTS: HuggingFace token available (length: {len(hf_token)})")
+            # Set environment variables for huggingface_hub
+            os.environ["HF_TOKEN"] = hf_token
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
         else:
-            print("TTS (LLM): WARNING - No HuggingFace token found. Private models may fail.")
-
-        print("Starting local VLLM server for Orpheus tokens...")
-        cmd = [
-            "vllm", "serve",
-            MODEL_NAME,
-            "--host", "0.0.0.0",
-            "--port", str(VLLM_PORT),
-            "--served-model-name", MODEL_NAME,
-            "--max-model-len", "8192",
-            "--dtype", "bfloat16",
-            "--gpu-memory-utilization", "0.9",
-            "--uvicorn-log-level", "info",
-            "--enforce-eager",
-        ]
-        self.tts_vllm_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-
-        def monitor_output():
+            print("Orpheus TTS: No HuggingFace token found - this may cause issues downloading models")
+            print("Orpheus TTS: Please ensure 'huggingface-secret' is configured in Modal")
+        
+        # Pre-download Orpheus model at runtime (when token is available)
+        try:
+            print("Checking for cached Orpheus model...")
+            from huggingface_hub import snapshot_download
+            import os
+            import shutil
+            
+            # Check both build-time cache and volume cache
+            build_cache_path = CACHE_DIR  # Build-time cache
+            volume_cache_path = VOLUME_CACHE_DIR  # Volume cache
+            
+            # Ensure volume cache directory exists
+            os.makedirs(volume_cache_path, exist_ok=True)
+            
+            # Check if model is already in volume cache (persistent)
+            volume_cached_dirs = [d for d in os.listdir(volume_cache_path) if 'orpheus' in d.lower()] if os.path.exists(volume_cache_path) else []
+            build_cached_dirs = [d for d in os.listdir(build_cache_path) if 'orpheus' in d.lower()] if os.path.exists(build_cache_path) else []
+            
+            if volume_cached_dirs:
+                print(f"Found cached Orpheus model in volume: {volume_cached_dirs}")
+                # Use volume cache as primary cache location
+                cache_path = volume_cache_path
+            elif build_cached_dirs:
+                print(f"Found cached Orpheus model in build cache: {build_cached_dirs}")
+                # Copy from build cache to volume cache for persistence
+                print("Copying model from build cache to volume cache...")
+                for cached_dir in build_cached_dirs:
+                    src_path = os.path.join(build_cache_path, cached_dir)
+                    dst_path = os.path.join(volume_cache_path, cached_dir)
+                    if os.path.exists(src_path) and not os.path.exists(dst_path):
+                        shutil.copytree(src_path, dst_path)
+                        print(f"Copied {cached_dir} to volume cache")
+                cache_path = volume_cache_path
+            else:
+                print("No cached Orpheus model found, downloading to volume cache...")
+                cache_path = volume_cache_path
+            
+            # Download or verify the full Orpheus model with authentication
+            print(f"Downloading/verifying Orpheus model to: {cache_path}")
+            snapshot_download(
+                'canopylabs/orpheus-3b-0.1-ft',
+                cache_dir=cache_path,
+                token=hf_token,
+                local_files_only=False,  # Allow download if not cached
+                resume_download=True     # Resume partial downloads
+            )
+            print("Orpheus model ready (downloaded or verified from cache)")
+            
+            # Set environment variable to use volume cache
+            os.environ["HF_HOME"] = volume_cache_path
+            
+        except Exception as e:
+            print(f"WARNING: Failed to download Orpheus model: {e}")
+            print("Will attempt to use cached version or fallback")
+            # Check if we have any cached version in either location
             try:
-                assert self.tts_vllm_proc.stdout is not None
-                for line in self.tts_vllm_proc.stdout:
-                    if line:
-                        print(f"VLLM (TTS): {line.strip()}")
-            except Exception as e:
-                print(f"VLLM (TTS) output monitor error: {e}")
-        threading.Thread(target=monitor_output, daemon=True).start()
-
-        # Wait for readiness
-        for attempt in range(1, 49):
-            if self.tts_vllm_proc.poll() is not None:
-                print(f"VLLM (TTS) exited with code {self.tts_vllm_proc.returncode}")
-                break
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1.0)
-                r = s.connect_ex(("127.0.0.1", VLLM_PORT))
-                s.close()
-                if r == 0:
-                    print(f"VLLM (TTS) ready after {attempt}s")
-                    break
-            except Exception:
-                pass
-            time.sleep(10)
-
-        # Point Orpheus-FastAPI engine at local VLLM compat endpoint
-        os.environ["ORPHEUS_API_URL"] = f"http://127.0.0.1:{VLLM_PORT}/v1/completions"
-        os.environ.setdefault("ORPHEUS_MAX_TOKENS", "8192")
-        os.environ.setdefault("ORPHEUS_TEMPERATURE", "0.6")
-        os.environ.setdefault("ORPHEUS_TOP_P", "0.9")
-        os.environ.setdefault("ORPHEUS_SAMPLE_RATE", "24000")
+                import os
+                volume_dirs = os.listdir(volume_cache_path) if os.path.exists(volume_cache_path) else []
+                build_dirs = os.listdir(build_cache_path) if os.path.exists(build_cache_path) else []
+                print(f"Available cached models - Volume: {volume_dirs}, Build: {build_dirs}")
+                
+                # Prefer volume cache, fallback to build cache
+                if volume_dirs:
+                    os.environ["HF_HOME"] = volume_cache_path
+                elif build_dirs:
+                    os.environ["HF_HOME"] = build_cache_path
+                    
+            except Exception as cache_e:
+                print(f"Could not check cache: {cache_e}")
+        
+        # Initialize Orpheus model
+        from unmute.tts.orpheus_tts import OrpheusModel, initialize_orpheus_model
+        
+        try:
+            print("Loading Orpheus TTS model...")
+            self.orpheus_model = OrpheusModel()
+            self.orpheus_model.load()
+            
+            # Initialize the global SNAC model
+            initialize_orpheus_model()
+            
+            print("Orpheus TTS model loaded successfully")
+            
+        except Exception as e:
+            print(f"CRITICAL ERROR: Orpheus TTS model loading failed: {e}")
+            raise RuntimeError(f"Orpheus TTS service initialization failed: {e}. Container must be restarted.")
 
     @modal.method()
     def generate_speech(self, text: str, voice: str = "tara"):
-        """Generate speech from text using orpheus_fast_api engine (non-streaming test)."""
+        """Generate speech from text - test method for direct access"""
+        import asyncio
         import base64
-        from unmute.orpheus_fast_api.tts_engine import inference as orph
-
-        # Synchronously generate audio segments
-        segments = orph.tokens_decoder_sync(
-            orph.generate_tokens_from_api(prompt=text, voice=voice)
-        )
-        combined = b"".join(list(segments))
-        audio_base64 = base64.b64encode(combined).decode("utf-8")
-        sample_rate = 24000
-        bytes_per_sample = 2
-        duration_ms = (len(combined) / bytes_per_sample / sample_rate) * 1000
-        return {
-            "success": True,
-            "audio_base64": audio_base64,
-            "sample_rate": sample_rate,
-            "duration_ms": duration_ms,
-            "chunk_count": None,
-            "total_bytes": len(combined),
-        }
+        
+        print(f"Generating speech for text: '{text}' with voice: '{voice}'")
+        
+        async def generate_audio():
+            audio_chunks = []
+            chunk_count = 0
+            
+            async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
+                audio_chunks.append(audio_chunk)
+                chunk_count += 1
+                print(f"Generated audio chunk {chunk_count}: {len(audio_chunk)} bytes")
+            
+            if not audio_chunks:
+                return {
+                    "success": False,
+                    "error": "No audio chunks generated"
+                }
+            
+            # Combine all audio chunks (raw 16-bit PCM bytes)
+            combined_audio = b''.join(audio_chunks)
+            
+            # Convert to base64 for transport
+            audio_base64 = base64.b64encode(combined_audio).decode('utf-8')
+            
+            # Calculate approximate duration (24kHz sample rate, 16-bit PCM)
+            sample_rate = 24000
+            bytes_per_sample = 2  # 16-bit = 2 bytes
+            duration_ms = (len(combined_audio) / bytes_per_sample / sample_rate) * 1000
+            
+            return {
+                "success": True,
+                "audio_base64": audio_base64,
+                "sample_rate": sample_rate,
+                "duration_ms": duration_ms,
+                "chunk_count": chunk_count,
+                "total_bytes": len(combined_audio)
+            }
+        
+        # Run the async generation
+        return asyncio.run(generate_audio())
     
     @modal.asgi_app()
     def web(self):
@@ -785,9 +834,6 @@ class TTSService:
         import msgpack
         import json
         
-        # Import Orpheus-FastAPI engine
-        from unmute.orpheus_fast_api.tts_engine import inference as orph
-
         app = FastAPI(title="Orpheus TTS Service", version="1.0.0")
         
         @app.get("/")
@@ -825,24 +871,19 @@ class TTSService:
                                 
                                 print(f"=== ORPHEUS_TTS_SERVICE: Processing text: {text[:50]}... with voice: {voice} ===")
                                 
-                                # Use orpheus_fast_api engine and stream audio
+                                # Generate audio using Orpheus
                                 try:
-                                    loop = asyncio.get_event_loop()
-                                    
-                                    def produce_and_stream():
-                                        try:
-                                            token_gen = orph.generate_tokens_from_api(prompt=text, voice=voice)
-                                            for audio_chunk in orph.tokens_decoder_sync(token_gen):
-                                                if audio_chunk:
-                                                    fut = asyncio.run_coroutine_threadsafe(websocket.send_bytes(audio_chunk), loop)
-                                                    fut.result()
-                                        except Exception as e:
-                                            print(f"=== ORPHEUS_TTS_SERVICE: Error streaming audio: {e} ===")
-                                    
-                                    await asyncio.to_thread(produce_and_stream)
+                                    async for audio_chunk in self.orpheus_model.generate_speech_stream(text, voice):
+                                        # Send raw PCM bytes directly (like Baseten API)
+                                        # Orpheus outputs 16-bit PCM at 24kHz, send as raw bytes
+                                        await websocket.send_bytes(audio_chunk)
+                                        
                                 except Exception as e:
                                     print(f"=== ORPHEUS_TTS_SERVICE: Error generating audio: {e} ===")
-                                    error_message = {"type": "Error", "message": f"Audio generation failed: {str(e)}"}
+                                    error_message = {
+                                        "type": "Error",
+                                        "message": f"Audio generation failed: {str(e)}"
+                                    }
                                     packed_error = msgpack.packb(error_message)
                                     await websocket.send_bytes(packed_error)
                                     
@@ -988,7 +1029,7 @@ class LLMService:
     @modal.asgi_app()
     def web(self):
         """OpenAI-compatible API endpoint for LLM service"""
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI
         from fastapi.responses import StreamingResponse
         from unmute.llm.llm_utils import get_openai_client, rechunk_to_words, VLLMStream
         import json
@@ -1003,31 +1044,6 @@ class LLMService:
         def root():
             return {"service": "llm", "model": MODEL_NAME, "status": "ready"}
         
-        @app.post("/v1/completions")
-        async def proxy_completions(request: Request):
-            """Proxy OpenAI /v1/completions for compatibility with Orpheus-FastAPI."""
-            client = get_openai_client(server_url="http://localhost:8091")
-            body = await request.json()
-            prompt = body.get("prompt", "")
-            max_tokens = body.get("max_tokens", 512)
-            temperature = body.get("temperature", 0.7)
-            top_p = body.get("top_p", 0.9)
-            # Stream server-sent events similar to vLLM
-            async def generate_stream():
-                try:
-                    # Use the chat completions with a single system/user prompt
-                    messages = [{"role": "user", "content": prompt}]
-                    stream = await client.chat.completions.create(messages=messages, model=MODEL_NAME, stream=True, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-                    async for chunk in stream:
-                        # Emit text chunks in OpenAI text format expected by Orpheus-FastAPI
-                        text_delta = chunk.choices[0].delta.get("content", "") if hasattr(chunk.choices[0], "delta") else ""
-                        if text_delta:
-                            yield f"data: {json.dumps({\"choices\": [{\"text\": text_delta}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                except Exception as e:
-                    yield f"data: {json.dumps({\"error\": str(e)})}\n\n"
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
-
         @app.get("/v1/models")
         def list_models():
             """List available models endpoint for OpenAI client compatibility"""
