@@ -78,6 +78,7 @@ orpheus_image = (
         # Additional dependencies for Modal integration
         "websockets>=12.0",
         "msgpack>=1.1.0",
+        "msgpack-numpy>=0.4.8",
         "aiofiles>=24.0.0",
         
         # For llama.cpp integration
@@ -538,9 +539,10 @@ class OrpheusFastAPIService:
     @modal.asgi_app()
     def asgi_app(self):
         """Create FastAPI app for HTTP endpoints"""
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, WebSocket
         from fastapi.responses import Response, StreamingResponse
         from pydantic import BaseModel
+        import msgpack
         
         app = FastAPI(title="Orpheus FastAPI TTS")
         
@@ -596,6 +598,86 @@ class OrpheusFastAPIService:
         @app.get("/health")
         async def health():
             return {"status": "healthy", "service": "orpheus-fastapi-tts"}
+        
+        @app.get("/")
+        def root():
+            return {"service": "tts", "model": "orpheus-fastapi", "status": "ready"}
+        
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            """WebSocket endpoint compatible with modal_app.py expectations"""
+            from fastapi import WebSocketDisconnect
+            import msgpack
+            
+            print("=== ORPHEUS_FASTAPI: WebSocket connection attempt ===")
+            
+            await websocket.accept()
+            print("=== ORPHEUS_FASTAPI: WebSocket connection accepted ===")
+            
+            try:
+                # Send initial Ready message to client in MessagePack format
+                ready_message = {"type": "Ready"}
+                packed_ready = msgpack.packb(ready_message)
+                await websocket.send_bytes(packed_ready)
+                print("=== ORPHEUS_FASTAPI: Sent Ready message (MessagePack format) ===")
+                
+                while True:
+                    try:
+                        # Receive message from client
+                        data = await websocket.receive_bytes()
+                        print(f"=== ORPHEUS_FASTAPI: Received data: {len(data)} bytes ===")
+                        
+                        # Unpack the message
+                        try:
+                            message = msgpack.unpackb(data)
+                            print(f"=== ORPHEUS_FASTAPI: Unpacked message type: {message.get('type', 'unknown')} ===")
+                            
+                            if message.get("type") == "Text":
+                                text = message.get("text", "")
+                                voice = message.get("voice", "tara")
+                                
+                                print(f"=== ORPHEUS_FASTAPI: Processing text: {text[:50]}... with voice: {voice} ===")
+                                
+                                # Generate audio using Orpheus
+                                try:
+                                    async for audio_chunk in self.generate_speech_stream(
+                                        text=text,
+                                        voice=voice,
+                                        model="orpheus",
+                                        speed=1.0,
+                                    ):
+                                        # Send raw PCM bytes directly
+                                        await websocket.send_bytes(audio_chunk)
+                                        
+                                except Exception as e:
+                                    print(f"=== ORPHEUS_FASTAPI: Error generating audio: {e} ===")
+                                    error_message = {
+                                        "type": "Error",
+                                        "message": f"Audio generation failed: {str(e)}"
+                                    }
+                                    packed_error = msgpack.packb(error_message)
+                                    await websocket.send_bytes(packed_error)
+                                    
+                            elif message.get("type") == "Eos":
+                                print("=== ORPHEUS_FASTAPI: Received EOS message ===")
+                                # Send EOS response
+                                eos_response = {"type": "Eos"}
+                                packed_eos = msgpack.packb(eos_response)
+                                await websocket.send_bytes(packed_eos)
+                                
+                        except Exception as e:
+                            print(f"=== ORPHEUS_FASTAPI: Error unpacking message: {e} ===")
+                            continue
+                            
+                    except WebSocketDisconnect:
+                        print("=== ORPHEUS_FASTAPI: Client disconnected ===")
+                        break
+                    except Exception as e:
+                        print(f"=== ORPHEUS_FASTAPI: WebSocket error: {e} ===")
+                        break
+                        
+            except Exception as e:
+                print(f"=== ORPHEUS_FASTAPI: Connection error: {e} ===")
         
         return app
 

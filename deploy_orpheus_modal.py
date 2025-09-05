@@ -54,6 +54,9 @@ def main():
     """Main deployment function"""
     print("🚀 Deploying Orpheus Modal Services")
     print("="*60)
+    print("\nThis deployment replaces the TTSService in modal_app.py")
+    print("The Orpheus FastAPI service runs independently and is used directly.")
+    print("="*60)
     
     # Check if Modal is installed and authenticated
     try:

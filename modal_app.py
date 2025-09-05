@@ -658,272 +658,10 @@ dim = 6
         return app
 
 
-@app.cls(
-    gpu="H100", 
-    image=tts_image,
-    volumes=tts_volumes,
-    secrets=secrets,
-    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
-    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
-    timeout=15 * 60,  # 15 minutes for Orpheus model download and initialization
-    # Optimize for H100 performance
-    cpu=4.0,  # More CPU cores for parallel processing
-    memory=32768,  # 32GB RAM for large model
-)
-@modal.concurrent(max_inputs=10)
-class TTSService:
-    """Text-to-Speech service using Orpheus TTS model"""
-    
-    @modal.enter()
-    def load_model(self):
-        """Load Orpheus TTS model weights once per container"""
-        import os
-        import time
-        
-        print("Setting up Orpheus TTS Service...")
-        
-        # Check if HuggingFace token is available
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        if hf_token:
-            print(f"Orpheus TTS: HuggingFace token available (length: {len(hf_token)})")
-            # Set environment variables for huggingface_hub
-            os.environ["HF_TOKEN"] = hf_token
-            os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
-        else:
-            print("Orpheus TTS: No HuggingFace token found - this may cause issues downloading models")
-            print("Orpheus TTS: Please ensure 'huggingface-secret' is configured in Modal")
-        
-        # Pre-download Orpheus model at runtime (when token is available)
-        try:
-            print("Checking for cached Orpheus model...")
-            from huggingface_hub import snapshot_download
-            import os
-            import shutil
-            
-            # Check both build-time cache and volume cache
-            build_cache_path = CACHE_DIR  # Build-time cache
-            volume_cache_path = VOLUME_CACHE_DIR  # Volume cache
-            
-            # Ensure volume cache directory exists
-            os.makedirs(volume_cache_path, exist_ok=True)
-            
-            # Check if model is already in volume cache (persistent)
-            volume_cached_dirs = [d for d in os.listdir(volume_cache_path) if 'orpheus' in d.lower()] if os.path.exists(volume_cache_path) else []
-            build_cached_dirs = [d for d in os.listdir(build_cache_path) if 'orpheus' in d.lower()] if os.path.exists(build_cache_path) else []
-            
-            if volume_cached_dirs:
-                print(f"Found cached Orpheus model in volume: {volume_cached_dirs}")
-                # Use volume cache as primary cache location
-                cache_path = volume_cache_path
-            elif build_cached_dirs:
-                print(f"Found cached Orpheus model in build cache: {build_cached_dirs}")
-                # Copy from build cache to volume cache for persistence
-                print("Copying model from build cache to volume cache...")
-                for cached_dir in build_cached_dirs:
-                    src_path = os.path.join(build_cache_path, cached_dir)
-                    dst_path = os.path.join(volume_cache_path, cached_dir)
-                    if os.path.exists(src_path) and not os.path.exists(dst_path):
-                        shutil.copytree(src_path, dst_path)
-                        print(f"Copied {cached_dir} to volume cache")
-                cache_path = volume_cache_path
-            else:
-                print("No cached Orpheus model found, downloading to volume cache...")
-                cache_path = volume_cache_path
-            
-            # Download or verify the full Orpheus model with authentication
-            print(f"Downloading/verifying Orpheus model to: {cache_path}")
-            snapshot_download(
-                'canopylabs/orpheus-3b-0.1-ft',
-                cache_dir=cache_path,
-                token=hf_token,
-                local_files_only=False,  # Allow download if not cached
-                resume_download=True     # Resume partial downloads
-            )
-            print("Orpheus model ready (downloaded or verified from cache)")
-            
-            # Set environment variable to use volume cache
-            os.environ["HF_HOME"] = volume_cache_path
-            
-        except Exception as e:
-            print(f"WARNING: Failed to download Orpheus model: {e}")
-            print("Will attempt to use cached version or fallback")
-            # Check if we have any cached version in either location
-            try:
-                import os
-                volume_dirs = os.listdir(volume_cache_path) if os.path.exists(volume_cache_path) else []
-                build_dirs = os.listdir(build_cache_path) if os.path.exists(build_cache_path) else []
-                print(f"Available cached models - Volume: {volume_dirs}, Build: {build_dirs}")
-                
-                # Prefer volume cache, fallback to build cache
-                if volume_dirs:
-                    os.environ["HF_HOME"] = volume_cache_path
-                elif build_dirs:
-                    os.environ["HF_HOME"] = build_cache_path
-                    
-            except Exception as cache_e:
-                print(f"Could not check cache: {cache_e}")
-        
-        # Initialize connection to companion services
-        # The actual Orpheus model runs in separate Modal services:
-        # - orpheus_fastapi_modal.py: Main TTS service
-        # - orpheus_llama_modal.py: LLM inference service
-        print("Orpheus TTS service ready to proxy requests to Modal services")
-        self.orpheus_initialized = True
-
-    @modal.method()
-    def generate_speech(self, text: str, voice: str = "tara"):
-        """Generate speech from text - proxy to Orpheus FastAPI Modal service"""
-        import asyncio
-        import base64
-        import httpx
-        
-        print(f"Proxying speech generation request for text: '{text}' with voice: '{voice}'")
-        
-        async def generate_audio():
-            # Get the Orpheus FastAPI service URL
-            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "https://orpheus-fastapi-tts.modal.run")
-            
-            # Make request to the Orpheus FastAPI Modal service
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                try:
-                    response = await client.post(
-                        f"{orpheus_url}/v1/audio/speech",
-                        json={
-                            "input": text,
-                            "voice": voice,
-                            "model": "orpheus",
-                            "response_format": "wav",
-                            "speed": 1.0
-                        }
-                    )
-                    response.raise_for_status()
-                    
-                    # Get the audio data
-                    audio_data = response.content
-                    
-                    # Convert to base64 for transport
-                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                    
-                    # Calculate approximate duration (24kHz sample rate, 16-bit PCM)
-                    sample_rate = 24000
-                    bytes_per_sample = 2  # 16-bit = 2 bytes
-                    # Note: WAV header is typically 44 bytes
-                    pcm_bytes = len(audio_data) - 44 if len(audio_data) > 44 else len(audio_data)
-                    duration_ms = (pcm_bytes / bytes_per_sample / sample_rate) * 1000
-                    
-                    return {
-                        "success": True,
-                        "audio_base64": audio_base64,
-                        "sample_rate": sample_rate,
-                        "duration_ms": duration_ms,
-                        "total_bytes": len(audio_data)
-                    }
-                    
-                except Exception as e:
-                    print(f"Error calling Orpheus FastAPI service: {e}")
-                    return {
-                        "success": False,
-                        "error": str(e)
-                    }
-        
-        # Run the async generation
-        return asyncio.run(generate_audio())
-    
-    @modal.asgi_app()
-    def web(self):
-        """WebSocket endpoint for Orpheus TTS service"""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-        import asyncio
-        import msgpack
-        import json
-        
-        app = FastAPI(title="Orpheus TTS Service", version="1.0.0")
-        
-        @app.get("/")
-        def root():
-            return {"service": "tts", "model": "orpheus-tts", "status": "ready"}
-        
-        @app.websocket("/ws")
-        async def websocket_endpoint(websocket: WebSocket):
-            print("=== ORPHEUS_TTS_SERVICE: WebSocket connection attempt ===")
-            
-            await websocket.accept()
-            print("=== ORPHEUS_TTS_SERVICE: WebSocket connection accepted ===")
-            
-            try:
-                # Send initial Ready message to client in MessagePack format (not JSON)
-                ready_message = {"type": "Ready"}
-                packed_ready = msgpack.packb(ready_message)
-                await websocket.send_bytes(packed_ready)
-                print("=== ORPHEUS_TTS_SERVICE: Sent Ready message (MessagePack format) ===")
-                
-                while True:
-                    try:
-                        # Receive message from client
-                        data = await websocket.receive_bytes()
-                        print(f"=== ORPHEUS_TTS_SERVICE: Received data: {len(data)} bytes ===")
-                        
-                        # Unpack the message
-                        try:
-                            message = msgpack.unpackb(data)
-                            print(f"=== ORPHEUS_TTS_SERVICE: Unpacked message type: {message.get('type', 'unknown')} ===")
-                            
-                            if message.get("type") == "Text":
-                                text = message.get("text", "")
-                                voice = message.get("voice", "tara")
-                                
-                                print(f"=== ORPHEUS_TTS_SERVICE: Processing text: {text[:50]}... with voice: {voice} ===")
-                                
-                                # Proxy to Orpheus FastAPI Modal service via WebSocket
-                                try:
-                                    import websockets as ws
-                                    orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
-                                    
-                                    # Connect to Orpheus FastAPI streaming endpoint
-                                    stream_url = f"{orpheus_url}/v1/audio/speech/stream/ws?voice={voice}"
-                                    
-                                    async with ws.connect(stream_url) as orpheus_ws:
-                                        # Send text to Orpheus service
-                                        await orpheus_ws.send(text)
-                                        
-                                        # Stream audio chunks back to client
-                                        async for audio_chunk in orpheus_ws:
-                                            if isinstance(audio_chunk, bytes):
-                                                # Send raw PCM bytes directly
-                                                await websocket.send_bytes(audio_chunk)
-                                        
-                                except Exception as e:
-                                    print(f"=== ORPHEUS_TTS_SERVICE: Error generating audio: {e} ===")
-                                    error_message = {
-                                        "type": "Error",
-                                        "message": f"Audio generation failed: {str(e)}"
-                                    }
-                                    packed_error = msgpack.packb(error_message)
-                                    await websocket.send_bytes(packed_error)
-                                    
-                            elif message.get("type") == "Eos":
-                                print("=== ORPHEUS_TTS_SERVICE: Received EOS message ===")
-                                # Send EOS response
-                                eos_response = {"type": "Eos"}
-                                packed_eos = msgpack.packb(eos_response)
-                                await websocket.send_bytes(packed_eos)
-                                
-                        except Exception as e:
-                            print(f"=== ORPHEUS_TTS_SERVICE: Error unpacking message: {e} ===")
-                            continue
-                            
-                    except WebSocketDisconnect:
-                        print("=== ORPHEUS_TTS_SERVICE: Client disconnected ===")
-                        break
-                    except Exception as e:
-                        print(f"=== ORPHEUS_TTS_SERVICE: WebSocket error: {e} ===")
-                        break
-                        
-            except Exception as e:
-                print(f"=== ORPHEUS_TTS_SERVICE: Connection error: {e} ===")
-                
-        return app
-
+# TTSService has been removed - we now use the Orpheus FastAPI Modal service directly
+# The service is defined in unmute/tts/orpheus_fastapi_modal.py
+# Deploy it with: modal deploy unmute/tts/orpheus_fastapi_modal.py
+# Deploy the companion llama.cpp service with: modal deploy unmute/tts/orpheus_llama_modal.py
 
 @app.cls(
     gpu="L40S",
@@ -1243,12 +981,16 @@ class OrchestratorService:
             # In modal serve mode, each service class gets its own -dev URL
             # Pattern: https://username--appname-classname-dev.modal.run
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
+            # Use the Orpheus FastAPI Modal service directly
+            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
+            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
         else:
-            # Production deployment URLs include -web suffix
+            # Production deployment URLs
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-ttsservice-web-dev.modal.run"
+            # Use the Orpheus FastAPI Modal service directly
+            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
+            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
@@ -1522,10 +1264,9 @@ def test_orpheus_tts_websocket():
         test_text = "Hello, this is a WebSocket test of the Orpheus TTS service."
         test_voice = "tara"
         
-        # Get the TTS service URL (this would be set when deployed)
-        # For testing, we'll use the dev URL pattern
-        base_url = "willdavenport--voice-stack"
-        tts_url = f"wss://{base_url}-ttsservice-web-dev.modal.run/ws"
+        # Get the TTS service URL from environment or use default
+        orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "https://orpheus-fastapi-tts.modal.run")
+        tts_url = (orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")) + "/ws"
         
         print(f"Connecting to TTS service at: {tts_url}")
         

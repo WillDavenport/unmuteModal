@@ -44,10 +44,10 @@ Key features:
 - Maintained backward compatibility with existing interfaces
 
 #### B. Updated `modal_app.py`
-- Removed dependency on old `orpheus_tts.py` implementation
-- Changed TTSService to proxy requests to new Modal services
-- Updated WebSocket handler to forward requests to Orpheus FastAPI
-- Simplified initialization (no local model loading required)
+- Completely removed the TTSService class (no longer needed)
+- Updated Orchestrator to connect directly to Orpheus FastAPI Modal service
+- Eliminated proxy layer for better performance and simplicity
+- No local model loading or management required
 
 ### 3. Removed Old Implementation
 - Deleted `unmute/tts/orpheus_tts.py` (old implementation)
@@ -59,19 +59,15 @@ Key features:
 - Deploys services in correct order
 - Provides configuration instructions and test commands
 
-## Architecture
+## Architecture (Simplified)
 
 ```
 ┌─────────────────────────┐
 │   Client Application    │
+│   (Orchestrator)        │
 └───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│    modal_app.py         │
-│   (TTSService Proxy)    │
-└───────────┬─────────────┘
-            │
+            │ Direct WebSocket
+            │ Connection
             ▼
 ┌─────────────────────────┐
 │  Orpheus FastAPI Modal  │◄──────┐
@@ -79,6 +75,7 @@ Key features:
 │     modal.py)           │       │
 │   - SNAC audio gen      │       │
 │   - WebSocket streaming │       │
+│   - OpenAI-compatible   │       │
 └─────────────────────────┘       │
                                   │
                           ┌───────┴──────────┐
@@ -89,6 +86,8 @@ Key features:
                           │ - Token generation│
                           └──────────────────┘
 ```
+
+The architecture has been simplified by removing the proxy layer. The Orchestrator in modal_app.py now connects directly to the Orpheus FastAPI Modal service via WebSocket, eliminating an unnecessary layer of indirection.
 
 ## Configuration
 
@@ -170,13 +169,16 @@ asyncio.run(test_streaming())
 
 ## Benefits of the New Implementation
 
-1. **Separation of Concerns**: TTS and LLM inference run in separate Modal services
-2. **Better Scalability**: Each service can scale independently
-3. **Improved Reliability**: Services can be updated/restarted independently
-4. **OpenAI Compatibility**: Full compatibility with OpenAI TTS API
-5. **Streaming Support**: Real-time audio streaming via WebSocket
-6. **Docker-based Architecture**: Following the orpheus_fast_api Docker setup
-7. **Optimized Performance**: Proper GPU allocation and CUDA optimization
+1. **Simplified Architecture**: Removed unnecessary proxy layer - direct connection to TTS service
+2. **Separation of Concerns**: TTS and LLM inference run in separate Modal services
+3. **Better Scalability**: Each service can scale independently
+4. **Improved Reliability**: Services can be updated/restarted independently
+5. **Reduced Latency**: Direct connection eliminates proxy overhead
+6. **OpenAI Compatibility**: Full compatibility with OpenAI TTS API
+7. **Streaming Support**: Real-time audio streaming via WebSocket
+8. **Docker-based Architecture**: Following the orpheus_fast_api Docker setup
+9. **Optimized Performance**: Proper GPU allocation and CUDA optimization
+10. **Easier Maintenance**: Fewer components to manage and debug
 
 ## Migration Notes
 
