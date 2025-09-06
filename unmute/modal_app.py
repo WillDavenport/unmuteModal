@@ -658,11 +658,11 @@ dim = 6
         return app
 
 
-# Import and include Orpheus TTS services
-from .tts.orpheus_services import orpheus_fastapi_app, orpheus_llama_app
+# Import and include Orpheus TTS services from the new Modal entrypoint
+from .tts.orpheus_modal import app as orpheus_tts_app, llama_app as orpheus_llama_app
 
 # Include the Orpheus services in the main app
-app = app.include(orpheus_fastapi_app).include(orpheus_llama_app)
+app = app.include(orpheus_tts_app).include(orpheus_llama_app)
 
 @app.cls(
     gpu="L40S",
@@ -982,25 +982,26 @@ class OrchestratorService:
             # In modal serve mode, each service class gets its own -dev URL
             # Pattern: https://username--appname-classname-dev.modal.run
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the included Orpheus FastAPI service
-            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-asgi-app-dev.modal.run"
+            # Use the new Orpheus TTS Modal service
+            os.environ["KYUTAI_TTS_URL"] = f"https://{base_url.replace('voice-stack', 'orpheus-tts')}-orpheustts-asgi-app-dev.modal.run/v1/audio/speech"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
             # Set the Orpheus llama.cpp endpoint for the TTS service
-            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url}-orpheusllamacppserver-asgi-app-dev.modal.run/v1/completions"
+            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url.replace('voice-stack', 'orpheus-llama-server')}-orpheusllamaserver-asgi-app-dev.modal.run/v1/completions"
         else:
             # Production deployment URLs
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the included Orpheus FastAPI service
-            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-asgi-app-dev.modal.run"
+            # Use the new Orpheus TTS Modal service
+            os.environ["KYUTAI_TTS_URL"] = f"https://{base_url.replace('voice-stack', 'orpheus-tts')}-orpheustts-asgi-app.modal.run/v1/audio/speech"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
             # Set the Orpheus llama.cpp endpoint for the TTS service
-            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url}-orpheusllamacppserver-asgi-app-dev.modal.run/v1/completions"
+            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url.replace('voice-stack', 'orpheus-llama-server')}-orpheusllamaserver-asgi-app.modal.run/v1/completions"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         
-        # Override paths for Modal services (they use /ws instead of /api/*)
+        # Override paths for Modal services
         os.environ["KYUTAI_STT_PATH"] = "/ws"
-        os.environ["KYUTAI_TTS_PATH"] = "/ws"
+        # TTS now uses REST API, path is included in URL
+        os.environ["KYUTAI_TTS_PATH"] = ""
         
         # Set longer timeout for Modal services which can take time to cold start
         # TTS service takes especially long to start up
