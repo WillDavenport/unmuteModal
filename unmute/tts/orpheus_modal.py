@@ -8,13 +8,54 @@ import os
 # Create Modal app
 app = modal.App("orpheus-tts")
 
-# Create image from the orpheus_fast_api Dockerfile
-orpheus_image = modal.Image.from_dockerfile(
-    "/workspace/unmute/orpheus_fast_api/Dockerfile.gpu",
-    context_mount=modal.Mount.from_local_dir(
-        "/workspace/unmute/orpheus_fast_api",
-        remote_path="/app"
+# Create image by replicating the Dockerfile.gpu steps
+orpheus_image = (
+    modal.Image.from_registry("ubuntu:22.04")
+    .env({"DEBIAN_FRONTEND": "noninteractive"})
+    .apt_install(
+        "python3.10",
+        "python3-pip", 
+        "python3-venv",
+        "libsndfile1",
+        "ffmpeg",
+        "portaudio19-dev"
     )
+    .run_commands(
+        "useradd -m -u 1001 appuser",
+        "mkdir -p /app/outputs /app",
+        "chown -R appuser:appuser /app"
+    )
+    .workdir("/app")
+    .pip_install(
+        "torch==2.5.1",
+        "torchvision", 
+        "torchaudio",
+        index_url="https://download.pytorch.org/whl/cu124"
+    )
+    .pip_install(
+        # Web Server Dependencies
+        "fastapi==0.103.1",
+        "uvicorn==0.23.2", 
+        "jinja2==3.1.2",
+        "pydantic==2.3.0",
+        "python-multipart==0.0.6",
+        # API and Communication
+        "requests==2.31.0",
+        "python-dotenv==1.0.0",
+        "watchfiles==1.0.4",
+        # Audio Processing
+        "numpy==1.24.0",
+        "sounddevice==0.4.6",
+        "snac==1.2.1",
+        # System Utilities  
+        "psutil==5.9.0"
+    )
+    .copy_local_dir("/workspace/unmute/orpheus_fast_api", "/app")
+    .env({
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "/app", 
+        "USE_GPU": "true"
+    })
 )
 
 # Create volume for model storage
@@ -41,6 +82,7 @@ class OrpheusTTS:
         import subprocess
         import time
         import os
+        import threading
         
         print("Initializing Orpheus TTS service...")
         
@@ -50,9 +92,13 @@ class OrpheusTTS:
         os.environ["USE_GPU"] = "true"
         
         # Set up the API URL for the llama.cpp server
-        # This should point to a running llama.cpp server with the Orpheus model
-        # For now, we'll use a placeholder - this should be updated to point to your actual llama.cpp server
-        os.environ["ORPHEUS_API_URL"] = os.environ.get("ORPHEUS_API_URL", "http://localhost:5006/v1/completions")
+        # This will be updated to point to the Modal llama.cpp server
+        llama_endpoint = os.environ.get("ORPHEUS_LLAMA_ENDPOINT")
+        if not llama_endpoint:
+            # Default to the Modal llama server (will be updated by orchestrator)
+            llama_endpoint = "https://willdavenport--orpheus-llama-server-orpheusllamaserver-asgi-app.modal.run/v1/completions"
+        
+        os.environ["ORPHEUS_API_URL"] = llama_endpoint
         
         # Set up model configuration
         os.environ["ORPHEUS_MODEL_NAME"] = os.environ.get("ORPHEUS_MODEL_NAME", "Orpheus-3b-FT-Q8_0.gguf")
@@ -65,8 +111,32 @@ class OrpheusTTS:
         print(f"API URL: {os.environ.get('ORPHEUS_API_URL')}")
         print(f"Model: {os.environ.get('ORPHEUS_MODEL_NAME')}")
         
-        # The Docker image's CMD will automatically start the FastAPI server
-        # We don't need to start it manually since Modal will handle that
+        # Start the FastAPI server in a background thread
+        def start_server():
+            os.chdir("/app")
+            subprocess.run([
+                "uvicorn", "app:app", 
+                "--host", "0.0.0.0", 
+                "--port", "5005", 
+                "--workers", "1"
+            ])
+        
+        self.server_thread = threading.Thread(target=start_server, daemon=True)
+        self.server_thread.start()
+        
+        # Wait for server to start
+        import requests
+        for i in range(30):  # Wait up to 30 seconds
+            try:
+                response = requests.get("http://localhost:5005/", timeout=5)
+                if response.status_code == 200:
+                    print("FastAPI server is ready")
+                    break
+            except:
+                pass
+            time.sleep(1)
+        else:
+            print("Warning: FastAPI server may not be ready")
         
     @modal.method()
     def generate_speech(self, text: str, voice: str = "tara", response_format: str = "wav") -> bytes:
@@ -159,9 +229,10 @@ class OrpheusTTS:
 llama_app = modal.App("orpheus-llama-server")
 
 # Use the official llama.cpp server image with CUDA support
-llama_image = modal.Image.from_registry(
-    "ghcr.io/ggml-org/llama.cpp:server-cuda"
-).pip_install("huggingface_hub")
+llama_image = (
+    modal.Image.from_registry("ghcr.io/ggml-org/llama.cpp:server-cuda")
+    .pip_install("huggingface_hub", "requests")
+)
 
 @llama_app.cls(
     image=llama_image,
@@ -216,7 +287,7 @@ class OrpheusLlamaServer:
         max_tokens = int(os.environ.get("ORPHEUS_MAX_TOKENS", "8192"))
         
         cmd = [
-            "/app/llama-server",
+            "llama-server",  # Binary should be in PATH in the official image
             "-m", model_path,
             "--port", "5006",
             "--host", "0.0.0.0",

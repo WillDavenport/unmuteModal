@@ -35,12 +35,20 @@ def check_modal_auth():
         result = subprocess.run(["modal", "token", "show"], capture_output=True, text=True)
         if result.returncode == 0:
             print("✅ Modal authentication verified")
+            print(f"Token info: {result.stdout.strip()}")
             return True
         else:
-            print("❌ Modal not authenticated. Please run: modal token new")
+            print("❌ Modal not authenticated.")
+            print("Please run: modal token new")
+            print("Then try this deployment script again.")
             return False
     except FileNotFoundError:
-        print("❌ Modal CLI not found. Please install with: pip install modal")
+        print("❌ Modal CLI not found.")
+        print("Please install Modal first:")
+        print("  pip install modal")
+        print("Then authenticate:")
+        print("  modal token new")
+        print("Then try this deployment script again.")
         return False
 
 def main():
