@@ -502,11 +502,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
 
     async def start_up(self):
         """Initialize connection to Orpheus FastAPI Modal service."""
-        # For Modal Orpheus FastAPI services, connect to the streaming endpoint
+        # For Modal Orpheus FastAPI services, connect to the /ws endpoint
         if "modal.run" in self.tts_base_url:
-            url = f"{self.tts_base_url}/v1/audio/speech/stream/ws"
+            url = f"{self.tts_base_url}/ws"
         else:
-            # Fallback for local testing
+            # Fallback for local testing - use the full path for local Orpheus FastAPI
             url = f"{self.tts_base_url}/v1/audio/speech/stream/ws"
             
         logger.info(f"Connecting to Orpheus FastAPI TTS: {url}")
@@ -555,9 +555,14 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         mt.TTS_ACTIVE_SESSIONS.inc()
         
         try:
-            # Send text directly to the WebSocket for streaming generation
-            # The Modal service expects plain text over WebSocket for streaming
-            await self.websocket.send(text)
+            # Send text as MessagePack-encoded message to match server expectations
+            message = {
+                "type": "Text",
+                "text": text,
+                "voice": self.voice
+            }
+            packed_message = msgpack.packb(message)
+            await self.websocket.send(packed_message)
             logger.info("Text sent to Orpheus FastAPI successfully")
             
         except Exception as e:
@@ -608,9 +613,30 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             # Process raw audio bytes from Orpheus FastAPI Modal service
             async for message_bytes in self.websocket:
                 if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
+                    # First, attempt to parse as msgpack control/error frames
+                    try:
+                        maybe_msg = msgpack.unpackb(message_bytes)
+                        if isinstance(maybe_msg, dict) and "type" in maybe_msg:
+                            mtype = maybe_msg.get("type")
+                            if mtype == "Ready":
+                                logger.debug("Received Ready from Orpheus FastAPI")
+                                continue
+                            if mtype == "Error":
+                                err = maybe_msg.get("message", "unknown error")
+                                logger.error(f"Orpheus FastAPI reported error: {err}")
+                                continue
+                    except Exception:
+                        # Not a msgpack control frame; proceed to treat as PCM
+                        pass
+
                     # Orpheus FastAPI outputs raw 16-bit PCM bytes at 24kHz
                     # Convert to float32 samples for the audio pipeline
                     try:
+                        # Ensure buffer size is a multiple of 2 bytes (int16)
+                        if len(message_bytes) % 2 != 0:
+                            logger.warning(f"PCM buffer size {len(message_bytes)} is not a multiple of 2, padding with zero")
+                            message_bytes = message_bytes + b'\x00'
+                        
                         audio_data = np.frombuffer(message_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                         
                         if self.waiting_first_audio and self.time_since_request_sent.started:

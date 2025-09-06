@@ -658,10 +658,11 @@ dim = 6
         return app
 
 
-# TTSService has been removed - we now use the Orpheus FastAPI Modal service directly
-# The service is defined in unmute/tts/orpheus_fastapi_modal.py
-# Deploy it with: modal deploy unmute/tts/orpheus_fastapi_modal.py
-# Deploy the companion llama.cpp service with: modal deploy unmute/tts/orpheus_llama_modal.py
+# Import and include Orpheus TTS services
+from .tts.orpheus_services import orpheus_fastapi_app, orpheus_llama_app
+
+# Include the Orpheus services in the main app
+app = app.include(orpheus_fastapi_app).include(orpheus_llama_app)
 
 @app.cls(
     gpu="L40S",
@@ -981,17 +982,19 @@ class OrchestratorService:
             # In modal serve mode, each service class gets its own -dev URL
             # Pattern: https://username--appname-classname-dev.modal.run
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the Orpheus FastAPI Modal service directly
-            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
-            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
+            # Use the included Orpheus FastAPI service
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-asgi-app-dev.modal.run"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
+            # Set the Orpheus llama.cpp endpoint for the TTS service
+            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url}-orpheusllamacppserver-asgi-app-dev.modal.run/v1/completions"
         else:
             # Production deployment URLs
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the Orpheus FastAPI Modal service directly
-            orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "wss://orpheus-fastapi-tts.modal.run")
-            os.environ["KYUTAI_TTS_URL"] = orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")
+            # Use the included Orpheus FastAPI service
+            os.environ["KYUTAI_TTS_URL"] = f"wss://{base_url}-orpheusfastapiservice-asgi-app-dev.modal.run"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
+            # Set the Orpheus llama.cpp endpoint for the TTS service
+            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url}-orpheusllamacppserver-asgi-app-dev.modal.run/v1/completions"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         
@@ -1147,280 +1150,6 @@ class OrchestratorService:
                 await _report_websocket_exception(websocket, exc)
         
         return app
-
-
-# Additional functions for deployment and health checks
-@app.function(image=orchestrator_image)
-def deploy():
-    """Deploy the voice stack application to Modal."""
-    print("Deploying voice stack application to Modal...")
-    print("Architecture: Orchestrator (CPU) + STT (L4) + LLM (L40S) + TTS (L4)")
-    return "Deployment complete"
-
-@app.function(image=orchestrator_image)
-def health_check():
-    """Check the health of all services."""
-    print("Checking health of all services...")
-    return {
-        "orchestrator": "healthy",
-        "stt": "healthy", 
-        "llm": "healthy",
-        "tts": "healthy",
-        "timestamp": "2025-01-14"
-    }
-
-@app.local_entrypoint()
-def test_orpheus_tts():
-    """Test the Orpheus TTS service."""
-    import time
-    
-    start_time = time.time()
-    print("Testing Orpheus TTS Service...")
-    print("Note: Timeout increased to 15 minutes to allow for model download")
-    print("Note: Subsequent runs will be faster due to model caching")
-    
-    # Test text
-    test_text = "This is a test of the Orpheus TTS service in our Modal deployment."
-    
-    try:
-        # Create service instance and test the new generate_speech method
-        service = TTSService()
-        
-        print(f"Generating speech for: '{test_text}'")
-        print("Note: Model loading happens automatically when container starts (@modal.enter)")
-        print("This may take up to 15 minutes on first run while downloading the 3B model...")
-        
-        # Call the generate_speech method (this will trigger @modal.enter() automatically)
-        generation_start = time.time()
-        result = service.generate_speech.remote(test_text, "tara")
-        generation_time = time.time() - generation_start
-        
-        if result["success"]:
-            print(f"Speech generation successful!")
-            print(f"Generation time: {generation_time:.2f}s")
-            print(f"Sample rate: {result['sample_rate']} Hz")
-            print(f"Duration: {result['duration_ms']:.2f}ms")
-            print(f"Chunks generated: {result['chunk_count']}")
-            print(f"Total audio bytes: {result['total_bytes']}")
-            print(f"Audio data length (base64): {len(result['audio_base64'])} characters")
-            
-            # Optionally save audio to file for testing
-            import base64
-            audio_bytes = base64.b64decode(result['audio_base64'])
-            with open("orpheus_test_output.raw", "wb") as f:
-                f.write(audio_bytes)
-            print("Raw audio saved to orpheus_test_output.raw")
-            print("To play: ffplay -f s16le -ar 24000 -ac 1 orpheus_test_output.raw")
-            
-            # Also create a WAV file for easier playback
-            try:
-                import wave
-                import numpy as np
-                
-                # Convert bytes to numpy array
-                audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                
-                with wave.open("orpheus_test_output.wav", "wb") as wav_file:
-                    wav_file.setnchannels(1)  # Mono
-                    wav_file.setsampwidth(2)  # 16-bit
-                    wav_file.setframerate(24000)  # 24kHz
-                    wav_file.writeframes(audio_bytes)
-                
-                print("WAV audio saved to orpheus_test_output.wav")
-                
-            except ImportError:
-                print("Note: Install 'wave' package to generate WAV files")
-            except Exception as e:
-                print(f"Warning: Could not create WAV file: {e}")
-            
-        else:
-            print(f"Speech generation failed: {result.get('error', 'Unknown error')}")
-            
-    except Exception as e:
-        print(f"Error testing Orpheus TTS: {e}")
-        import traceback
-        print(f"Traceback: {traceback.format_exc()}")
-        raise
-    finally:
-        total_time = time.time() - start_time
-        print(f"Total test time: {total_time:.2f}s")
-
-
-@app.local_entrypoint()
-def test_orpheus_tts_websocket():
-    """Test the Orpheus TTS service via WebSocket interface."""
-    import time
-    
-    start_time = time.time()
-    print("Testing Orpheus TTS Service via WebSocket...")
-    
-    import asyncio
-    import msgpack
-    import base64
-    import websockets
-    
-    async def test_websocket():
-        # Test text
-        test_text = "Hello, this is a WebSocket test of the Orpheus TTS service."
-        test_voice = "tara"
-        
-        # Get the TTS service URL from environment or use default
-        orpheus_url = os.environ.get("ORPHEUS_FASTAPI_URL", "https://orpheus-fastapi-tts.modal.run")
-        tts_url = (orpheus_url if orpheus_url.startswith("wss://") else orpheus_url.replace("https://", "wss://")) + "/ws"
-        
-        print(f"Connecting to TTS service at: {tts_url}")
-        
-        # Retry logic for connection (service might be downloading model)
-        max_retries = 5
-        retry_delay = 30  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                print(f"Connection attempt {attempt + 1}/{max_retries}...")
-                if attempt > 0:
-                    print(f"Waiting {retry_delay}s before retry (service may be downloading model)...")
-                    await asyncio.sleep(retry_delay)
-                
-                return await _attempt_websocket_connection(tts_url, test_text, test_voice)
-                
-            except (TimeoutError, ConnectionRefusedError, OSError) as e:
-                if attempt == max_retries - 1:
-                    print(f"All connection attempts failed. Last error: {e}")
-                    return False
-                else:
-                    print(f"Connection attempt {attempt + 1} failed: {e}")
-                    print("This is likely because the Orpheus model is still downloading...")
-                    continue
-            except Exception as e:
-                print(f"Unexpected error on attempt {attempt + 1}: {e}")
-                if attempt == max_retries - 1:
-                    return False
-                continue
-        
-        return False
-    
-    async def _attempt_websocket_connection(tts_url, test_text, test_voice):
-        try:
-            connection_start = time.time()
-            # Set a longer timeout for the initial connection (model might be loading)
-            async with websockets.connect(tts_url, open_timeout=60) as websocket:
-                connection_time = time.time() - connection_start
-                print(f"Connected to Orpheus TTS WebSocket (took {connection_time:.2f}s)")
-                
-                # Wait for Ready message
-                ready_start = time.time()
-                ready_data = await websocket.recv()
-                ready_time = time.time() - ready_start
-                ready_message = msgpack.unpackb(ready_data)
-                print(f"Received Ready message: {ready_message} (took {ready_time:.2f}s)")
-                
-                if ready_message.get("type") != "Ready":
-                    print(f"Warning: Expected Ready message, got: {ready_message}")
-                
-                # Send text message
-                text_message = {
-                    "type": "Text",
-                    "text": test_text,
-                    "voice": test_voice
-                }
-                
-                send_start = time.time()
-                packed_message = msgpack.packb(text_message)
-                await websocket.send(packed_message)
-                send_time = time.time() - send_start
-                print(f"Sent text message: '{test_text}' with voice: '{test_voice}' (took {send_time:.3f}s)")
-                
-                # Collect audio chunks (raw bytes from Orpheus)
-                audio_chunks = []
-                chunk_count = 0
-                first_chunk_time = None
-                audio_start_time = time.time()
-                
-                try:
-                    while True:
-                        # Receive raw bytes directly from Orpheus TTS
-                        data = await asyncio.wait_for(websocket.recv(), timeout=60.0)  # Increased timeout
-                        
-                        if first_chunk_time is None:
-                            first_chunk_time = time.time() - audio_start_time
-                        
-                        # Orpheus sends raw PCM bytes, not msgpack messages
-                        if isinstance(data, bytes) and len(data) > 0:
-                            audio_chunks.append(data)
-                            chunk_count += 1
-                            print(f"Received raw audio chunk {chunk_count}: {len(data)} bytes")
-                        else:
-                            # Check if it might be a control message
-                            try:
-                                message = msgpack.unpackb(data)
-                                if message.get("type") == "Error":
-                                    error_msg = message.get("message", "Unknown error")
-                                    print(f"Received error from TTS: {error_msg}")
-                                    return False
-                                elif message.get("type") == "Eos":
-                                    print("Received End of Stream message")
-                                    break
-                                else:
-                                    print(f"Received unexpected message type: {message.get('type')}")
-                            except:
-                                # Not a msgpack message, might be end of stream
-                                print(f"Received non-audio data: {type(data)} length {len(data) if hasattr(data, '__len__') else 'unknown'}")
-                                break
-                            
-                except asyncio.TimeoutError:
-                    print("Timeout waiting for audio data - stream ended")
-                
-                audio_generation_time = time.time() - audio_start_time
-                
-                if audio_chunks:
-                    # Combine all audio chunks
-                    combined_audio = b''.join(audio_chunks)
-                    total_bytes = len(combined_audio)
-                    
-                    print(f"WebSocket test successful!")
-                    print(f"Time to first audio chunk: {first_chunk_time:.2f}s")
-                    print(f"Total audio generation time: {audio_generation_time:.2f}s")
-                    print(f"Total audio chunks: {chunk_count}")
-                    print(f"Total audio bytes: {total_bytes}")
-                    
-                    # Calculate approximate duration (24kHz, 16-bit PCM)
-                    sample_rate = 24000
-                    bytes_per_sample = 2
-                    duration_ms = (total_bytes / bytes_per_sample / sample_rate) * 1000
-                    print(f"Approximate duration: {duration_ms:.2f}ms")
-                    
-                    # Calculate real-time factor (generation time vs audio duration)
-                    rtf = audio_generation_time / (duration_ms / 1000)
-                    print(f"Real-time factor: {rtf:.2f}x (lower is better)")
-                    
-                    # Save audio file
-                    with open("orpheus_websocket_test_output.raw", "wb") as f:
-                        f.write(combined_audio)
-                    print("Audio saved to orpheus_websocket_test_output.raw")
-                    print("To play: ffplay -f s16le -ar 24000 -ac 1 orpheus_websocket_test_output.raw")
-                    
-                    return True
-                else:
-                    print("No audio chunks received!")
-                    return False
-                    
-        except Exception as e:
-            print(f"WebSocket connection attempt failed: {e}")
-            raise  # Re-raise to be caught by retry logic
-    
-    # Run the async test
-    try:
-        result = asyncio.run(test_websocket())
-        if result:
-            print("✅ Orpheus TTS WebSocket test PASSED")
-        else:
-            print("❌ Orpheus TTS WebSocket test FAILED")
-    except Exception as e:
-        print(f"❌ Orpheus TTS WebSocket test ERROR: {e}")
-    finally:
-        total_time = time.time() - start_time
-        print(f"Total WebSocket test time: {total_time:.2f}s")
-
 
 if __name__ == "__main__":
     # For local development

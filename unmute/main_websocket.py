@@ -39,21 +39,12 @@ from unmute.exceptions import (
 )
 from unmute.kyutai_constants import (
     LLM_SERVER,
-    MAX_VOICE_FILE_SIZE_MB,
     SAMPLE_RATE,
     STT_SERVER,
     TTS_SERVER,
-    VOICE_CLONING_SERVER,
 )
 from unmute.service_discovery import async_ttl_cached
 from unmute.timer import Stopwatch
-from unmute.tts.voice_cloning import clone_voice
-from unmute.tts.voice_donation import (
-    VoiceDonationSubmission,
-    generate_verification,
-    submit_voice_donation,
-)
-from unmute.tts.voices import VoiceList
 from unmute.conversation_handler import ConversationUnmuteHandler
 from unmute.conversation import ConversationManager
 
@@ -137,12 +128,10 @@ class HealthStatus(BaseModel):
     tts_up: bool
     stt_up: bool
     llm_up: bool
-    voice_cloning_up: bool
 
     @computed_field
     @property
     def ok(self) -> bool:
-        # Note that voice cloning is not required for the server to be healthy.
         return self.tts_up and self.stt_up and self.llm_up
 
 
@@ -172,13 +161,7 @@ async def _get_health(
         else:
             llm_endpoint += "/v1/models"  # Local VLLM servers
         
-        voice_cloning_endpoint = _ws_to_http(VOICE_CLONING_SERVER)
-        if "modal.run" in voice_cloning_endpoint:
-            voice_cloning_endpoint += "/"  # Modal services use root endpoint
-        else:
-            voice_cloning_endpoint += "/api/build_info"  # Local Moshi servers
-        
-        print(f"=== HEALTH_CHECK: Checking endpoints - TTS: {tts_endpoint}, STT: {stt_endpoint}, LLM: {llm_endpoint}, Voice: {voice_cloning_endpoint} ===")
+        print(f"=== HEALTH_CHECK: Checking endpoints - TTS: {tts_endpoint}, STT: {stt_endpoint}, LLM: {llm_endpoint} ===")
         
         tts_up = tg.create_task(
             asyncio.to_thread(_check_server_status, tts_endpoint)
@@ -189,19 +172,14 @@ async def _get_health(
         llm_up = tg.create_task(
             asyncio.to_thread(_check_server_status, llm_endpoint)
         )
-        voice_cloning_up = tg.create_task(
-            asyncio.to_thread(_check_server_status, voice_cloning_endpoint)
-        )
         tts_up_res = await tts_up
         stt_up_res = await stt_up
         llm_up_res = await llm_up
-        voice_cloning_up_res = await voice_cloning_up
 
     health_result = HealthStatus(
         tts_up=tts_up_res,
         stt_up=stt_up_res,
         llm_up=llm_up_res,
-        voice_cloning_up=voice_cloning_up_res,
     )
     print(f"=== HEALTH_CHECK: Health check completed: {health_result} ===")
     return health_result
@@ -212,19 +190,6 @@ async def get_health():
     health = await _get_health(None)
     mt.HEALTH_OK.observe(health.ok)
     return health
-
-
-@app.get("/v1/voices")
-@cache
-def voices():
-    voice_list = VoiceList()
-    # Note that `voice.good` is bool | None, here we really take only True values.
-    good_voices = [
-        voice.model_dump(exclude={"comment"})
-        for voice in voice_list.voices
-        if voice.good
-    ]
-    return good_voices
 
 
 class LimitUploadSizeForPath(BaseHTTPMiddleware):
@@ -245,64 +210,6 @@ class LimitUploadSizeForPath(BaseHTTPMiddleware):
                 return Response(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 
         return await call_next(request)
-
-
-app.add_middleware(
-    LimitUploadSizeForPath,
-    max_upload_size=MAX_VOICE_FILE_SIZE_MB * 1024 * 1024,
-    path="/v1/voices",
-)
-
-
-@app.post("/v1/voices")
-async def post_voices(file: UploadFile):
-    """Upload a voice list file.
-
-    Make sure the maximum file size is configured in uvicorn.
-    """
-    name = clone_voice(file.file.read())
-    return {"name": name}
-
-
-@app.get("/v1/voice-donation")
-async def get_voice_donation():
-    """Initiate a voice donation by asking for a verification text."""
-    verification = generate_verification()
-    return verification
-
-
-app.add_middleware(
-    LimitUploadSizeForPath,
-    max_upload_size=MAX_VOICE_FILE_SIZE_MB * 1024 * 1024,
-    path="/v1/voice-donation",
-)
-
-
-@app.post("/v1/voice-donation")
-async def post_voice_donation(
-    file: UploadFile = File(...),  # noqa: B008
-    metadata: str = Form(...),
-):
-    """Finish a voice donation."""
-    file_bytes = file.file.read()
-
-    try:
-        metadata_parsed = VoiceDonationSubmission(**json.loads(metadata))
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
-    except ValidationError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid submission: {e.errors()}",
-        ) from e
-
-    try:
-        submit_voice_donation(metadata_parsed, file_bytes)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-    return {}
-
 
 @app.websocket("/v1/realtime")
 async def websocket_route(websocket: WebSocket):
