@@ -19,10 +19,17 @@ This guide will help you deploy the new Orpheus TTS Modal services that replace 
 
 ## Files Overview
 
-- `unmute/tts/orpheus_modal.py` - New Modal entrypoint with two apps
+- `unmute/tts/orpheus_modal.py` - New Modal entrypoint with two apps (Updated for Modal 1.0 API)
 - `unmute/modal_app.py` - Updated orchestrator to use new services  
 - `deploy_orpheus_modal.py` - Automated deployment script
 - `unmute/tts/orpheus_services.py` - Cleared out (old implementation)
+
+## ⚠️ Modal 1.0 API Update
+
+The code has been updated to use the correct Modal 1.0 API:
+- Uses `modal.Image.from_dockerfile()` instead of deprecated methods
+- Follows the official Modal documentation for Docker image building
+- Compatible with current Modal CLI versions
 
 ## Deployment Steps
 

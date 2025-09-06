@@ -8,54 +8,10 @@ import os
 # Create Modal app
 app = modal.App("orpheus-tts")
 
-# Create image by replicating the Dockerfile.gpu steps
-orpheus_image = (
-    modal.Image.from_registry("ubuntu:22.04")
-    .env({"DEBIAN_FRONTEND": "noninteractive"})
-    .apt_install(
-        "python3.10",
-        "python3-pip", 
-        "python3-venv",
-        "libsndfile1",
-        "ffmpeg",
-        "portaudio19-dev"
-    )
-    .run_commands(
-        "useradd -m -u 1001 appuser",
-        "mkdir -p /app/outputs /app",
-        "chown -R appuser:appuser /app"
-    )
-    .workdir("/app")
-    .pip_install(
-        "torch==2.5.1",
-        "torchvision", 
-        "torchaudio",
-        index_url="https://download.pytorch.org/whl/cu124"
-    )
-    .pip_install(
-        # Web Server Dependencies
-        "fastapi==0.103.1",
-        "uvicorn==0.23.2", 
-        "jinja2==3.1.2",
-        "pydantic==2.3.0",
-        "python-multipart==0.0.6",
-        # API and Communication
-        "requests==2.31.0",
-        "python-dotenv==1.0.0",
-        "watchfiles==1.0.4",
-        # Audio Processing
-        "numpy==1.24.0",
-        "sounddevice==0.4.6",
-        "snac==1.2.1",
-        # System Utilities  
-        "psutil==5.9.0"
-    )
-    .copy_local_dir("/workspace/unmute/orpheus_fast_api", "/app")
-    .env({
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": "/app", 
-        "USE_GPU": "true"
-    })
+# Use the from_dockerfile approach as recommended in Modal docs
+orpheus_image = modal.Image.from_dockerfile(
+    "unmute/orpheus_fast_api/Dockerfile.gpu",
+    context="unmute/orpheus_fast_api"
 )
 
 # Create volume for model storage
