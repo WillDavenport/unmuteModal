@@ -659,10 +659,10 @@ dim = 6
 
 
 # Import and include Orpheus TTS services from the new Modal entrypoint
-from .tts.orpheus_modal import app as orpheus_tts_app, llama_app as orpheus_llama_app
+from .tts.orpheus_modal import app as orpheus_tts_app
 
-# Include the Orpheus services in the main app
-app = app.include(orpheus_tts_app).include(orpheus_llama_app)
+# Include the Orpheus TTS service in the main app
+app = app.include(orpheus_tts_app)
 
 @app.cls(
     gpu="L40S",

@@ -32,3 +32,8 @@ orpheus_test_output.wav
 orpheus_test_output.raw
 orpheus_websocket_test_output.wav
 orpheus_websocket_test_output.raw
+orpheus_streaming_test_output.wav
+orpheus_streaming_test_output_1.wav
+orpheus_streaming_test_output_2.wav
+orpheus_test_output_1.wav
+orpheus_test_output_2.wav
