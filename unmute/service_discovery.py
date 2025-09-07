@@ -60,10 +60,10 @@ async def get_instances(service_name: str) -> list[str]:
     print(f"=== SERVICE_DISCOVERY: Getting instances for {service_name}, base URL: {url} ===")
     protocol, remaining = url.split("://", 1)
     
-    # For secure protocols (wss, https), don't resolve to IP addresses
-    # to avoid SSL certificate validation issues
-    if protocol in ("wss", "https"):
-        print(f"=== SERVICE_DISCOVERY: Using secure protocol {protocol}, returning original URL ===")
+    # For secure protocols (wss, https) OR Modal services, don't resolve to IP addresses
+    # to avoid SSL certificate validation issues and Modal routing problems
+    if protocol in ("wss", "https") or "modal.run" in url:
+        print(f"=== SERVICE_DISCOVERY: Using secure protocol {protocol} or Modal service, returning original URL ===")
         return [url]
     
     # Handle URLs with and without explicit ports for non-secure protocols
@@ -76,7 +76,7 @@ async def get_instances(service_name: str) -> list[str]:
         print(f"=== SERVICE_DISCOVERY: Resolved to {len(ips)} IPs: {result} ===")
         return result
     else:
-        # No explicit port in URL (e.g., Modal URLs)
+        # No explicit port in URL (e.g., local services)
         hostname = remaining
         print(f"=== SERVICE_DISCOVERY: Resolving hostname {hostname} (no port) ===")
         ips = list(await _resolve(hostname))

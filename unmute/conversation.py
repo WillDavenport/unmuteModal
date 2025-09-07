@@ -144,7 +144,6 @@ class Conversation:
                 OrpheusTextToSpeech,
                 recorder=self.recorder,
                 get_time=lambda: self.n_samples_received / SAMPLE_RATE,
-                voice=self.tts_voice,
             )
             self.tts = await find_instance("tts", factory)
             logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
@@ -207,17 +206,21 @@ class Conversation:
     async def _tts_loop(self, generating_message_i: int):
         """Main TTS processing loop."""
         if not self.tts:
+            logger.warning(f"TTS is None, cannot start TTS loop for conversation {self.conversation_id}")
             return
             
-        logger.info(f"Starting TTS loop for conversation {self.conversation_id}")
+        logger.info(f"Starting TTS loop for conversation {self.conversation_id} with TTS type: {type(self.tts).__name__}")
         output_queue = self.output_queue
         
         try:
             audio_started = None
             message_count = 0
+            
+            logger.info(f"Beginning TTS message iteration for conversation {self.conversation_id}")
 
             async for message in self.tts:
                 if self.shutdown_event.is_set():
+                    logger.info(f"Shutdown event set, breaking TTS loop for conversation {self.conversation_id}")
                     break
                     
                 message_count += 1
@@ -228,8 +231,6 @@ class Conversation:
                     logger.info("Response interrupted, breaking TTS loop")
                     break
 
-                logger.info(f"TTS message type: {type(message)}")
-                
                 if isinstance(message, TTSAudioMessage):
                     logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
                     t = self.tts_output_stopwatch.stop()
@@ -239,11 +240,12 @@ class Conversation:
                     audio = np.array(message.pcm, dtype=np.float32)
                     
                     # Output as tuple for FastRTC compatibility
+                    logger.info(f"Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz")
                     await output_queue.put((SAMPLE_RATE, audio))
 
                     if audio_started is None:
                         audio_started = self.n_samples_received / SAMPLE_RATE
-                        logger.info("First audio message received")
+                        logger.info("First audio message received and queued to output")
 
                 elif isinstance(message, TTSTextMessage):
                     logger.info(f"Processing TTSTextMessage: {message.text}")
@@ -254,10 +256,14 @@ class Conversation:
                         generating_message_i=generating_message_i,
                     )
                 else:
-                    logger.warning("Got unexpected message from TTS: %s", message.type)
+                    logger.warning("Got unexpected message from TTS: %s", type(message).__name__)
 
         except websockets.ConnectionClosedError as e:
             logger.error(f"TTS CONNECTION CLOSED WITH ERROR: {e}")
+        except Exception as e:
+            logger.error(f"TTS loop error for conversation {self.conversation_id}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
 
         logger.info("TTS loop ended, cleaning up")
         

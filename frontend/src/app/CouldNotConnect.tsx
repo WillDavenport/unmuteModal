@@ -4,7 +4,6 @@ import UnmuteHeader from "./UnmuteHeader";
 export type HealthStatus = {
   connected: "no" | "yes_request_ok" | "yes_request_fail";
   ok: boolean;
-  tts_up?: boolean;
   stt_up?: boolean;
   llm_up?: boolean;
   voice_cloning_up?: boolean;
@@ -64,7 +63,6 @@ const CouldNotConnect = ({ healthStatus }: { healthStatus: HealthStatus }) => {
         )}
         {renderServiceStatus("STT", healthStatus.stt_up)}
         {renderServiceStatus("LLM", healthStatus.llm_up)}
-        {renderServiceStatus("TTS", healthStatus.tts_up)}
         {renderServiceStatus(
           "Voice cloning",
           healthStatus.voice_cloning_up,

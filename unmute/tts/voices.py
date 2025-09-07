@@ -88,8 +88,11 @@ async def text_to_speech_non_streaming(
     async def websocket_client():
         uri = f"{url}/api/tts_streaming?voice={voice}&{CFG_PARAM}"
 
+        # Modal services don't require the kyutai-api-key header
+        headers = {} if "modal.run" in url else HEADERS
+        
         async with await asyncio.wait_for(
-            websockets.connect(uri, additional_headers=HEADERS),
+            websockets.connect(uri, additional_headers=headers),
             timeout=60.0  # Allow 60 seconds for cold start
         ) as websocket:
             send_task = asyncio.create_task(send_messages(websocket))

@@ -125,14 +125,13 @@ async def debug_running_tasks():
 
 
 class HealthStatus(BaseModel):
-    tts_up: bool
     stt_up: bool
     llm_up: bool
 
     @computed_field
     @property
     def ok(self) -> bool:
-        return self.tts_up and self.stt_up and self.llm_up
+        return self.stt_up and self.llm_up
 
 
 @partial(async_ttl_cached, ttl_sec=0.5)
@@ -143,16 +142,6 @@ async def _get_health(
     async with asyncio.TaskGroup() as tg:
         # For Modal deployment, check root endpoints instead of specific API paths
         # This allows the health check to work with both local Moshi servers and Modal services
-        tts_endpoint = _ws_to_http(TTS_SERVER)
-        if "modal.run" in tts_endpoint:
-            # For Orpheus TTS Modal service, extract base URL and use /health endpoint
-            if "/ws" in tts_endpoint:
-                tts_endpoint = tts_endpoint.replace("/ws", "/health")
-            else:
-                tts_endpoint += "/"  # Other Modal services use root endpoint
-        else:
-            tts_endpoint += "/api/build_info"  # Local Moshi servers
-        
         stt_endpoint = _ws_to_http(STT_SERVER)
         if "modal.run" in stt_endpoint:
             stt_endpoint += "/"  # Modal services use root endpoint
@@ -165,23 +154,18 @@ async def _get_health(
         else:
             llm_endpoint += "/v1/models"  # Local VLLM servers
         
-        print(f"=== HEALTH_CHECK: Checking endpoints - TTS: {tts_endpoint}, STT: {stt_endpoint}, LLM: {llm_endpoint} ===")
+        print(f"=== HEALTH_CHECK: Checking endpoints - STT: {stt_endpoint}, LLM: {llm_endpoint} ===")
         
-        tts_up = tg.create_task(
-            asyncio.to_thread(_check_server_status, tts_endpoint)
-        )
         stt_up = tg.create_task(
             asyncio.to_thread(_check_server_status, stt_endpoint)
         )
         llm_up = tg.create_task(
             asyncio.to_thread(_check_server_status, llm_endpoint)
         )
-        tts_up_res = await tts_up
         stt_up_res = await stt_up
         llm_up_res = await llm_up
 
     health_result = HealthStatus(
-        tts_up=tts_up_res,
         stt_up=stt_up_res,
         llm_up=llm_up_res,
     )

@@ -18,11 +18,12 @@ OPTIMIZATION: Essential model weights are pre-downloaded during image build to r
 import modal
 import logging
 import os
+from .tts.orpheus_modal import orpheus_tts_app
 
 logger = logging.getLogger(__name__)
 
 # Modal app definition
-app = modal.App("voice-stack")
+app = modal.App("voice-stack").include(orpheus_tts_app)
 
 # Configuration constants
 MINUTES = 60
@@ -959,7 +960,7 @@ class OrchestratorService:
             return {
                 "service": "orchestrator",
                 "status": "ready",
-                "services": ["stt", "llm", "tts"]
+                "services": ["stt", "llm"]
             }
         
         @app.get("/v1/health")

@@ -23,7 +23,6 @@ from unmute.recorder import Recorder
 from unmute.service_discovery import ServiceWithStartup
 from unmute.timer import Stopwatch
 from unmute.tts.realtime_queue import RealtimeQueue
-from unmute.tts.voice_cloning import voice_embeddings_cache
 from unmute.websocket_utils import WebsocketState
 
 logger = getLogger(__name__)
@@ -34,12 +33,6 @@ class TTSClientTextMessage(BaseModel):
 
     type: Literal["Text"] = "Text"
     text: str
-
-
-class TTSClientVoiceMessage(BaseModel):
-    type: Literal["Voice"] = "Voice"
-    embeddings: list[float]
-    shape: list[int]
 
 
 class TTSClientEosMessage(BaseModel):
@@ -55,7 +48,7 @@ class TTSQueuedEosMessage(BaseModel):
 
 
 TTSClientMessage = Annotated[
-    Union[TTSClientTextMessage, TTSClientVoiceMessage, TTSClientEosMessage],
+    Union[TTSClientTextMessage, TTSClientEosMessage],
     Field(discriminator="type"),
 ]
 TTSClientMessageAdapter = TypeAdapter(TTSClientMessage)
@@ -145,7 +138,6 @@ class TextToSpeech(ServiceWithStartup):
         # record the true time of the messages.
         recorder: Recorder | None = None,
         get_time: Callable[[], float] | None = None,
-        voice: str | None = None,
     ):
         self.tts_base_url = tts_base_url
         self.recorder = recorder
@@ -158,13 +150,9 @@ class TextToSpeech(ServiceWithStartup):
         # Number of samples that we passed on after waiting for the correct time
         self.received_samples_yielded = 0
 
-        self.voice = voice
+        self.voice = "tara"  # Always use tara voice
         self.query = TtsStreamingQuery(
-            voice=self.voice
-            # Don't pass in custom voices as a query parameter, we set it later using
-            # a message
-            if (self.voice and not self.voice.startswith("custom:"))
-            else None,
+            voice="tara",
             cfg_alpha=1.5,
         )
 
@@ -247,23 +235,17 @@ class TextToSpeech(ServiceWithStartup):
             url = self.tts_base_url + TEXT_TO_SPEECH_PATH
             
         logger.info(f"Connecting to TTS: {url}")
+        
+        # Modal services don't require the kyutai-api-key header
+        headers = {} if "modal.run" in self.tts_base_url else HEADERS
+        
         self.websocket = await websockets.connect(
             url,
-            additional_headers=HEADERS,
+            additional_headers=headers,
         )
         logger.debug("Connected to TTS")
 
         try:
-            if self.voice is not None and self.voice.startswith("custom:"):
-                voice_embedding = voice_embeddings_cache.get(self.voice)
-
-                if voice_embedding is not None:
-                    await self.websocket.send(voice_embedding)
-                else:
-                    logger.warning(
-                        f"Custom voice {self.voice} not found, not sending it to TTS"
-                    )
-
             for _ in range(10):
                 # Due to some race condition in the TTS, we might get packets from a previous TTS client.
                 message_bytes = await self.websocket.recv(decode=False)
@@ -451,24 +433,23 @@ class TextToSpeech(ServiceWithStartup):
 
 class OrpheusTextToSpeech(ServiceWithStartup):
     """
-    Orpheus TTS adapter that uses the Modal-based Orpheus FastAPI service.
-    Handles complete text input and streams audio output from the Modal service.
+    Orpheus TTS adapter that uses Modal function calls directly.
+    Handles complete text input and streams audio output from the included Orpheus service.
     """
 
     def __init__(
         self,
-        tts_base_url: str = TTS_SERVER,
+        tts_base_url: str = TTS_SERVER,  # Not used for Modal function calls
         recorder: Recorder | None = None,
         get_time: Callable[[], float] | None = None,
-        voice: str | None = None,
+        orpheus_service_instance = None,  # Direct reference to OrpheusTTS instance
     ):
-        self.tts_base_url = tts_base_url
         self.recorder = recorder
         self.get_time = get_time or (lambda: 0.0)
-        self.voice = voice or "tara"
+        self.voice = "tara"  # Always use tara voice
+        self.orpheus_service_instance = orpheus_service_instance
         
-        # Connection state
-        self.websocket: websockets.ClientConnection | None = None
+        # State management
         self.shutdown_lock = asyncio.Lock()
         self.shutdown_complete = asyncio.Event()
         
@@ -478,212 +459,283 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         self.received_samples = 0
         self.received_samples_yielded = 0
         
-        # Simple generation tracking - no complex queuing needed for Orpheus
-        self.generation_complete = asyncio.Event()
+        # Modal function references
+        self.modal_function = None
+        self.current_generation_task = None
         
-        # Store the llama endpoint if configured
-        self.llama_endpoint = None
-        if "ORPHEUS_LLAMA_ENDPOINT" in os.environ:
-            self.llama_endpoint = os.environ["ORPHEUS_LLAMA_ENDPOINT"]
+        # Queue for audio chunks from streaming generation
+        self.audio_queue: asyncio.Queue[TTSMessage] = asyncio.Queue()
         
-        logger.info(f"Initialized OrpheusTextToSpeech with voice: {self.voice}")
+        logger.info("Initialized OrpheusTextToSpeech with voice: tara")
 
     def state(self) -> WebsocketState:
-        if not self.websocket:
+        if self.orpheus_service_instance is None and self.modal_function is None:
             return "not_created"
+        elif self.shutdown_complete.is_set():
+            return "closed"
+        elif self.current_generation_task is not None:
+            return "connected"
         else:
-            d: dict[websockets.protocol.State, WebsocketState] = {
-                websockets.protocol.State.CONNECTING: "connecting",
-                websockets.protocol.State.OPEN: "connected",
-                websockets.protocol.State.CLOSING: "closing",
-                websockets.protocol.State.CLOSED: "closed",
-            }
-            return d[self.websocket.state]
+            return "connecting"
 
     async def start_up(self):
-        """Initialize connection to Orpheus FastAPI Modal service."""
-        # For Modal Orpheus FastAPI services, connect to the /ws endpoint
-        if "modal.run" in self.tts_base_url:
-            url = f"{self.tts_base_url}/ws"
-        else:
-            # Fallback for local testing - use the full path for local Orpheus FastAPI
-            url = f"{self.tts_base_url}/v1/audio/speech/stream/ws"
-            
-        logger.info(f"Connecting to Orpheus FastAPI TTS: {url}")
-        
+        """Initialize connection to Orpheus Modal service using direct reference."""
         try:
-            # Add query parameters for the voice and other settings
-            params = {
-                "voice": self.voice,
-                "model": "orpheus",
-                "speed": "1.0",
-            }
-            if self.llama_endpoint:
-                params["llama_endpoint"] = self.llama_endpoint
-                
-            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-            full_url = f"{url}?{query_string}"
+            # If we have a direct service instance, use it
+            if self.orpheus_service_instance is not None:
+                logger.info("Using direct Orpheus service instance")
+                self.modal_function = self.orpheus_service_instance.generate_speech_stream
+                logger.info("Successfully connected to Orpheus Modal service via direct reference")
+                return
             
-            self.websocket = await websockets.connect(
-                full_url,
-                additional_headers=HEADERS,
-            )
-            logger.info("Connected to Orpheus FastAPI TTS successfully")
+            # Since the orpheus app is included in the main app, we can access the Modal class directly
+            from .orpheus_modal import OrpheusTTS
+            
+            logger.info("Creating Orpheus Modal service instance from included app")
+            
+            # For Modal classes, we need to use the class directly, not instantiate it locally
+            # The Modal runtime will handle the instantiation on the remote container
+            self.modal_function = OrpheusTTS().generate_speech_stream
+            
+            logger.info("Successfully connected to Orpheus Modal service via included app")
             
         except Exception as e:
-            logger.error(f"Failed to connect to Orpheus FastAPI TTS: {e}")
+            logger.error(f"Failed to connect to Orpheus Modal service: {e}")
             raise
 
     async def send_complete_text(self, text: str) -> None:
-        """Send complete text to Orpheus FastAPI Modal service for audio generation."""
-        if not self.websocket:
-            logger.error("Cannot send text - Orpheus FastAPI websocket not connected")
+        """Send complete text to Orpheus Modal service for audio generation."""
+        if self.modal_function is None:
+            logger.error("Cannot send text - Orpheus Modal function not connected")
             return
             
         if self.shutdown_lock.locked():
-            logger.warning("Cannot send text - Orpheus FastAPI shutting down")
+            logger.warning("Cannot send text - Orpheus Modal service shutting down")
             return
+            
+        # If there's an ongoing generation, clean it up first
+        if self.current_generation_task and not self.current_generation_task.done():
+            logger.info("Stopping previous generation before starting new one")
+            await self.shutdown(full_shutdown=False)
             
         text = prepare_text_for_tts(text)
         if not text.strip():
-            logger.warning("Empty text after preprocessing, not sending to Orpheus FastAPI")
+            logger.warning("Empty text after preprocessing, not sending to Orpheus Modal")
             return
             
-        logger.info(f"Sending complete text to Orpheus FastAPI: '{text}'")
-        self.time_since_request_sent.start_if_not_started()
-        mt.TTS_SESSIONS.inc()
-        mt.TTS_ACTIVE_SESSIONS.inc()
+        logger.info(f"Sending complete text to Orpheus Modal: '{text}'")
+        
+        # Reset state for new generation
+        self.time_since_request_sent = Stopwatch(autostart=True)
+        self.waiting_first_audio = True
+        
+        # Only increment sessions for the first generation
+        if not hasattr(self, '_session_started') or not self._session_started:
+            mt.TTS_SESSIONS.inc()
+            mt.TTS_ACTIVE_SESSIONS.inc()
+            self._session_started = True
         
         try:
-            # Send text as MessagePack-encoded message to match server expectations
-            message = {
-                "type": "Text",
-                "text": text,
-                "voice": self.voice
-            }
-            packed_message = msgpack.packb(message)
-            await self.websocket.send(packed_message)
-            logger.info("Text sent to Orpheus FastAPI successfully")
+            # Start the streaming generation task
+            self.current_generation_task = asyncio.create_task(
+                self._stream_audio_from_modal(text)
+            )
+            
+            logger.info("Text sent to Orpheus Modal successfully")
             
         except Exception as e:
-            logger.error(f"Failed to send text to Orpheus FastAPI: {e}")
+            logger.error(f"Failed to send text to Orpheus Modal: {e}")
             raise
+    
+    async def _stream_audio_from_modal(self, text: str) -> None:
+        """Stream audio chunks from Modal function and queue them."""
+        try:
+            logger.info(f"Starting Modal streaming generation for: '{text[:50]}...'")
+            
+            # Call the Modal function with streaming
+            def process_stream():
+                """Process the Modal generator synchronously."""
+                try:
+                    chunk_count = 0
+                    
+                    # Call the Modal method directly (since we're using the included app)
+                    for audio_chunk in self.modal_function.remote_gen(
+                        text=text,
+                        voice=self.voice
+                    ):
+                        chunk_count += 1
+                        logger.debug(f"Received raw chunk {chunk_count}: {len(audio_chunk)} bytes")
+                        yield audio_chunk
+                    
+                    logger.info(f"Modal generator completed with {chunk_count} chunks")
+                except Exception as e:
+                    logger.error(f"Error in Modal generator: {e}")
+                    raise
+            
+            # Process chunks as they come from the generator
+            chunk_index = 0
+            for audio_chunk in process_stream():
+                if self.shutdown_complete.is_set():
+                    break
+                
+                chunk_index += 1
+                
+                # Convert raw bytes to TTSAudioMessage
+                try:
+                    # Ensure buffer size is a multiple of 2 bytes (int16)
+                    if len(audio_chunk) % 2 != 0:
+                        logger.warning(f"PCM buffer size {len(audio_chunk)} is not a multiple of 2, padding with zero")
+                        audio_chunk = audio_chunk + b'\x00'
+                    
+                    audio_data = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    if self.waiting_first_audio and self.time_since_request_sent.started:
+                        self.waiting_first_audio = False
+                        ttft = self.time_since_request_sent.time()
+                        mt.TTS_TTFT.observe(ttft)
+                        logger.info("Time to first audio from Orpheus Modal: %.1f ms", ttft * 1000)
+                    
+                    # Create TTS audio message
+                    audio_message = TTSAudioMessage(
+                        type="Audio",
+                        pcm=audio_data.tolist()
+                    )
+                    
+                    self.received_samples += len(audio_data)
+                    mt.TTS_RECV_FRAMES.inc()
+                    
+                    if self.recorder is not None:
+                        await self.recorder.add_event(
+                            "server",
+                            ora.UnmuteResponseAudioDeltaReady(
+                                number_of_samples=len(audio_data)
+                            ),
+                        )
+                    
+                    # Queue the audio message
+                    await self.audio_queue.put(audio_message)
+                    
+                    logger.info(f"Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()})")
+                    
+                    # Add a small delay to allow other async tasks to run
+                    await asyncio.sleep(0.001)
+                    
+                except ValueError as e:
+                    logger.error(f"Failed to convert Orpheus Modal PCM bytes to float array: {e}")
+                    continue
+                    
+            logger.info(f"Completed Modal streaming generation with {chunk_index} chunks")
+            
+        except Exception as e:
+            logger.error(f"Error in Modal streaming generation: {e}")
+            import traceback
+            traceback.print_exc()
+            # Put an error marker in the queue to signal completion
+            await self.audio_queue.put(None)
+        finally:
+            # Signal completion
+            await self.audio_queue.put(None)
+            self.current_generation_task = None
 
     async def send(self, message: str) -> None:
-        """Legacy method for compatibility - not used with Orpheus."""
-        logger.warning("send() method called on OrpheusTextToSpeech - this should use send_complete_text() instead")
+        """Legacy method for compatibility - redirects to send_complete_text."""
+        logger.warning("send() method called on OrpheusTextToSpeech - redirecting to send_complete_text()")
+        await self.send_complete_text(message)
 
     def queue_eos(self) -> None:
-        """Legacy method for compatibility - not needed with Orpheus."""
+        """Legacy method for compatibility - not needed with Orpheus Modal."""
         logger.debug("queue_eos() called on OrpheusTextToSpeech - not needed for complete text generation")
 
-    async def shutdown(self):
-        """Clean up Orpheus TTS connection."""
+    async def shutdown(self, full_shutdown: bool = False):
+        """Clean up Orpheus Modal TTS connection.
+        
+        Args:
+            full_shutdown: If True, completely disconnect the Modal function.
+                          If False, only clean up the current generation but keep connection.
+        """
         async with self.shutdown_lock:
-            if self.shutdown_complete.is_set():
+            if self.shutdown_complete.is_set() and not full_shutdown:
                 return
                 
-            logger.info("Shutting down Orpheus TTS")
+            logger.info(f"Shutting down Orpheus Modal TTS (full_shutdown={full_shutdown})")
             
-            mt.TTS_ACTIVE_SESSIONS.dec()
-            mt.TTS_AUDIO_DURATION.observe(self.received_samples / SAMPLE_RATE)
-            if self.time_since_request_sent.started:
-                mt.TTS_GEN_DURATION.observe(self.time_since_request_sent.time())
+            # Cancel any ongoing generation task
+            if self.current_generation_task and not self.current_generation_task.done():
+                self.current_generation_task.cancel()
+                try:
+                    await self.current_generation_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Reset generation state
+            self.current_generation_task = None
+            self.waiting_first_audio = True
+            
+            # Clear the audio queue
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
-            self.shutdown_complete.set()
-            self.generation_complete.set()
+            if full_shutdown:
+                mt.TTS_ACTIVE_SESSIONS.dec()
+                mt.TTS_AUDIO_DURATION.observe(self.received_samples / SAMPLE_RATE)
+                if self.time_since_request_sent.started:
+                    mt.TTS_GEN_DURATION.observe(self.time_since_request_sent.time())
 
-            if self.websocket:
-                await self.websocket.close()
-                self.websocket = None
-
-            logger.info("Orpheus TTS shutdown completed")
+                self.shutdown_complete.set()
+                self.modal_function = None
+                logger.info("Orpheus Modal TTS fully shut down")
+            else:
+                logger.info("Orpheus Modal TTS generation cleaned up, connection maintained")
 
     async def __aiter__(self) -> AsyncIterator[TTSMessage]:
-        """Iterate over TTS messages from Orpheus FastAPI Modal service.
+        """Iterate over TTS messages from Orpheus Modal service.
         
         The Modal service streams raw 16-bit PCM audio bytes at 24kHz.
         """
-        if self.websocket is None:
-            raise RuntimeError("Orpheus FastAPI websocket not connected")
+        if self.modal_function is None:
+            raise RuntimeError("Orpheus Modal function not connected")
             
-        logger.info("Starting Orpheus FastAPI message iteration")
+        logger.info("Starting Orpheus Modal message iteration")
         
         try:
-            # Process raw audio bytes from Orpheus FastAPI Modal service
-            async for message_bytes in self.websocket:
-                if isinstance(message_bytes, bytes) and len(message_bytes) > 0:
-                    # First, attempt to parse as msgpack control/error frames
-                    try:
-                        maybe_msg = msgpack.unpackb(message_bytes)
-                        if isinstance(maybe_msg, dict) and "type" in maybe_msg:
-                            mtype = maybe_msg.get("type")
-                            if mtype == "Ready":
-                                logger.debug("Received Ready from Orpheus FastAPI")
-                                continue
-                            if mtype == "Error":
-                                err = maybe_msg.get("message", "unknown error")
-                                logger.error(f"Orpheus FastAPI reported error: {err}")
-                                continue
-                    except Exception:
-                        # Not a msgpack control frame; proceed to treat as PCM
-                        pass
-
-                    # Orpheus FastAPI outputs raw 16-bit PCM bytes at 24kHz
-                    # Convert to float32 samples for the audio pipeline
-                    try:
-                        # Ensure buffer size is a multiple of 2 bytes (int16)
-                        if len(message_bytes) % 2 != 0:
-                            logger.warning(f"PCM buffer size {len(message_bytes)} is not a multiple of 2, padding with zero")
-                            message_bytes = message_bytes + b'\x00'
-                        
-                        audio_data = np.frombuffer(message_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                        
-                        if self.waiting_first_audio and self.time_since_request_sent.started:
-                            self.waiting_first_audio = False
-                            ttft = self.time_since_request_sent.time()
-                            mt.TTS_TTFT.observe(ttft)
-                            logger.info("Time to first audio from Orpheus FastAPI: %.1f ms", ttft * 1000)
-                        
-                        # Create TTS audio message with float32 PCM data
-                        audio_message = TTSAudioMessage(
-                            type="Audio",
-                            pcm=audio_data.tolist()
-                        )
-                        
-                        self.received_samples += len(audio_data)
-                        mt.TTS_RECV_FRAMES.inc()
-                        
-                        if self.recorder is not None:
-                            await self.recorder.add_event(
-                                "server",
-                                ora.UnmuteResponseAudioDeltaReady(
-                                    number_of_samples=len(audio_data)
-                                ),
-                            )
-                        
-                        logger.debug(f"Yielding audio message with {len(audio_data)} samples")
-                        yield audio_message
-                        
-                    except ValueError as e:
-                        logger.error(f"Failed to convert Orpheus FastAPI PCM bytes to float array: {e}")
-                        continue
-                        
-                else:
-                    logger.debug(f"Received non-bytes message from Orpheus FastAPI: {type(message_bytes)}")
-                    continue
+            # Process messages from the audio queue
+            while True:
+                if self.shutdown_complete.is_set():
+                    break
                     
-        except websockets.ConnectionClosedOK:
-            logger.info("Orpheus FastAPI connection closed normally")
-        except websockets.ConnectionClosedError as e:
-            if self.shutdown_complete.is_set():
-                logger.info("Orpheus FastAPI connection closed during intentional shutdown")
-            else:
-                logger.error(f"Orpheus FastAPI connection lost unexpectedly: {e}")
-                raise
+                try:
+                    # Wait for audio messages with a longer timeout to handle generation startup
+                    message = await asyncio.wait_for(self.audio_queue.get(), timeout=10.0)
+                    
+                    # None indicates end of stream
+                    if message is None:
+                        logger.info("Received end of stream marker, breaking iteration")
+                        break
+                        
+                    self.received_samples_yielded += len(message.pcm)
+                    logger.debug(f"Yielding audio message with {len(message.pcm)} samples")
+                    yield message
+                    
+                except asyncio.TimeoutError:
+                    # Check if we should continue waiting
+                    if self.current_generation_task is None:
+                        logger.info("No generation task active, breaking iteration")
+                        break
+                    elif self.current_generation_task.done():
+                        logger.info("Generation task completed, breaking iteration")
+                        break
+                    else:
+                        # Generation is still running, continue waiting
+                        logger.debug("Generation task still running, continuing to wait for audio")
+                        continue
+                    
         except Exception as e:
-            logger.error(f"Orpheus FastAPI connection error: {type(e).__name__}: {e}")
+            logger.error(f"Orpheus Modal iteration error: {type(e).__name__}: {e}")
             raise
         finally:
-            self.generation_complete.set()
-            await self.shutdown()
+            logger.info("Orpheus Modal message iteration completed")
+            # Don't automatically shutdown - keep the Modal function connection available
+            # for subsequent TTS generations. Shutdown will be called explicitly when needed.

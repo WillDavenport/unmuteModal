@@ -8,7 +8,7 @@ import asyncio
 from typing import AsyncGenerator, Iterator
 
 # Create Modal app
-app = modal.App("orpheus-tts")
+orpheus_tts_app = modal.App("orpheus-tts")
 
 # Create Modal image with Orpheus TTS package
 orpheus_image = (
@@ -27,7 +27,7 @@ orpheus_image = (
 # Create volume for model storage and cache
 model_volume = modal.Volume.from_name("orpheus-models")
 
-@app.cls(
+@orpheus_tts_app.cls(
     image=orpheus_image,
     gpu="H100",
     timeout=10 * 60,  # 10 minutes
@@ -170,156 +170,10 @@ class OrpheusTTS:
             print(f"Error generating streaming speech: {e}")
             raise
     
-    @modal.asgi_app()
-    def asgi_app(self):
-        """FastAPI app with OpenAI-compatible TTS endpoints"""
-        from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-        from fastapi.responses import Response, StreamingResponse
-        from pydantic import BaseModel
-        import json
-        import asyncio
-        
-        app = FastAPI(title="Orpheus TTS Modal Service")
-        
-        class SpeechRequest(BaseModel):
-            input: str
-            model: str = "orpheus"
-            voice: str = "tara"
-            response_format: str = "wav"
-            speed: float = 1.0
-        
-        @app.post("/v1/audio/speech")
-        async def create_speech(request: SpeechRequest):
-            """OpenAI-compatible TTS endpoint"""
-            try:
-                # Generate speech using the Orpheus model
-                audio_bytes = self.generate_speech(
-                    text=request.input,
-                    voice=request.voice,
-                    response_format=request.response_format
-                )
-                
-                return Response(
-                    content=audio_bytes,
-                    media_type="audio/wav",
-                    headers={
-                        "Content-Disposition": "attachment; filename=speech.wav",
-                        "Content-Length": str(len(audio_bytes))
-                    }
-                )
-                    
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.post("/v1/audio/speech/stream")
-        async def create_speech_stream(request: SpeechRequest):
-            """Streaming TTS endpoint - returns raw audio chunks"""
-            try:
-                def generate_audio():
-                    # Stream raw audio chunks (client needs to handle WAV formatting)
-                    for chunk in self.generate_speech_stream(
-                        text=request.input,
-                        voice=request.voice
-                    ):
-                        yield chunk
-                
-                return StreamingResponse(
-                    generate_audio(),
-                    media_type="audio/raw",
-                    headers={
-                        "X-Audio-Format": "raw-pcm",
-                        "X-Audio-Sample-Rate": "24000",
-                        "X-Audio-Channels": "1",
-                        "X-Audio-Sample-Width": "2"
-                    }
-                )
-                    
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @app.websocket("/ws")
-        async def websocket_endpoint(websocket: WebSocket):
-            """WebSocket endpoint for real-time TTS streaming"""
-            await websocket.accept()
-            
-            try:
-                while True:
-                    # Receive text input from client
-                    data = await websocket.receive_text()
-                    message = json.loads(data)
-                    
-                    if message.get("type") == "text":
-                        text = message.get("text", "")
-                        voice = message.get("voice", "tara")
-                        
-                        if text.strip():
-                            # Send audio format info first
-                            try:
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_format",
-                                    "sample_rate": 24000,
-                                    "channels": 1,
-                                    "sample_width": 2,
-                                    "format": "raw-pcm"
-                                }))
-                                
-                                # Stream raw audio chunks back to client
-                                for chunk in self.generate_speech_stream(text=text, voice=voice):
-                                    await websocket.send_bytes(chunk)
-                                
-                                # Send completion message
-                                await websocket.send_text(json.dumps({
-                                    "type": "complete",
-                                    "message": "Audio generation complete"
-                                }))
-                            except Exception as e:
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "error": str(e)
-                                }))
-                    
-            except WebSocketDisconnect:
-                print("WebSocket client disconnected")
-            except Exception as e:
-                print(f"WebSocket error: {e}")
-                try:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "error": str(e)
-                    }))
-                except:
-                    pass
-        
-        @app.get("/health")
-        async def health():
-            """Health check endpoint"""
-            try:
-                # Simple health check - verify model is loaded
-                if hasattr(self, 'model') and self.model is not None:
-                    return {"status": "healthy", "service": "orpheus-tts-modal"}
-                else:
-                    return {"status": "unhealthy", "error": "Model not loaded"}
-            except Exception as e:
-                return {"status": "unhealthy", "error": str(e)}
-        
-        @app.get("/")
-        async def root():
-            """Root endpoint"""
-            return {
-                "service": "Orpheus TTS Modal Service",
-                "version": "1.0.0",
-                "endpoints": [
-                    "/v1/audio/speech",
-                    "/v1/audio/speech/stream", 
-                    "/ws",
-                    "/health"
-                ]
-            }
-        
-        return app
+    # Remove FastAPI/WebSocket endpoints - we'll use direct function calls instead
 
 
-@app.local_entrypoint()
+@orpheus_tts_app.local_entrypoint()
 def test_orpheus_tts():
     """Test the Orpheus TTS service with streaming generation and performance comparison."""
     print("Testing Orpheus TTS Service...")
