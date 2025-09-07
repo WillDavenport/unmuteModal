@@ -30,14 +30,17 @@ model_volume = modal.Volume.from_name("orpheus-models")
 @app.cls(
     image=orpheus_image,
     gpu="H100",
-    timeout=30 * 60,  # 30 minutes
+    timeout=10 * 60,  # 10 minutes
     volumes={
         "/cache": model_volume,
     },
     secrets=[
         modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"]),
     ],
+    min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
+    scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
 )
+@modal.concurrent(max_inputs=5)
 class OrpheusTTS:
     """Modal service for Orpheus TTS using the official orpheus-speech package"""
     

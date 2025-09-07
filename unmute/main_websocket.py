@@ -145,7 +145,11 @@ async def _get_health(
         # This allows the health check to work with both local Moshi servers and Modal services
         tts_endpoint = _ws_to_http(TTS_SERVER)
         if "modal.run" in tts_endpoint:
-            tts_endpoint += "/"  # Modal services use root endpoint
+            # For Orpheus TTS Modal service, extract base URL and use /health endpoint
+            if "/ws" in tts_endpoint:
+                tts_endpoint = tts_endpoint.replace("/ws", "/health")
+            else:
+                tts_endpoint += "/"  # Other Modal services use root endpoint
         else:
             tts_endpoint += "/api/build_info"  # Local Moshi servers
         

@@ -1,19 +1,18 @@
 """
 Modal Voice Stack Application
 
-This Modal app implements the target architecture with four serverless classes:
+This Modal app implements the target architecture with three serverless classes:
 - Orchestrator (CPU only) - handles client WebSocket connections
-- STT (L4 GPU) - Speech-to-Text service with WebSocket endpoint  
+- STT (L40S GPU) - Speech-to-Text service with WebSocket endpoint  
 - LLM (L40S GPU) - Language Model service with WebSocket endpoint
-- TTS (L4 GPU) - Text-to-Speech service with WebSocket endpoint
+
+TTS (Text-to-Speech) is handled by a separate Modal app (orpheus_modal.py) using Orpheus TTS.
 
 Each service uses @modal.asgi_app() for WebSocket endpoints and @modal.enter() for model loading.
 
 OPTIMIZATION: Essential model weights are pre-downloaded during image build to reduce startup delays:
 - STT models: kyutai/stt-1b-en_fr-candle (model.safetensors, tokenizer, audio tokenizer)  
-- TTS models: kyutai/tts-1.6b-en_fr (tokenizer) + essential default voice from kyutai/tts-voices
-Additional TTS voices are downloaded on-demand at runtime to avoid HuggingFace rate limits.
-This reduces initial TTS startup time significantly while maintaining voice variety.
+- TTS is provided by the separate Orpheus TTS Modal app with OpenAI-compatible REST API
 """
 
 import modal
@@ -126,70 +125,8 @@ stt_image = (
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
-# TTS image: build steps first, then local files
-tts_image = (
-    base_deps_image
-    .apt_install("cmake", "pkg-config", "libopus-dev", "git", "curl", "libssl-dev", "openssl", "wget", "gnupg", "git-lfs")
-    .run_commands(
-        # Install CUDA toolkit for nvcc compiler (required for cudarc compilation)
-        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb",
-        "dpkg -i cuda-keyring_1.0-1_all.deb",
-        "apt-get update -q",
-        "apt-get install -y cuda-toolkit-12-1 || apt-get install -y cuda-toolkit-11-8",
-        # Install git-lfs for Orpheus model downloads
-        "git lfs install",
-    )
-    .pip_install(
-        # PyTorch with CUDA support for Orpheus - use latest stable
-        "torch==2.7.1",
-        "torchaudio>=2.1.0",
-        "huggingface_hub[hf_transfer]>=0.19.0",  # Include hf_transfer for faster downloads
-        "safetensors>=0.4.0",
-        "transformers>=4.35.0",
-        "tokenizers>=0.15.0",
-        # Required for device mapping with large models
-        "accelerate>=0.20.0",
-        # Orpheus-specific dependencies
-        "snac==1.2.1",
-        "batched==0.1.4",
-        # OpenAI client for LLM integration
-        "openai>=1.70.0",
-        # Keep some existing dependencies for compatibility
-        "sentencepiece>=0.2.0",
-        "einops>=0.8.0",
-        # Additional optimization packages (flash-attn removed due to compatibility issues)
-        # "flash-attn>=2.0.0",  # Commented out due to CUDA symbol conflicts
-        "xformers>=0.0.20",   # Memory-efficient attention (fallback)
-    )
-    .run_commands(
-        # Pre-download publicly available models during image build
-        "echo 'Pre-downloading publicly available models to cache...'",
-        # Create cache directories using CACHE_DIR
-        f"mkdir -p {CACHE_DIR}",
-        "mkdir -p /root/orpheus-models",
-        # Download SNAC model for audio conversion (publicly available)
-        f"python -c \"from huggingface_hub import snapshot_download; snapshot_download('hubertsiuzdak/snac_24khz', cache_dir='{CACHE_DIR}')\"",
-        # Pre-download Orpheus tokenizer and config (publicly available parts)
-        "echo 'Pre-downloading Orpheus tokenizer and config...'",
-        f"python -c \"from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('canopylabs/orpheus-3b-0.1-ft', cache_dir='{CACHE_DIR}', use_auth_token=False)\" || echo 'Tokenizer download failed (expected without token)'",
-        # Note: Full Orpheus model requires authentication, will be downloaded at runtime
-        "echo 'Note: Full Orpheus model (canopylabs/orpheus-3b-0.1-ft) requires HF token, will download at runtime'",
-        # Verify SNAC model was downloaded
-        "echo 'Verifying downloaded models...'",
-        f"ls -la {CACHE_DIR}/ | head -10",
-        "echo 'Public model pre-download completed.'"
-    )
-    # Add local files LAST
-    .add_local_python_source("unmute")
-    .add_local_file("voices.yaml", "/root/voices.yaml")
-)
-
-# Import dependencies for TTS image context
-with tts_image.imports():
-    import torch
-    import transformers
-    from huggingface_hub import snapshot_download
-    from transformers import AutoTokenizer
+# TTS is now handled by the separate Orpheus TTS Modal app (orpheus_modal.py)
+# No separate TTS image needed in this app
 
 # LLM image: additional deps first, then local files
 llm_image = (
@@ -218,21 +155,15 @@ orchestrator_image = (
 
 # Modal volumes for model storage - following Modal best practices
 models_volume = modal.Volume.from_name("voice-models", create_if_missing=True)
-# Orpheus TTS doesn't need persistent voice storage like Moshi
-# tts_voices_volume = modal.Volume.from_name("tts-voices-cache")
 
 # HuggingFace cache volume for persistent model storage
 hf_cache_volume = modal.Volume.from_name("hf-hub-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
-# Cache volume for Rust binaries (shared between STT and TTS)
+# Cache volume for Rust binaries (used by STT service)
 rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache", create_if_missing=True)
 
-# Volume mappings for TTS service
-tts_volumes = {
-    "/models": models_volume,
-    VOLUME_CACHE_DIR: hf_cache_volume,  # Use volume mount point (separate from build cache)
-}
+# TTS volumes are now handled by the separate Orpheus TTS Modal app
 
 # Model configuration for Mistral
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
@@ -658,11 +589,8 @@ dim = 6
         return app
 
 
-# Import and include Orpheus TTS services from the new Modal entrypoint
-from .tts.orpheus_modal import app as orpheus_tts_app
-
-# Include the Orpheus TTS service in the main app
-app = app.include(orpheus_tts_app)
+# Orpheus TTS is now deployed as a separate Modal app (orpheus_modal.py)
+# The orchestrator service below is configured to use the Orpheus TTS endpoints
 
 @app.cls(
     gpu="L40S",
@@ -982,19 +910,15 @@ class OrchestratorService:
             # In modal serve mode, each service class gets its own -dev URL
             # Pattern: https://username--appname-classname-dev.modal.run
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the new Orpheus TTS Modal service
-            os.environ["KYUTAI_TTS_URL"] = f"https://{base_url.replace('voice-stack', 'orpheus-tts')}-orpheustts-asgi-app-dev.modal.run/v1/audio/speech"
+            # Use the separate Orpheus TTS Modal app WebSocket endpoint
+            os.environ["KYUTAI_TTS_URL"] = f"https://willdavenport--orpheus-tts-orpheustts-asgi-app-dev.modal.run/ws"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
-            # Set the Orpheus llama.cpp endpoint for the TTS service
-            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url.replace('voice-stack', 'orpheus-llama-server')}-orpheusllamaserver-asgi-app-dev.modal.run/v1/completions"
         else:
             # Production deployment URLs
             os.environ["KYUTAI_STT_URL"] = f"wss://{base_url}-sttservice-web-dev.modal.run"
-            # Use the new Orpheus TTS Modal service
-            os.environ["KYUTAI_TTS_URL"] = f"https://{base_url.replace('voice-stack', 'orpheus-tts')}-orpheustts-asgi-app.modal.run/v1/audio/speech"
+            # Use the separate Orpheus TTS Modal app WebSocket endpoint
+            os.environ["KYUTAI_TTS_URL"] = f"https://willdavenport--orpheus-tts-orpheustts-asgi-app-dev.modal.run/ws"
             os.environ["KYUTAI_LLM_URL"] = f"https://{base_url}-llmservice-web-dev.modal.run"
-            # Set the Orpheus llama.cpp endpoint for the TTS service
-            os.environ["ORPHEUS_LLAMA_ENDPOINT"] = f"https://{base_url.replace('voice-stack', 'orpheus-llama-server')}-orpheusllamaserver-asgi-app.modal.run/v1/completions"
         # Voice cloning is not available in Modal deployment
         os.environ["KYUTAI_VOICE_CLONING_URL"] = "http://localhost:8092"
         
@@ -1004,7 +928,6 @@ class OrchestratorService:
         os.environ["KYUTAI_TTS_PATH"] = ""
         
         # Set longer timeout for Modal services which can take time to cold start
-        # TTS service takes especially long to start up
         os.environ["KYUTAI_SERVICE_TIMEOUT_SEC"] = "150.0"
         
         print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")

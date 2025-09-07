@@ -1,4 +1,4 @@
 # TTS package initialization
-from .orpheus_services import orpheus_fastapi_app, orpheus_llama_app
+from .orpheus_modal import app as orpheus_modal_app
 
-__all__ = ["orpheus_fastapi_app", "orpheus_llama_app"]
+__all__ = ["orpheus_modal_app"]
