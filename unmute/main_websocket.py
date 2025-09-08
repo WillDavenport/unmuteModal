@@ -443,6 +443,7 @@ async def emit_loop(
     emit_debug_logger = EmitDebugLogger()
 
     opus_writer = sphn.OpusStreamWriter(SAMPLE_RATE)
+    audio_started_sent = False
     last_keepalive = asyncio.get_event_loop().time()
     KEEPALIVE_INTERVAL = 240  # 4 minutes - send keepalive before 5min timeout
 
@@ -519,6 +520,15 @@ async def emit_loop(
 
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):
+                # Send start marker on first audio
+                if not audio_started_sent:
+                    start_evt = ora.ResponseAudioStart()
+                    try:
+                        await websocket.send_text(start_evt.model_dump_json())
+                    except Exception:
+                        logger.debug("Failed to send response.audio.start marker")
+                    audio_started_sent = True
+
                 # Track in global debug tracker
                 audio_debug_tracker = get_audio_debug_tracker()
                 # Estimate opus bytes from base64 length (base64 is ~4/3 the size of binary)
@@ -526,6 +536,28 @@ async def emit_loop(
                 audio_debug_tracker.record_websocket_message_sent(estimated_opus_bytes)
                 
                 logger.info(f"=== AUDIO_DEBUG: Sending ResponseAudioDelta to websocket: {len(to_emit.delta)} base64 chars (~{estimated_opus_bytes} opus bytes) ===")
+                await websocket.send_text(to_emit.model_dump_json())
+            elif isinstance(to_emit, ora.ResponseAudioDone):
+                # Also send response.audio.end marker for clients
+                try:
+                    end_evt = ora.ResponseAudioEnd()
+                    await websocket.send_text(end_evt.model_dump_json())
+                except Exception:
+                    logger.debug("Failed to send response.audio.end marker")
+                audio_started_sent = False
+                await websocket.send_text(to_emit.model_dump_json())
+            elif isinstance(to_emit, ora.UnmuteInterruptedByVAD):
+                # Emit generic interrupted signal for clients to flush immediately
+                try:
+                    interrupted_evt = ora.ResponseInterrupted()
+                    await websocket.send_text(interrupted_evt.model_dump_json())
+                except Exception:
+                    logger.debug("Failed to send response.interrupted event")
+                audio_started_sent = False
+                # Also forward the original event for compatibility
+                await websocket.send_text(to_emit.model_dump_json())
+            else:
+                # Forward any other server events (e.g., debug outputs, text, etc.)
                 await websocket.send_text(to_emit.model_dump_json())
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):

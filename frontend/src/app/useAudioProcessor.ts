@@ -53,30 +53,34 @@ export const useAudioProcessor = (
       outputAnalyser.fftSize = 2048;
       outputWorklet.connect(outputAnalyser);
 
-      const decoder = new Worker("/decoderWorker.min.js");
-      let micDuration = 0;
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      decoder.onmessage = (event: MessageEvent<any>) => {
-        if (!event.data) {
-          return;
-        }
-        const frame = event.data[0];
-        console.log(`=== FRONTEND_AUDIO_DEBUG: Decoder worker returned PCM frame with ${frame.length} samples ===`);
-        outputWorklet.port.postMessage({
-          frame: frame,
-          type: "audio",
-          micDuration: micDuration,
+      const createDecoder = () => {
+        const worker = new Worker("/decoderWorker.min.js");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        worker.onmessage = (event: MessageEvent<any>) => {
+          if (!event.data) {
+            return;
+          }
+          const frame = event.data[0];
+          console.log(`=== FRONTEND_AUDIO_DEBUG: Decoder worker returned PCM frame with ${frame.length} samples ===`);
+          const micDuration = opusRecorder.encodedSamplePosition / 48000;
+          outputWorklet.port.postMessage({
+            frame: frame,
+            type: "audio",
+            micDuration: micDuration,
+          });
+          console.log(`=== FRONTEND_AUDIO_DEBUG: Sent PCM frame to output worklet ===`);
+        };
+        worker.postMessage({
+          command: "init",
+          bufferLength: (960 * audioContext.sampleRate) / 24000,
+          decoderSampleRate: 24000,
+          outputBufferSampleRate: audioContext.sampleRate,
+          resampleQuality: 0,
         });
-        console.log(`=== FRONTEND_AUDIO_DEBUG: Sent PCM frame to output worklet ===`);
+        return worker;
       };
-      decoder.postMessage({
-        command: "init",
-        bufferLength: (960 * audioContext.sampleRate) / 24000,
-        decoderSampleRate: 24000,
-        outputBufferSampleRate: audioContext.sampleRate,
-        resampleQuality: 0,
-      });
+
+      const decoder = createDecoder();
 
       // For buffer length: 960 = 24000 / 12.5 / 2
       // The /2 is a bit optional, but won't hurt for recording the mic.
@@ -108,16 +112,15 @@ export const useAudioProcessor = (
       let lastpos = 0;
       const opusRecorder = new OpusRecorder(recorderOptions);
       opusRecorder.ondataavailable = (data: Uint8Array) => {
-        // opus actually always works at 48khz, so it seems this is the proper value to use here.
-        micDuration = opusRecorder.encodedSamplePosition / 48000;
         // logging disabled
         if (chunk_idx < 0) {
+          const micDurationSec = opusRecorder.encodedSamplePosition / 48000;
           console.debug(
             Date.now() % 1000,
             "Mic Data chunk",
             chunk_idx++,
             (opusRecorder.encodedSamplePosition - lastpos) / 48000,
-            micDuration
+            micDurationSec
           );
           lastpos = opusRecorder.encodedSamplePosition;
         }
@@ -141,6 +144,42 @@ export const useAudioProcessor = (
     [onOpusRecorded]
   );
 
+  const flushOutput = useCallback(() => {
+    const ap = audioProcessorRef.current;
+    if (!ap) return;
+    try {
+      // Flush output worklet buffers
+      ap.outputWorklet.port.postMessage({ type: "reset" });
+    } catch {}
+    try {
+      // Recreate decoder to drop any pending frames and state
+      ap.decoder.terminate();
+    } catch {}
+    const audioContext = ap.audioContext;
+    const outputWorklet = ap.outputWorklet;
+    const opusRecorder = ap.opusRecorder;
+    const worker = new Worker("/decoderWorker.min.js");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    worker.onmessage = (event: MessageEvent<any>) => {
+      if (!event.data) return;
+      const frame = event.data[0];
+      const micDuration = opusRecorder.encodedSamplePosition / 48000;
+      outputWorklet.port.postMessage({
+        frame,
+        type: "audio",
+        micDuration,
+      });
+    };
+    worker.postMessage({
+      command: "init",
+      bufferLength: (960 * audioContext.sampleRate) / 24000,
+      decoderSampleRate: 24000,
+      outputBufferSampleRate: audioContext.sampleRate,
+      resampleQuality: 0,
+    });
+    ap.decoder = worker;
+  }, []);
+
   const shutdownAudio = useCallback(() => {
     if (audioProcessorRef.current) {
       const { audioContext, opusRecorder, outputWorklet } =
@@ -160,5 +199,6 @@ export const useAudioProcessor = (
     setupAudio,
     shutdownAudio,
     audioProcessor: audioProcessorRef,
+    flushOutput,
   };
 };

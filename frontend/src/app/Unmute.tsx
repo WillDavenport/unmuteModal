@@ -125,7 +125,7 @@ const Unmute = () => {
     [sendMessage]
   );
 
-  const { setupAudio, shutdownAudio, audioProcessor } =
+  const { setupAudio, shutdownAudio, audioProcessor, flushOutput } =
     useAudioProcessor(onOpusRecorded);
   const {
     canvasRef: recordingCanvasRef,
@@ -194,6 +194,17 @@ const Unmute = () => {
         },
         [opus.buffer]
       );
+    } else if (data.type === "response.interrupted") {
+      console.log("=== FRONTEND_AUDIO_DEBUG: response.interrupted received, flushing output buffers ===");
+      try {
+        flushOutput();
+      } catch (e) {
+        console.warn("Failed to flush output on interruption", e);
+      }
+    } else if (data.type === "response.audio.start") {
+      console.log("=== FRONTEND_AUDIO_DEBUG: response.audio.start ===");
+    } else if (data.type === "response.audio.end") {
+      console.log("=== FRONTEND_AUDIO_DEBUG: response.audio.end ===");
     } else if (data.type === "unmute.additional_outputs") {
       setDebugDict(data.args.debug_dict);
     } else if (data.type === "error") {

@@ -140,6 +140,18 @@ class ResponseAudioDone(BaseEvent[Literal["response.audio.done"]]):
     pass
 
 
+class ResponseAudioStart(BaseEvent[Literal["response.audio.start"]]):
+    pass
+
+
+class ResponseAudioEnd(BaseEvent[Literal["response.audio.end"]]):
+    pass
+
+
+class ResponseInterrupted(BaseEvent[Literal["response.interrupted"]]):
+    reason: str | None = None
+
+
 class TranscriptLogprob(BaseModel):
     bytes: bytes
     logprob: float
@@ -181,6 +193,9 @@ ServerEvent = Union[
     ResponseTextDone,
     ResponseAudioDelta,
     ResponseAudioDone,
+    ResponseAudioStart,
+    ResponseAudioEnd,
+    ResponseInterrupted,
     ResponseCreated,
     ConversationItemInputAudioTranscriptionDelta,
     InputAudioBufferSpeechStarted,

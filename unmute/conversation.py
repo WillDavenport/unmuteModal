@@ -489,6 +489,14 @@ class Conversation:
 
         await self.output_queue.put(ora.UnmuteInterruptedByVAD())
         
+        # Stop any ongoing TTS generation ASAP to save resources
+        if self.tts is not None:
+            try:
+                logger.info("Requesting TTS shutdown after VAD interruption")
+                await self.tts.shutdown(full_shutdown=False)
+            except Exception as e:
+                logger.warning(f"Error shutting down TTS after interruption: {e}")
+        
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():
             logger.info("Cancelling TTS task")

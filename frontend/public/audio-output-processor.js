@@ -8,7 +8,7 @@ function asSamples(mili) {
   return Math.round((mili * sampleRate) / 1000);
 }
 
-const DEFAULT_MAX_BUFFER_MS = 60 * 1000;
+const DEFAULT_MAX_BUFFER_MS = 120;
 
 const debug = (...args) => {
   // console.debug(...args);
@@ -31,7 +31,7 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
     this.maxBufferSamples = asSamples(DEFAULT_MAX_BUFFER_MS);
     // increments
     this.partialBufferIncrement = asSamples(5);
-    this.maxPartialWithIncrements = asSamples(80);
+    this.maxPartialWithIncrements = asSamples(120);
     this.maxBufferSamplesIncrement = asSamples(5);
     this.maxMaxBufferWithIncrements = asSamples(80);
 
@@ -41,6 +41,11 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (event) => {
       if (event.data.type == "reset") {
         debug("Reset audio processor state.");
+        this.initState();
+        return;
+      }
+      if (event.data.type == "flush") {
+        debug("Flush audio processor state.");
         this.initState();
         return;
       }
