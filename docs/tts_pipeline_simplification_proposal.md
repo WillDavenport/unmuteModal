@@ -10,7 +10,7 @@ Answer: Why do we have multiple queues and layers between Orpheus TTS and audio 
 
 - Current: Orpheus → backend stream adapter → internal queues (timing/cadence) → encoder (Opus) → WebSocket → frontend decoder worker → audio worklet queue → output
 - Proposed: Orpheus → backend Opus encoder → WebSocket → frontend decoder worker → audio worklet output
-  - Remove: long-lived intermediate queues and cadence schedulers in the backend (keep only a minimal buffer for quick flush on interrupt and encoder state)
+  - Remove: long-lived intermediate queues and cadence schedulers in the backend; no backend buffering
   - Keep: a small jitter buffer on frontend worklet to avoid underruns; Opus encoding for bandwidth; VAD/interrupt signaling path
 
 ## Why all the queues existed
@@ -29,11 +29,11 @@ These are valid concerns, but most can be handled with much smaller buffers and 
 - Receive raw PCM chunks from Orpheus stream
 - Encode each incoming Orpheus chunk to Opus immediately (no re-batching)
 - Send `response.audio.delta` messages to the client without additional timing queues
-- Maintain only a small (configurable) ring buffer (e.g., ≤ 200 ms) used solely for quick drop on interrupt and handling partial encoder state
+- No backend buffering; rely on WebSocket backpressure; tag deltas with `response_id` so the client can ignore late chunks after an interrupt
 
 2) Backend: Interruption and VAD
 - VAD continuously runs on mic stream
-- On interrupt: send `response.interrupted` event to client; mark backend encoder/output as "muted" and flush the small ring buffer; cancel or pause TTS generation if supported
+- On interrupt: send `response.interrupted` event to client; stop emitting new audio; cancel or pause TTS generation; ignore any late-arriving chunks
 
 3) Frontend: Jitter buffer and playback
 - Decoder worker decodes Opus deltas into PCM frames
@@ -53,14 +53,14 @@ These are valid concerns, but most can be handled with much smaller buffers and 
 
 ## Backpressure and Flow Control
 
-- Backend does not accumulate beyond the small ring buffer; if the client is slow, WebSocket send backpressure naturally slows the producer; on sustained slow client, cancel/stop TTS.
+- Backend does not buffer; if the client is slow, WebSocket backpressure naturally slows the producer; on sustained slowness, cancel/stop TTS.
 - Client maintains a small jitter buffer only; if underrun happens, allow momentary glitches instead of building latency.
 
 ## What functionality is lost by removing queues?
 
 - Fine-grained server-side cadence shaping (prosody-timed pacing) — moved to frontend jitter buffer; acceptable for real-time voice.
 - Large server-side buffer enabling temporary network outages — now outages will cause audible glitches sooner; mitigate with 150–250 ms frontend buffer.
-- Server-side late drop-in of interruptions with long audio already queued — with ≤ 200 ms backend ring + ≤ 120 ms frontend jitter, worst-case overrun before stop is ~320 ms, which is generally acceptable for barge-in UX.
+- Server-side late drop-in of interruptions — with no backend buffer and ≤ 120 ms frontend jitter, worst-case overrun before stop ≈ frontend jitter (e.g., ~120 ms), which is generally acceptable for barge-in UX.
 
 ## Why not send raw PCM straight from Orpheus to frontend?
 
@@ -71,9 +71,9 @@ These are valid concerns, but most can be handled with much smaller buffers and 
 ## Would frontend-only playback with VAD interrupt be sufficient?
 
 Yes, if we:
-- Ensure tiny buffers both sides (≤ 200 ms backend, ≤ 120 ms frontend)
+- Use a small frontend jitter buffer (≤ 120 ms)
 - Deliver immediate deltas as soon as encoded (no cadence queue)
-- On interrupt, send `response.interrupted` promptly and flush both buffers
+- On interrupt, send `response.interrupted` promptly and flush the frontend buffer
 - Cancel/pause Orpheus stream on interrupt to stop wasting GPU
 
 This preserves: fast start, low-latency barge-in, simple control flow.
@@ -84,8 +84,7 @@ Phase 1: Backend tightening
 - Replace the current multi-queue pipeline in `unmute/tts/text_to_speech.py` with a single producer that:
   - Reads Orpheus PCM stream iteratively
   - Encodes each Orpheus-provided chunk immediately and emits `response.audio.delta`
-  - Maintains a ring buffer of ≤ 200 ms for quick flush
-- Add explicit interrupt hook to drop buffers and cancel Orpheus task
+- Add explicit interrupt hook to cancel Orpheus task and stop emitting audio
 
 Phase 2: Frontend adjustments
 - Ensure `audio-output-processor.js` initial buffer ≤ 120 ms; target buffer ~80–100 ms
@@ -114,7 +113,6 @@ Phase 4: Clean-up
 
 - Sample rate: Keep 24 kHz end-to-end (Orpheus native), resample to AudioContext rate on frontend as today
 - Packetization: unchanged; encode per Orpheus chunk (no additional batching)
-- Backend ring buffer: 200 ms max; flush-on-interrupt
 - Frontend jitter: 80–120 ms initial; maintain ~100 ms when possible
 
 ## Risks and Mitigations
@@ -130,10 +128,10 @@ Phase 4: Clean-up
 
 ## Migration Steps
 
-1) Implement backend ring-buffer encoder in `unmute/tts/text_to_speech.py` behind a feature flag: `TTS_SIMPLE_PIPELINE=1`
+1) Implement encode-per-chunk path in `unmute/tts/text_to_speech.py` (no backend buffering)
 2) Add `response.interrupted` emission and plumb interrupt handling end-to-end (backend → frontend)
 3) Update frontend worklet to support `flush` command and reduce initial buffer to ≤ 120 ms
-4) Shadow test: enable flag for a subset of sessions; capture latency and barge-in metrics
+4) Test end-to-end locally and in staging; capture latency and barge-in metrics
 5) Remove legacy queues and timing shapers after parity and stability are confirmed
 
 ## Answering the original questions succinctly
