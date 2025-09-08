@@ -62,11 +62,13 @@ export const useAudioProcessor = (
           return;
         }
         const frame = event.data[0];
+        console.log(`=== FRONTEND_AUDIO_DEBUG: Decoder worker returned PCM frame with ${frame.length} samples ===`);
         outputWorklet.port.postMessage({
           frame: frame,
           type: "audio",
           micDuration: micDuration,
         });
+        console.log(`=== FRONTEND_AUDIO_DEBUG: Sent PCM frame to output worklet ===`);
       };
       decoder.postMessage({
         command: "init",
