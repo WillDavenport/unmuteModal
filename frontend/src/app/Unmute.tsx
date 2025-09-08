@@ -179,10 +179,14 @@ const Unmute = () => {
     const data = JSON.parse(lastMessage.data);
     if (data.type === "response.audio.delta") {
       const opus = base64DecodeOpus(data.delta);
-      console.log(`=== FRONTEND: Received audio delta, opus size: ${opus.length} bytes ===`);
+      console.log(`=== FRONTEND_AUDIO_DEBUG: Received audio delta, opus size: ${opus.length} bytes, base64 length: ${data.delta.length} ===`);
       const ap = audioProcessor.current;
-      if (!ap) return;
+      if (!ap) {
+        console.error(`=== FRONTEND_AUDIO_DEBUG: Audio processor not available, dropping audio data ===`);
+        return;
+      }
 
+      console.log(`=== FRONTEND_AUDIO_DEBUG: Sending opus data to decoder worker ===`);
       ap.decoder.postMessage(
         {
           command: "decode",

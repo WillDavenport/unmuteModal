@@ -47,6 +47,7 @@ from unmute.service_discovery import async_ttl_cached
 from unmute.timer import Stopwatch
 from unmute.conversation_handler import ConversationUnmuteHandler
 from unmute.conversation import ConversationManager
+from unmute.audio_debug import get_audio_debug_tracker
 
 app = FastAPI()
 
@@ -496,12 +497,12 @@ async def emit_loop(
                     opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
                     # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
                     if opus_bytes:
-                        logger.info(f"Sending audio to realtime websocket: {len(opus_bytes)} opus bytes")
+                        logger.info(f"=== AUDIO_DEBUG: Sending audio to realtime websocket: {len(opus_bytes)} opus bytes from {len(audio)} PCM samples ===")
                         to_emit = ora.ResponseAudioDelta(
                             delta=base64.b64encode(opus_bytes).decode("utf-8"),
                         )
                     else:
-                        logger.warning(f"No audio to send to realtime websocket")
+                        logger.warning(f"=== AUDIO_DEBUG: No opus bytes generated from {len(audio)} PCM samples ===")
                         continue
                 except (TypeError, ValueError) as e:
                     logger.error(f"Failed to unpack emitted_by_handler: {type(emitted_by_handler)=}, {emitted_by_handler=}, error: {e}")
@@ -518,6 +519,13 @@ async def emit_loop(
 
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):
+                # Track in global debug tracker
+                audio_debug_tracker = get_audio_debug_tracker()
+                # Estimate opus bytes from base64 length (base64 is ~4/3 the size of binary)
+                estimated_opus_bytes = (len(to_emit.delta) * 3) // 4
+                audio_debug_tracker.record_websocket_message_sent(estimated_opus_bytes)
+                
+                logger.info(f"=== AUDIO_DEBUG: Sending ResponseAudioDelta to websocket: {len(to_emit.delta)} base64 chars (~{estimated_opus_bytes} opus bytes) ===")
                 await websocket.send_text(to_emit.model_dump_json())
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):

@@ -22,6 +22,7 @@ from unmute.kyutai_constants import (
 from unmute.recorder import Recorder
 from unmute.service_discovery import ServiceWithStartup
 from unmute.timer import Stopwatch
+from unmute.audio_debug import get_audio_debug_tracker
 from unmute.tts.realtime_queue import RealtimeQueue
 from unmute.websocket_utils import WebsocketState
 
@@ -466,7 +467,36 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         # Queue for audio chunks from streaming generation
         self.audio_queue: asyncio.Queue[TTSMessage] = asyncio.Queue()
         
+        # Audio flow debug tracking
+        self.debug_stats = {
+            "modal_chunks_received": 0,
+            "audio_messages_queued": 0,
+            "audio_messages_yielded": 0,
+            "bytes_from_modal": 0,
+            "samples_processed": 0,
+            "generation_requests": 0,
+        }
+        
+        # Global audio debug tracker
+        self.audio_debug_tracker = get_audio_debug_tracker()
+        
         logger.info("Initialized OrpheusTextToSpeech with voice: tara")
+        
+    def log_debug_summary(self):
+        """Log a summary of audio flow debug statistics."""
+        logger.info(f"=== AUDIO_DEBUG_SUMMARY: TTS Service Stats ===")
+        logger.info(f"Generation requests: {self.debug_stats['generation_requests']}")
+        logger.info(f"Modal chunks received: {self.debug_stats['modal_chunks_received']}")
+        logger.info(f"Audio messages queued: {self.debug_stats['audio_messages_queued']}")
+        logger.info(f"Audio messages yielded: {self.debug_stats['audio_messages_yielded']}")
+        logger.info(f"Total bytes from Modal: {self.debug_stats['bytes_from_modal']}")
+        logger.info(f"Total samples processed: {self.debug_stats['samples_processed']}")
+        logger.info(f"Audio queue current size: {self.audio_queue.qsize()}")
+        logger.info(f"Current generation task: {'Running' if self.current_generation_task and not self.current_generation_task.done() else 'None'}")
+        logger.info(f"=== END AUDIO_DEBUG_SUMMARY ===")
+        
+        # Also log the comprehensive global tracker summary
+        self.audio_debug_tracker.log_summary()
 
     def state(self) -> WebsocketState:
         if self.orpheus_service_instance is None and self.modal_function is None:
@@ -523,11 +553,23 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.warning("Empty text after preprocessing, not sending to Orpheus Modal")
             return
             
+        self.debug_stats["generation_requests"] += 1
+        logger.info(f"=== AUDIO_DEBUG: Generation request #{self.debug_stats['generation_requests']} ===")
         logger.info(f"Sending complete text to Orpheus Modal: '{text}'")
         
         # Reset state for new generation
         self.time_since_request_sent = Stopwatch(autostart=True)
         self.waiting_first_audio = True
+        
+        # Reset debug stats for this generation
+        self.debug_stats["modal_chunks_received"] = 0
+        self.debug_stats["audio_messages_queued"] = 0
+        self.debug_stats["bytes_from_modal"] = 0
+        self.debug_stats["samples_processed"] = 0
+        
+        # Reset global tracker for new generation
+        self.audio_debug_tracker.reset()
+        self.audio_debug_tracker.generation_active = True
         
         # Only increment sessions for the first generation
         if not hasattr(self, '_session_started') or not self._session_started:
@@ -564,7 +606,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         voice=self.voice
                     ):
                         chunk_count += 1
-                        logger.debug(f"Received raw chunk {chunk_count}: {len(audio_chunk)} bytes")
+                        logger.info(f"=== AUDIO_DEBUG: Received raw chunk {chunk_count} from Modal: {len(audio_chunk)} bytes ===")
                         yield audio_chunk
                     
                     logger.info(f"Modal generator completed with {chunk_count} chunks")
@@ -579,6 +621,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     break
                 
                 chunk_index += 1
+                self.debug_stats["modal_chunks_received"] += 1
+                self.debug_stats["bytes_from_modal"] += len(audio_chunk)
+                
+                # Track in global debug tracker
+                self.audio_debug_tracker.record_modal_chunk(len(audio_chunk))
                 
                 # Convert raw bytes to TTSAudioMessage
                 try:
@@ -588,6 +635,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         audio_chunk = audio_chunk + b'\x00'
                     
                     audio_data = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    self.debug_stats["samples_processed"] += len(audio_data)
                     
                     if self.waiting_first_audio and self.time_since_request_sent.started:
                         self.waiting_first_audio = False
@@ -614,8 +662,13 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                     # Queue the audio message
                     await self.audio_queue.put(audio_message)
+                    self.debug_stats["audio_messages_queued"] += 1
                     
-                    logger.info(f"Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()})")
+                    # Track in global debug tracker
+                    self.audio_debug_tracker.record_audio_message_queued(len(audio_data))
+                    
+                    logger.info(f"=== AUDIO_DEBUG: Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()}) ===")
+                    logger.info(f"=== AUDIO_DEBUG: Total stats - Modal chunks: {self.debug_stats['modal_chunks_received']}, Queued messages: {self.debug_stats['audio_messages_queued']}, Bytes: {self.debug_stats['bytes_from_modal']}, Samples: {self.debug_stats['samples_processed']} ===")
                     
                     # Add a small delay to allow other async tasks to run
                     await asyncio.sleep(0.001)
@@ -716,7 +769,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         break
                         
                     self.received_samples_yielded += len(message.pcm)
-                    logger.debug(f"Yielding audio message with {len(message.pcm)} samples")
+                    self.debug_stats["audio_messages_yielded"] += 1
+                    
+                    # Track in global debug tracker
+                    self.audio_debug_tracker.record_audio_message_yielded(len(message.pcm))
+                    
+                    logger.info(f"=== AUDIO_DEBUG: Yielding audio message with {len(message.pcm)} samples (yielded count: {self.debug_stats['audio_messages_yielded']}) ===")
                     yield message
                     
                 except asyncio.TimeoutError:

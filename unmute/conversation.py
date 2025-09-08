@@ -215,6 +215,7 @@ class Conversation:
         try:
             audio_started = None
             message_count = 0
+            last_debug_summary = 0
             
             logger.info(f"Beginning TTS message iteration for conversation {self.conversation_id}")
 
@@ -224,7 +225,15 @@ class Conversation:
                     break
                     
                 message_count += 1
-                logger.info(f"Received TTS message #{message_count}: {type(message).__name__}")
+                logger.info(f"=== AUDIO_DEBUG: Received TTS message #{message_count}: {type(message).__name__} ===")
+
+                # Log debug summary every 10 messages or every 5 seconds
+                import time
+                current_time = time.time()
+                if message_count % 10 == 0 or (current_time - last_debug_summary) > 5:
+                    if hasattr(self.tts, 'log_debug_summary'):
+                        self.tts.log_debug_summary()
+                    last_debug_summary = current_time
 
                 # Check for interruption
                 if len(self.chatbot.chat_history) > generating_message_i:
@@ -232,7 +241,7 @@ class Conversation:
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
+                    logger.info(f"=== AUDIO_DEBUG: Processing TTSAudioMessage with {len(message.pcm)} samples ===")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
@@ -240,8 +249,12 @@ class Conversation:
                     audio = np.array(message.pcm, dtype=np.float32)
                     
                     # Output as tuple for FastRTC compatibility
-                    logger.info(f"Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz")
+                    logger.info(f"=== AUDIO_DEBUG: Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz (output_queue size: {output_queue.qsize()}) ===")
                     await output_queue.put((SAMPLE_RATE, audio))
+                    
+                    # Track in global debug tracker
+                    if hasattr(self.tts, 'audio_debug_tracker'):
+                        self.tts.audio_debug_tracker.record_output_queue_message()
 
                     if audio_started is None:
                         audio_started = self.n_samples_received / SAMPLE_RATE
