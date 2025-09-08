@@ -179,14 +179,14 @@ const Unmute = () => {
     const data = JSON.parse(lastMessage.data);
     if (data.type === "response.audio.delta") {
       const opus = base64DecodeOpus(data.delta);
-      console.log(`=== FRONTEND_AUDIO_DEBUG: Received audio delta, opus size: ${opus.length} bytes, base64 length: ${data.delta.length} ===`);
+      console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Received audio delta, opus size: ${opus.length} bytes, base64 length: ${data.delta.length} ===`);
       const ap = audioProcessor.current;
       if (!ap) {
-        console.error(`=== FRONTEND_AUDIO_DEBUG: Audio processor not available, dropping audio data ===`);
+        console.error(`=== SIMPLIFIED_AUDIO_FRONTEND: Audio processor not available, dropping audio data ===`);
         return;
       }
 
-      console.log(`=== FRONTEND_AUDIO_DEBUG: Sending opus data to decoder worker ===`);
+      console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Sending opus data to decoder worker ===`);
       ap.decoder.postMessage(
         {
           command: "decode",
@@ -194,6 +194,20 @@ const Unmute = () => {
         },
         [opus.buffer]
       );
+    } else if (data.type === "response.audio.start") {
+      console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Response audio start (response_id: ${data.response_id}) ===`);
+      // Optional: could be used for UI feedback
+    } else if (data.type === "response.audio.end") {
+      console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Response audio end (response_id: ${data.response_id}) ===`);
+      // Optional: could be used for UI feedback
+    } else if (data.type === "response.interrupted") {
+      console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Response interrupted (reason: ${data.reason}) - flushing audio buffers ===`);
+      const ap = audioProcessor.current;
+      if (ap && ap.outputWorklet) {
+        // Flush audio worklet buffers
+        ap.outputWorklet.port.postMessage({ type: "flush" });
+        console.log(`=== SIMPLIFIED_AUDIO_FRONTEND: Sent flush command to audio worklet ===`);
+      }
     } else if (data.type === "unmute.additional_outputs") {
       setDebugDict(data.args.debug_dict);
     } else if (data.type === "error") {

@@ -76,8 +76,13 @@ class TTSReadyMessage(BaseModel):
     type: Literal["Ready"]
 
 
+class TTSControlMessage(BaseModel):
+    type: Literal["AudioStart", "AudioEnd", "Interrupted"]
+    response_id: str | None = None
+
+
 TTSMessage = Annotated[
-    Union[TTSTextMessage, TTSAudioMessage, TTSErrorMessage, TTSReadyMessage],
+    Union[TTSTextMessage, TTSAudioMessage, TTSErrorMessage, TTSReadyMessage, TTSControlMessage],
     Field(discriminator="type"),
 ]
 TTSMessageAdapter = TypeAdapter(TTSMessage)
@@ -132,6 +137,13 @@ class TtsStreamingQuery(BaseModel):
 
 
 class TextToSpeech(ServiceWithStartup):
+    """
+    LEGACY TTS SERVICE - Consider using OrpheusTextToSpeech for simplified pipeline
+    
+    This class implements the original complex pipeline with RealtimeQueue timing control.
+    The simplified OrpheusTextToSpeech class below removes intermediate queues and provides
+    direct streaming from Orpheus → Opus encoding → WebSocket with faster interruption.
+    """
     def __init__(
         self,
         tts_base_url: str = TTS_SERVER,
@@ -158,6 +170,7 @@ class TextToSpeech(ServiceWithStartup):
         )
 
         # self.query_parameters = f"?voice={self.voice}&cfg_alpha=2&format=PcmMessagePack"
+        # LEGACY: RealtimeQueue used in original pipeline (kept for backward compatibility)
         self.text_output_queue = RealtimeQueue(get_time=get_time)
         
         # Track the last queued text message timestamp to properly schedule EOS
@@ -294,6 +307,7 @@ class TextToSpeech(ServiceWithStartup):
         mt.TTS_SESSIONS.inc()
         mt.TTS_ACTIVE_SESSIONS.inc()
 
+        # LEGACY: RealtimeQueue used in original pipeline (kept for backward compatibility)
         output_queue: RealtimeQueue[TTSMessage] = RealtimeQueue()
         
         # TTS Connection Health Monitoring
@@ -434,8 +448,8 @@ class TextToSpeech(ServiceWithStartup):
 
 class OrpheusTextToSpeech(ServiceWithStartup):
     """
-    Orpheus TTS adapter that uses Modal function calls directly.
-    Handles complete text input and streams audio output from the included Orpheus service.
+    Simplified Orpheus TTS adapter that streams audio directly without queues.
+    Implements the simplified pipeline: Orpheus → immediate Opus encoding → WebSocket
     """
 
     def __init__(
@@ -453,6 +467,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         # State management
         self.shutdown_lock = asyncio.Lock()
         self.shutdown_complete = asyncio.Event()
+        self.interrupted = asyncio.Event()
         
         # Timing and metrics
         self.time_since_request_sent = Stopwatch(autostart=False)
@@ -464,8 +479,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         self.modal_function = None
         self.current_generation_task = None
         
-        # Queue for audio chunks from streaming generation
-        self.audio_queue: asyncio.Queue[TTSMessage] = asyncio.Queue()
+        # Simplified streaming queue (minimal buffering)
+        self.audio_queue: asyncio.Queue[TTSMessage | None] = asyncio.Queue(maxsize=10)
+        
+        # Response tracking for interruption
+        self.current_response_id: str | None = None
         
         # Audio flow debug tracking
         self.debug_stats = {
@@ -480,7 +498,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         # Global audio debug tracker
         self.audio_debug_tracker = get_audio_debug_tracker()
         
-        logger.info("Initialized OrpheusTextToSpeech with voice: tara")
+        logger.info("Initialized simplified OrpheusTextToSpeech with voice: tara")
         
     def log_debug_summary(self):
         """Log a summary of audio flow debug statistics."""
@@ -533,8 +551,13 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.error(f"Failed to connect to Orpheus Modal service: {e}")
             raise
 
-    async def send_complete_text(self, text: str) -> None:
-        """Send complete text to Orpheus Modal service for audio generation."""
+    async def send_complete_text(self, text: str, response_id: str | None = None) -> None:
+        """Send complete text to Orpheus Modal service for audio generation.
+        
+        Args:
+            text: Text to synthesize
+            response_id: Optional response ID for tracking interruptions
+        """
         if self.modal_function is None:
             logger.error("Cannot send text - Orpheus Modal function not connected")
             return
@@ -543,19 +566,23 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.warning("Cannot send text - Orpheus Modal service shutting down")
             return
             
-        # If there's an ongoing generation, clean it up first
+        # If there's an ongoing generation, interrupt it first
         if self.current_generation_task and not self.current_generation_task.done():
-            logger.info("Stopping previous generation before starting new one")
-            await self.shutdown(full_shutdown=False)
+            logger.info("Interrupting previous generation before starting new one")
+            await self.interrupt_generation()
             
         text = prepare_text_for_tts(text)
         if not text.strip():
             logger.warning("Empty text after preprocessing, not sending to Orpheus Modal")
             return
             
+        # Set response ID for interruption tracking
+        self.current_response_id = response_id
+        self.interrupted.clear()
+        
         self.debug_stats["generation_requests"] += 1
         logger.info(f"=== AUDIO_DEBUG: Generation request #{self.debug_stats['generation_requests']} ===")
-        logger.info(f"Sending complete text to Orpheus Modal: '{text}'")
+        logger.info(f"Sending complete text to Orpheus Modal: '{text}' (response_id: {response_id})")
         
         # Reset state for new generation
         self.time_since_request_sent = Stopwatch(autostart=True)
@@ -580,7 +607,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         try:
             # Start the streaming generation task
             self.current_generation_task = asyncio.create_task(
-                self._stream_audio_from_modal(text)
+                self._stream_audio_from_modal(text, response_id)
             )
             
             logger.info("Text sent to Orpheus Modal successfully")
@@ -588,13 +615,49 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         except Exception as e:
             logger.error(f"Failed to send text to Orpheus Modal: {e}")
             raise
+
+    async def interrupt_generation(self) -> None:
+        """Interrupt the current generation and clear audio buffers."""
+        logger.info("Interrupting TTS generation")
+        
+        # Set interrupt flag
+        self.interrupted.set()
+        
+        # Cancel the current generation task
+        if self.current_generation_task and not self.current_generation_task.done():
+            self.current_generation_task.cancel()
+            try:
+                await self.current_generation_task
+            except asyncio.CancelledError:
+                logger.info("Generation task cancelled successfully")
+        
+        # Clear the audio queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        
+        # Signal end of stream to iterator
+        await self.audio_queue.put(None)
+        
+        logger.info("TTS generation interrupted and buffers cleared")
     
-    async def _stream_audio_from_modal(self, text: str) -> None:
-        """Stream audio chunks from Modal function and queue them."""
+    async def _stream_audio_from_modal(self, text: str, response_id: str | None = None) -> None:
+        """Stream audio chunks from Modal function with immediate processing (no queuing delays)."""
         try:
-            logger.info(f"Starting Modal streaming generation for: '{text[:50]}...'")
+            logger.info(f"Starting simplified Modal streaming for: '{text[:50]}...' (response_id: {response_id})")
             
-            # Call the Modal function with streaming
+            # Emit response.audio.start marker
+            if response_id:
+                start_message = TTSControlMessage(
+                    type="AudioStart",
+                    response_id=response_id
+                )
+                await self.audio_queue.put(start_message)
+                logger.info(f"Emitted response.audio.start for {response_id}")
+            
+            # Call the Modal function with streaming - no intermediate buffering
             def process_stream():
                 """Process the Modal generator synchronously."""
                 try:
@@ -605,8 +668,13 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         text=text,
                         voice=self.voice
                     ):
+                        # Check for interruption
+                        if self.interrupted.is_set():
+                            logger.info("Generation interrupted, stopping Modal stream")
+                            break
+                            
                         chunk_count += 1
-                        logger.info(f"=== AUDIO_DEBUG: Received raw chunk {chunk_count} from Modal: {len(audio_chunk)} bytes ===")
+                        logger.info(f"=== SIMPLIFIED_AUDIO: Received chunk {chunk_count} from Modal: {len(audio_chunk)} bytes ===")
                         yield audio_chunk
                     
                     logger.info(f"Modal generator completed with {chunk_count} chunks")
@@ -614,10 +682,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     logger.error(f"Error in Modal generator: {e}")
                     raise
             
-            # Process chunks as they come from the generator
+            # Process chunks immediately as they arrive - no timing delays
             chunk_index = 0
             for audio_chunk in process_stream():
-                if self.shutdown_complete.is_set():
+                # Check for interruption or shutdown
+                if self.interrupted.is_set() or self.shutdown_complete.is_set():
+                    logger.info("Stopping audio processing due to interruption/shutdown")
                     break
                 
                 chunk_index += 1
@@ -627,7 +697,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 # Track in global debug tracker
                 self.audio_debug_tracker.record_modal_chunk(len(audio_chunk))
                 
-                # Convert raw bytes to TTSAudioMessage
+                # Convert raw bytes to TTSAudioMessage immediately
                 try:
                     # Ensure buffer size is a multiple of 2 bytes (int16)
                     if len(audio_chunk) % 2 != 0:
@@ -641,13 +711,21 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         self.waiting_first_audio = False
                         ttft = self.time_since_request_sent.time()
                         mt.TTS_TTFT.observe(ttft)
-                        logger.info("Time to first audio from Orpheus Modal: %.1f ms", ttft * 1000)
+                        logger.info("=== SIMPLIFIED_AUDIO_TELEMETRY: Time to first audio from Orpheus Modal: %.1f ms ===", ttft * 1000)
+                        
+                        # Log telemetry for simplified pipeline
+                        logger.info("=== SIMPLIFIED_AUDIO_TELEMETRY: First chunk processing - Modal bytes: %d, PCM samples: %d, Response ID: %s ===", 
+                                   len(audio_chunk), len(audio_data), response_id)
                     
-                    # Create TTS audio message
+                    # Create TTS audio message with response_id for interruption tracking
                     audio_message = TTSAudioMessage(
                         type="Audio",
                         pcm=audio_data.tolist()
                     )
+                    
+                    # Add response_id to message for client-side filtering
+                    if hasattr(audio_message, '__dict__'):
+                        audio_message.__dict__['response_id'] = response_id
                     
                     self.received_samples += len(audio_data)
                     mt.TTS_RECV_FRAMES.inc()
@@ -660,31 +738,39 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                             ),
                         )
                     
-                    # Queue the audio message
+                    # Stream directly to queue without timing delays
                     await self.audio_queue.put(audio_message)
                     self.debug_stats["audio_messages_queued"] += 1
                     
                     # Track in global debug tracker
                     self.audio_debug_tracker.record_audio_message_queued(len(audio_data))
                     
-                    logger.info(f"=== AUDIO_DEBUG: Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()}) ===")
-                    logger.info(f"=== AUDIO_DEBUG: Total stats - Modal chunks: {self.debug_stats['modal_chunks_received']}, Queued messages: {self.debug_stats['audio_messages_queued']}, Bytes: {self.debug_stats['bytes_from_modal']}, Samples: {self.debug_stats['samples_processed']} ===")
+                    logger.info(f"=== SIMPLIFIED_AUDIO: Streamed chunk {chunk_index} with {len(audio_data)} samples immediately (queue size: {self.audio_queue.qsize()}) ===")
                     
-                    # Add a small delay to allow other async tasks to run
-                    await asyncio.sleep(0.001)
+                    # Minimal yield to prevent blocking - no artificial delays
+                    await asyncio.sleep(0)
                     
                 except ValueError as e:
                     logger.error(f"Failed to convert Orpheus Modal PCM bytes to float array: {e}")
                     continue
-                    
-            logger.info(f"Completed Modal streaming generation with {chunk_index} chunks")
             
+            # Emit response.audio.end marker
+            if response_id:
+                end_message = TTSControlMessage(
+                    type="AudioEnd",
+                    response_id=response_id
+                )
+                await self.audio_queue.put(end_message)
+                logger.info(f"Emitted response.audio.end for {response_id}")
+                    
+            logger.info(f"Completed simplified streaming with {chunk_index} chunks")
+            
+        except asyncio.CancelledError:
+            logger.info("Modal streaming cancelled due to interruption")
         except Exception as e:
-            logger.error(f"Error in Modal streaming generation: {e}")
+            logger.error(f"Error in simplified Modal streaming: {e}")
             import traceback
             traceback.print_exc()
-            # Put an error marker in the queue to signal completion
-            await self.audio_queue.put(None)
         finally:
             # Signal completion
             await self.audio_queue.put(None)
@@ -744,38 +830,56 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 logger.info("Orpheus Modal TTS generation cleaned up, connection maintained")
 
     async def __aiter__(self) -> AsyncIterator[TTSMessage]:
-        """Iterate over TTS messages from Orpheus Modal service.
+        """Simplified iterator that streams TTS messages directly without timing queues.
         
-        The Modal service streams raw 16-bit PCM audio bytes at 24kHz.
+        This implements the simplified pipeline: direct streaming from Modal → immediate output
         """
         if self.modal_function is None:
             raise RuntimeError("Orpheus Modal function not connected")
             
-        logger.info("Starting Orpheus Modal message iteration")
+        logger.info("Starting simplified Orpheus Modal message iteration")
         
         try:
-            # Process messages from the audio queue
+            # Stream messages directly from the audio queue (no RealtimeQueue delays)
             while True:
                 if self.shutdown_complete.is_set():
+                    logger.info("Shutdown complete, breaking iteration")
                     break
                     
                 try:
-                    # Wait for audio messages with a longer timeout to handle generation startup
+                    # Wait for messages with timeout to handle generation lifecycle
                     message = await asyncio.wait_for(self.audio_queue.get(), timeout=10.0)
                     
                     # None indicates end of stream
                     if message is None:
                         logger.info("Received end of stream marker, breaking iteration")
                         break
+                    
+                    # Handle control messages
+                    if isinstance(message, TTSControlMessage):
+                        logger.info(f"=== SIMPLIFIED_AUDIO: Yielding control message: {message.type} (response_id: {message.response_id}) ===")
+                        yield message
+                        continue
+                    
+                    # Handle audio messages - stream immediately without timing delays
+                    if isinstance(message, TTSAudioMessage):
+                        # Check if this message is from an interrupted response
+                        if hasattr(message, '__dict__') and message.__dict__.get('response_id') != self.current_response_id:
+                            logger.info(f"Dropping audio from superseded response: {message.__dict__.get('response_id')} != {self.current_response_id}")
+                            continue
+                            
+                        self.received_samples_yielded += len(message.pcm)
+                        self.debug_stats["audio_messages_yielded"] += 1
                         
-                    self.received_samples_yielded += len(message.pcm)
-                    self.debug_stats["audio_messages_yielded"] += 1
-                    
-                    # Track in global debug tracker
-                    self.audio_debug_tracker.record_audio_message_yielded(len(message.pcm))
-                    
-                    logger.info(f"=== AUDIO_DEBUG: Yielding audio message with {len(message.pcm)} samples (yielded count: {self.debug_stats['audio_messages_yielded']}) ===")
-                    yield message
+                        # Track in global debug tracker
+                        self.audio_debug_tracker.record_audio_message_yielded(len(message.pcm))
+                        
+                        logger.info(f"=== SIMPLIFIED_AUDIO: Yielding audio message with {len(message.pcm)} samples immediately (yielded count: {self.debug_stats['audio_messages_yielded']}) ===")
+                        yield message
+                    else:
+                        # Handle other message types
+                        logger.info(f"=== SIMPLIFIED_AUDIO: Yielding message: {type(message).__name__} ===")
+                        yield message
                     
                 except asyncio.TimeoutError:
                     # Check if we should continue waiting
@@ -791,9 +895,9 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         continue
                     
         except Exception as e:
-            logger.error(f"Orpheus Modal iteration error: {type(e).__name__}: {e}")
+            logger.error(f"Simplified Orpheus Modal iteration error: {type(e).__name__}: {e}")
             raise
         finally:
-            logger.info("Orpheus Modal message iteration completed")
+            logger.info("Simplified Orpheus Modal message iteration completed")
             # Don't automatically shutdown - keep the Modal function connection available
             # for subsequent TTS generations. Shutdown will be called explicitly when needed.

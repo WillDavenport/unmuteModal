@@ -134,6 +134,19 @@ class ResponseTextDone(BaseEvent[Literal["response.text.done"]]):
 
 class ResponseAudioDelta(BaseEvent[Literal["response.audio.delta"]]):
     delta: str  # Base64-encoded Opus audio data
+    response_id: str | None = None  # For interruption tracking
+
+
+class ResponseAudioStart(BaseEvent[Literal["response.audio.start"]]):
+    response_id: str
+
+
+class ResponseAudioEnd(BaseEvent[Literal["response.audio.end"]]):
+    response_id: str
+
+
+class ResponseInterrupted(BaseEvent[Literal["response.interrupted"]]):
+    reason: str | None = None
 
 
 class ResponseAudioDone(BaseEvent[Literal["response.audio.done"]]):
