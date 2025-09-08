@@ -59,14 +59,26 @@ export const useAudioProcessor = (
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       decoder.onmessage = (event: MessageEvent<any>) => {
         if (!event.data) {
+          console.warn("=== FRONTEND DECODER: Received empty data from decoder worker ===");
           return;
         }
         const frame = event.data[0];
+        const frameLength = frame ? frame.length : 0;
+        const decodedTime = new Date().toLocaleTimeString('en-US', { 
+          hour12: false, 
+          hour: '2-digit', 
+          minute: '2-digit', 
+          second: '2-digit', 
+          fractionalSecondDigits: 3 
+        });
+        console.log(`=== FRONTEND DECODER: Decoded audio frame at ${decodedTime}, length: ${frameLength} samples ===`);
+        
         outputWorklet.port.postMessage({
           frame: frame,
           type: "audio",
           micDuration: micDuration,
         });
+        console.log(`=== FRONTEND DECODER: Sent decoded frame to output worklet ===`);
       };
       decoder.postMessage({
         command: "init",
