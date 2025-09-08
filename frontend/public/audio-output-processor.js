@@ -8,7 +8,10 @@ function asSamples(mili) {
   return Math.round((mili * sampleRate) / 1000);
 }
 
-const DEFAULT_MAX_BUFFER_MS = 60 * 1000;
+// Simplified pipeline: smaller jitter buffer for lower latency
+const DEFAULT_MAX_BUFFER_MS = 120; // Reduced from 60 seconds to 120ms
+const INITIAL_BUFFER_MS = 80; // Target initial buffer
+const PARTIAL_BUFFER_MS = 20; // Smaller partial buffer
 
 const debug = (...args) => {
   // console.debug(...args);
@@ -17,23 +20,21 @@ const debug = (...args) => {
 class AudioOutputProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    debug("AudioOutputProcessor created", currentFrame, sampleRate);
+    debug("AudioOutputProcessor created (simplified pipeline)", currentFrame, sampleRate);
 
-    // Buffer length definitions
+    // Simplified buffer configuration for lower latency
     const frameSize = asSamples(80);
-    // initialBufferSamples: we wait to have at least that many samples before starting to play
-    this.initialBufferSamples = 1 * frameSize;
-    // once we have enough samples, we further wait that long before starting to play.
-    // This allows to have buffer lengths that are not a multiple of frameSize.
-    this.partialBufferSamples = asSamples(10);
-    // If the buffer length goes over that many, we will drop the oldest packets until
-    // we reach back initialBufferSamples + partialBufferSamples.
+    // initialBufferSamples: reduced for faster start
+    this.initialBufferSamples = asSamples(INITIAL_BUFFER_MS);
+    // partialBufferSamples: smaller for lower latency
+    this.partialBufferSamples = asSamples(PARTIAL_BUFFER_MS);
+    // maxBufferSamples: much smaller for simplified pipeline
     this.maxBufferSamples = asSamples(DEFAULT_MAX_BUFFER_MS);
-    // increments
+    // increments: smaller adjustments
     this.partialBufferIncrement = asSamples(5);
-    this.maxPartialWithIncrements = asSamples(80);
+    this.maxPartialWithIncrements = asSamples(60); // Reduced from 80ms
     this.maxBufferSamplesIncrement = asSamples(5);
-    this.maxMaxBufferWithIncrements = asSamples(80);
+    this.maxMaxBufferWithIncrements = asSamples(150); // Reduced from 80ms
 
     // State and metrics
     this.initState();
@@ -42,6 +43,11 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
       if (event.data.type == "reset") {
         debug("Reset audio processor state.");
         this.initState();
+        return;
+      }
+      if (event.data.type == "flush") {
+        debug("Flush audio processor buffers (response.interrupted).");
+        this.flushBuffers();
         return;
       }
       let frame = event.data.frame;
@@ -152,6 +158,15 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
     this.started = true;
     this.remainingPartialBufferSamples = this.partialBufferSamples;
     this.firstOut = true;
+  }
+
+  flushBuffers() {
+    // Clear all audio frames immediately (for response.interrupted)
+    debug("Flushing all audio buffers due to interruption");
+    this.frames = [];
+    this.offsetInFirstBuffer = 0;
+    this.resetStart();
+    console.log("Audio buffers flushed due to response.interrupted");
   }
 
   canPlay() {

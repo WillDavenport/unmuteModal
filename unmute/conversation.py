@@ -241,15 +241,15 @@ class Conversation:
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"=== AUDIO_DEBUG: Processing TTSAudioMessage with {len(message.pcm)} samples ===")
+                    logger.info(f"=== SIMPLIFIED_AUDIO: Processing TTSAudioMessage with {len(message.pcm)} samples ===")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
 
                     audio = np.array(message.pcm, dtype=np.float32)
                     
-                    # Output as tuple for FastRTC compatibility
-                    logger.info(f"=== AUDIO_DEBUG: Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz (output_queue size: {output_queue.qsize()}) ===")
+                    # Stream directly to output queue (no intermediate buffering)
+                    logger.info(f"=== SIMPLIFIED_AUDIO: Streaming audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz (output_queue size: {output_queue.qsize()}) ===")
                     await output_queue.put((SAMPLE_RATE, audio))
                     
                     # Track in global debug tracker
@@ -258,7 +258,25 @@ class Conversation:
 
                     if audio_started is None:
                         audio_started = self.n_samples_received / SAMPLE_RATE
-                        logger.info("First audio message received and queued to output")
+                        logger.info("First audio message received and streamed to output")
+
+                elif hasattr(message, 'type') and message.type in ["AudioStart", "AudioEnd"]:
+                    # Handle control messages from simplified pipeline
+                    from unmute.tts.text_to_speech import TTSControlMessage
+                    if isinstance(message, TTSControlMessage):
+                        logger.info(f"=== SIMPLIFIED_AUDIO: Processing control message: {message.type} (response_id: {message.response_id}) ===")
+                        
+                        if message.type == "AudioStart":
+                            # Emit response.audio.start
+                            await output_queue.put(ora.ResponseAudioStart(response_id=message.response_id))
+                            logger.info(f"=== SIMPLIFIED_AUDIO_TELEMETRY: Emitted response.audio.start for {message.response_id} ===")
+                            
+                        elif message.type == "AudioEnd":
+                            # Emit response.audio.end
+                            await output_queue.put(ora.ResponseAudioEnd(response_id=message.response_id))
+                            logger.info(f"=== SIMPLIFIED_AUDIO_TELEMETRY: Emitted response.audio.end for {message.response_id} ===")
+                        
+                        continue
 
                 elif isinstance(message, TTSTextMessage):
                     logger.info(f"Processing TTSTextMessage: {message.text}")
@@ -413,7 +431,9 @@ class Conversation:
             if self.tts is not None and complete_response.strip():
                 logger.info("Sending complete response to Orpheus TTS")
                 self.tts_output_stopwatch.start_if_not_started()
-                await self.tts.send_complete_text(complete_response)
+                # Generate response ID for interruption tracking
+                response_id = f"resp_{generating_message_i}_{hash(complete_response) % 10000}"
+                await self.tts.send_complete_text(complete_response, response_id=response_id)
             else:
                 if not complete_response.strip():
                     logger.warning("Empty response, not sending to TTS")
@@ -488,6 +508,14 @@ class Conversation:
         )
 
         await self.output_queue.put(ora.UnmuteInterruptedByVAD())
+        
+        # Interrupt TTS generation using simplified pipeline
+        if self.tts and hasattr(self.tts, 'interrupt_generation'):
+            logger.info("Interrupting TTS generation using simplified pipeline")
+            await self.tts.interrupt_generation()
+            
+            # Emit response.interrupted event
+            await self.output_queue.put(ora.ResponseInterrupted(reason="VAD detected user speech"))
         
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():

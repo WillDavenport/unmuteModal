@@ -525,7 +525,14 @@ async def emit_loop(
                 estimated_opus_bytes = (len(to_emit.delta) * 3) // 4
                 audio_debug_tracker.record_websocket_message_sent(estimated_opus_bytes)
                 
-                logger.info(f"=== AUDIO_DEBUG: Sending ResponseAudioDelta to websocket: {len(to_emit.delta)} base64 chars (~{estimated_opus_bytes} opus bytes) ===")
+                logger.info(f"=== SIMPLIFIED_AUDIO: Sending ResponseAudioDelta to websocket: {len(to_emit.delta)} base64 chars (~{estimated_opus_bytes} opus bytes) ===")
+                await websocket.send_text(to_emit.model_dump_json())
+            elif isinstance(to_emit, (ora.ResponseAudioStart, ora.ResponseAudioEnd, ora.ResponseInterrupted)):
+                # Handle simplified pipeline control messages
+                logger.info(f"=== SIMPLIFIED_AUDIO: Sending control message to websocket: {to_emit.type} ===")
+                await websocket.send_text(to_emit.model_dump_json())
+            elif hasattr(to_emit, 'model_dump_json'):
+                # Handle other server events
                 await websocket.send_text(to_emit.model_dump_json())
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
