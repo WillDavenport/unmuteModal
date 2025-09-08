@@ -9,14 +9,14 @@ Answer: Why do we have multiple queues and layers between Orpheus TTS and audio 
 ## Current vs Proposed (High Level)
 
 - Current: Orpheus → backend stream adapter → internal queues (timing/cadence) → encoder (Opus) → WebSocket → frontend decoder worker → audio worklet queue → output
-- Proposed: Orpheus → backend chunk normalizer + Opus encoder → WebSocket → frontend decoder worker → audio worklet output
-  - Remove: long-lived intermediate queues and cadence schedulers in the backend (keep only a minimal buffer for encoding granularity)
+- Proposed: Orpheus → backend Opus encoder → WebSocket → frontend decoder worker → audio worklet output
+  - Remove: long-lived intermediate queues and cadence schedulers in the backend (keep only a minimal buffer for quick flush on interrupt and encoder state)
   - Keep: a small jitter buffer on frontend worklet to avoid underruns; Opus encoding for bandwidth; VAD/interrupt signaling path
 
 ## Why all the queues existed
 
 - Backpressure smoothing: Prevent bursty upstream (model) from overflowing downstream (encoder/websocket/client).
-- Timing/cadence shaping: Convert irregular PCM chunks into steady Opus frames to avoid jitter.
+- Timing/cadence shaping: Smooth irregular production to avoid jitter during playback.
 - Interruption cut-through: Provide a place to drop superseded audio upon barge-in without waiting for upstream to stop.
 - Cross-component isolation: Decouple model stalls from websocket and client playback.
 - Monitoring/recovery: Measure throughput and detect stuck states.
@@ -27,10 +27,9 @@ These are valid concerns, but most can be handled with much smaller buffers and 
 
 1) Backend: Stream-normalize and encode
 - Receive raw PCM chunks from Orpheus stream
-- Immediately segment into 20 ms frames (960 samples at 48 kHz equiv., or 480 at 24 kHz; choose consistent sample rate)
-- Encode to Opus as pages as soon as a frame or small group is ready (e.g., 40–60 ms packetization for efficiency)
+- Encode each incoming Orpheus chunk to Opus immediately (no re-batching)
 - Send `response.audio.delta` messages to the client without additional timing queues
-- Maintain only a small (configurable) ring buffer (e.g., ≤ 200 ms) used solely for: (a) packetization completeness, (b) quick drop on interrupt
+- Maintain only a small (configurable) ring buffer (e.g., ≤ 200 ms) used solely for quick drop on interrupt and handling partial encoder state
 
 2) Backend: Interruption and VAD
 - VAD continuously runs on mic stream
@@ -84,8 +83,7 @@ This preserves: fast start, low-latency barge-in, simple control flow.
 Phase 1: Backend tightening
 - Replace the current multi-queue pipeline in `unmute/tts/text_to_speech.py` with a single producer that:
   - Reads Orpheus PCM stream iteratively
-  - Batches into fixed 20 ms frames (configurable N frames per Opus packet)
-  - Encodes immediately and emits `response.audio.delta`
+  - Encodes each Orpheus-provided chunk immediately and emits `response.audio.delta`
   - Maintains a ring buffer of ≤ 200 ms for quick flush
 - Add explicit interrupt hook to drop buffers and cancel Orpheus task
 
@@ -115,7 +113,7 @@ Phase 4: Clean-up
 ## Tuning Defaults
 
 - Sample rate: Keep 24 kHz end-to-end (Orpheus native), resample to AudioContext rate on frontend as today
-- Packetization: 40 ms per Opus packet (2 x 20 ms frames) for balance of latency and efficiency
+- Packetization: unchanged; encode per Orpheus chunk (no additional batching)
 - Backend ring buffer: 200 ms max; flush-on-interrupt
 - Frontend jitter: 80–120 ms initial; maintain ~100 ms when possible
 
@@ -128,7 +126,7 @@ Phase 4: Clean-up
 - Model cancellation delay
   - Mitigation: Cooperative cancel with Orpheus stream; ignore late-arriving audio after interrupt id
 - Opus encoder threading may become a hotspot
-  - Mitigation: Keep it in a background thread or process; batch 40–60 ms
+  - Mitigation: Keep it in a background thread or process; adjust encoder complexity if needed
 
 ## Migration Steps
 
