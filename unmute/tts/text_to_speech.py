@@ -1,12 +1,15 @@
 import asyncio
 import os
 import urllib.parse
+import base64
+import collections
 from logging import getLogger
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Union, cast
 import numpy as np
 
 import msgpack
 import websockets
+import sphn
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 import unmute.openai_realtime_api_events as ora
@@ -797,3 +800,352 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.info("Orpheus Modal message iteration completed")
             # Don't automatically shutdown - keep the Modal function connection available
             # for subsequent TTS generations. Shutdown will be called explicitly when needed.
+
+
+class SimplifiedTTSMessage(BaseModel):
+    """Simplified TTS message format for the new pipeline."""
+    type: Literal["audio_delta", "audio_start", "audio_end", "interrupted", "error"]
+    # For audio_delta: base64 Opus data
+    delta: str | None = None
+    # For audio_start/end: response identifier
+    response_id: str | None = None
+    # For interrupted: reason
+    reason: str | None = None
+    # For error: error message
+    message: str | None = None
+
+
+class SimplifiedOrpheusTextToSpeech(ServiceWithStartup):
+    """
+    Simplified Orpheus TTS implementation following the proposal:
+    - Minimal ring buffer (≤200ms) for encoding granularity only
+    - Direct Opus encoding and WebSocket streaming
+    - Immediate interrupt handling with buffer flush
+    """
+    
+    def __init__(
+        self,
+        tts_base_url: str = TTS_SERVER,
+        recorder: Recorder | None = None,
+        get_time: Callable[[], float] | None = None,
+        orpheus_service_instance = None,
+        ring_buffer_ms: float = 200.0,  # Maximum ring buffer size
+        opus_packet_ms: float = 40.0,   # Opus packet duration (2 x 20ms frames)
+    ):
+        self.recorder = recorder
+        self.get_time = get_time or (lambda: asyncio.get_event_loop().time())
+        self.voice = "tara"
+        self.orpheus_service_instance = orpheus_service_instance
+        
+        # Ring buffer configuration
+        self.ring_buffer_ms = ring_buffer_ms
+        self.opus_packet_ms = opus_packet_ms
+        self.frame_size_samples = int(SAMPLE_RATE * 0.02)  # 20ms frames at 24kHz
+        self.packet_size_samples = int(SAMPLE_RATE * opus_packet_ms / 1000)
+        self.ring_buffer_max_samples = int(SAMPLE_RATE * ring_buffer_ms / 1000)
+        
+        # Ring buffer for PCM samples (collections.deque for efficient operations)
+        self.ring_buffer = collections.deque(maxlen=self.ring_buffer_max_samples)
+        self.buffer_lock = asyncio.Lock()
+        
+        # Opus encoder
+        self.opus_encoder = sphn.OpusStreamWriter(SAMPLE_RATE)
+        
+        # State management
+        self.shutdown_lock = asyncio.Lock()
+        self.shutdown_complete = asyncio.Event()
+        self.interrupt_event = asyncio.Event()
+        
+        # Current generation task and response tracking
+        self.current_generation_task: asyncio.Task | None = None
+        self.current_response_id: str | None = None
+        self.is_interrupted = False
+        
+        # Timing and metrics
+        self.time_since_request_sent = Stopwatch(autostart=False)
+        self.waiting_first_audio = True
+        self.received_samples = 0
+        self.received_samples_yielded = 0
+        
+        # Modal function reference
+        self.modal_function = None
+        
+        # Output queue for WebSocket messages
+        self.output_queue: asyncio.Queue[SimplifiedTTSMessage] = asyncio.Queue()
+        
+        logger.info(f"Initialized SimplifiedOrpheusTextToSpeech with {ring_buffer_ms}ms ring buffer, {opus_packet_ms}ms packets")
+    
+    def state(self) -> WebsocketState:
+        if self.orpheus_service_instance is None and self.modal_function is None:
+            return "not_created"
+        elif self.shutdown_complete.is_set():
+            return "closed"
+        elif self.current_generation_task is not None:
+            return "connected"
+        else:
+            return "connecting"
+    
+    async def start_up(self):
+        """Initialize connection to Orpheus Modal service."""
+        try:
+            if self.orpheus_service_instance is not None:
+                logger.info("Using direct Orpheus service instance")
+                self.modal_function = self.orpheus_service_instance.generate_speech_stream
+                logger.info("Successfully connected to Orpheus Modal service via direct reference")
+                return
+            
+            from .orpheus_modal import OrpheusTTS
+            logger.info("Creating Orpheus Modal service instance from included app")
+            self.modal_function = OrpheusTTS().generate_speech_stream
+            logger.info("Successfully connected to Orpheus Modal service via included app")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to Orpheus Modal service: {e}")
+            raise
+    
+    async def send_complete_text(self, text: str, response_id: str | None = None) -> None:
+        """Send complete text to Orpheus for generation with simplified pipeline."""
+        if self.modal_function is None:
+            logger.error("Cannot send text - Orpheus Modal function not connected")
+            return
+            
+        if self.shutdown_lock.locked():
+            logger.warning("Cannot send text - service shutting down")
+            return
+        
+        # Cancel any ongoing generation
+        if self.current_generation_task and not self.current_generation_task.done():
+            logger.info("Interrupting previous generation for new text")
+            await self.interrupt()
+        
+        text = prepare_text_for_tts(text)
+        if not text.strip():
+            logger.warning("Empty text after preprocessing")
+            return
+        
+        # Reset state for new generation
+        self.current_response_id = response_id or f"resp_{asyncio.get_event_loop().time()}"
+        self.is_interrupted = False
+        self.interrupt_event.clear()
+        self.time_since_request_sent = Stopwatch(autostart=True)
+        self.waiting_first_audio = True
+        
+        # Clear ring buffer
+        async with self.buffer_lock:
+            self.ring_buffer.clear()
+        
+        # Send audio start marker
+        await self.output_queue.put(SimplifiedTTSMessage(
+            type="audio_start",
+            response_id=self.current_response_id
+        ))
+        
+        logger.info(f"Starting simplified TTS generation for response {self.current_response_id}: '{text[:50]}...'")
+        
+        # Start generation and encoding task
+        self.current_generation_task = asyncio.create_task(
+            self._generate_and_encode(text)
+        )
+    
+    async def interrupt(self, reason: str = "user_interrupt") -> None:
+        """Interrupt current generation and flush buffers."""
+        logger.info(f"Interrupting TTS generation: {reason}")
+        
+        self.is_interrupted = True
+        self.interrupt_event.set()
+        
+        # Cancel current generation
+        if self.current_generation_task and not self.current_generation_task.done():
+            self.current_generation_task.cancel()
+            try:
+                await self.current_generation_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush ring buffer
+        async with self.buffer_lock:
+            self.ring_buffer.clear()
+        
+        # Send interrupt message
+        await self.output_queue.put(SimplifiedTTSMessage(
+            type="interrupted",
+            reason=reason
+        ))
+        
+        logger.info("TTS interruption completed")
+    
+    async def _generate_and_encode(self, text: str) -> None:
+        """Generate audio from Orpheus and encode to Opus with minimal buffering."""
+        try:
+            logger.info(f"Starting Modal generation for: '{text[:50]}...'")
+            
+            # Process chunks from Modal
+            chunk_count = 0
+            for audio_chunk in self.modal_function.remote_gen(text=text, voice=self.voice):
+                if self.is_interrupted:
+                    logger.info("Generation interrupted, stopping")
+                    break
+                
+                chunk_count += 1
+                
+                # Convert raw bytes to float32 PCM
+                if len(audio_chunk) % 2 != 0:
+                    logger.warning(f"PCM buffer size {len(audio_chunk)} not multiple of 2, padding")
+                    audio_chunk = audio_chunk + b'\x00'
+                
+                audio_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                if self.waiting_first_audio:
+                    self.waiting_first_audio = False
+                    ttft = self.time_since_request_sent.time()
+                    mt.TTS_TTFT.observe(ttft)
+                    logger.info(f"Time to first audio: {ttft * 1000:.1f}ms")
+                
+                # Add samples to ring buffer and encode
+                await self._buffer_and_encode(audio_samples)
+                
+                # Record metrics
+                self.received_samples += len(audio_samples)
+                mt.TTS_RECV_FRAMES.inc()
+                
+                if self.recorder is not None:
+                    await self.recorder.add_event(
+                        "server",
+                        ora.UnmuteResponseAudioDeltaReady(number_of_samples=len(audio_samples))
+                    )
+            
+            # Flush remaining buffer
+            if not self.is_interrupted:
+                await self._flush_remaining_buffer()
+                
+                # Send audio end marker
+                await self.output_queue.put(SimplifiedTTSMessage(
+                    type="audio_end",
+                    response_id=self.current_response_id
+                ))
+            
+            logger.info(f"Completed generation with {chunk_count} chunks")
+            
+        except Exception as e:
+            logger.error(f"Error in generation: {e}")
+            await self.output_queue.put(SimplifiedTTSMessage(
+                type="error",
+                message=str(e)
+            ))
+        finally:
+            self.current_generation_task = None
+    
+    async def _buffer_and_encode(self, audio_samples: np.ndarray) -> None:
+        """Add samples to ring buffer and encode when we have enough for a packet."""
+        async with self.buffer_lock:
+            # Add samples to ring buffer
+            self.ring_buffer.extend(audio_samples)
+            
+            # Encode packets while we have enough samples
+            while len(self.ring_buffer) >= self.packet_size_samples:
+                # Extract packet worth of samples
+                packet_samples = np.array([self.ring_buffer.popleft() for _ in range(self.packet_size_samples)])
+                
+                # Encode to Opus
+                opus_bytes = await asyncio.to_thread(self.opus_encoder.append_pcm, packet_samples)
+                
+                if opus_bytes and not self.is_interrupted:
+                    # Send as WebSocket message
+                    delta_b64 = base64.b64encode(opus_bytes).decode('utf-8')
+                    await self.output_queue.put(SimplifiedTTSMessage(
+                        type="audio_delta",
+                        delta=delta_b64
+                    ))
+                    
+                    logger.debug(f"Encoded and queued {len(opus_bytes)} Opus bytes")
+    
+    async def _flush_remaining_buffer(self) -> None:
+        """Flush any remaining samples in the ring buffer."""
+        async with self.buffer_lock:
+            if len(self.ring_buffer) > 0:
+                # Pad to frame boundary if needed
+                remaining_samples = list(self.ring_buffer)
+                self.ring_buffer.clear()
+                
+                if len(remaining_samples) > 0:
+                    # Pad to frame size
+                    while len(remaining_samples) % self.frame_size_samples != 0:
+                        remaining_samples.append(0.0)
+                    
+                    remaining_array = np.array(remaining_samples, dtype=np.float32)
+                    opus_bytes = await asyncio.to_thread(self.opus_encoder.append_pcm, remaining_array)
+                    
+                    if opus_bytes:
+                        delta_b64 = base64.b64encode(opus_bytes).decode('utf-8')
+                        await self.output_queue.put(SimplifiedTTSMessage(
+                            type="audio_delta",
+                            delta=delta_b64
+                        ))
+                        
+                        logger.debug(f"Flushed final {len(opus_bytes)} Opus bytes")
+    
+    async def send(self, message: str) -> None:
+        """Legacy compatibility method."""
+        await self.send_complete_text(message)
+    
+    def queue_eos(self) -> None:
+        """Legacy compatibility method - not needed."""
+        pass
+    
+    async def shutdown(self):
+        """Shutdown the service."""
+        async with self.shutdown_lock:
+            if self.shutdown_complete.is_set():
+                return
+            
+            logger.info("Shutting down SimplifiedOrpheusTextToSpeech")
+            
+            # Interrupt any ongoing generation
+            if not self.is_interrupted:
+                await self.interrupt("shutdown")
+            
+            # Update metrics
+            mt.TTS_ACTIVE_SESSIONS.dec()
+            mt.TTS_AUDIO_DURATION.observe(self.received_samples / SAMPLE_RATE)
+            if self.time_since_request_sent.started:
+                mt.TTS_GEN_DURATION.observe(self.time_since_request_sent.time())
+            
+            self.shutdown_complete.set()
+            self.modal_function = None
+            logger.info("SimplifiedOrpheusTextToSpeech shutdown complete")
+    
+    async def __aiter__(self) -> AsyncIterator[SimplifiedTTSMessage]:
+        """Iterate over TTS messages from the simplified pipeline."""
+        if self.modal_function is None:
+            raise RuntimeError("Modal function not connected")
+        
+        logger.info("Starting simplified TTS message iteration")
+        
+        try:
+            while True:
+                if self.shutdown_complete.is_set():
+                    break
+                
+                try:
+                    message = await asyncio.wait_for(self.output_queue.get(), timeout=10.0)
+                    logger.debug(f"Yielding message: {message.type}")
+                    yield message
+                    
+                    # Break on audio_end or error
+                    if message.type in ("audio_end", "error"):
+                        break
+                        
+                except asyncio.TimeoutError:
+                    # Check if generation is still active
+                    if self.current_generation_task is None or self.current_generation_task.done():
+                        logger.info("No active generation, ending iteration")
+                        break
+                    else:
+                        logger.debug("Generation still active, continuing to wait")
+                        continue
+                        
+        except Exception as e:
+            logger.error(f"Simplified TTS iteration error: {e}")
+            raise
+        finally:
+            logger.info("Simplified TTS message iteration completed")
