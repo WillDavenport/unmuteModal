@@ -133,44 +133,84 @@ class OrpheusTTS:
     def generate_speech_stream(self, text: str, voice: str = "tara") -> Iterator[bytes]:
         """Generate speech from text with streaming output (raw audio data)"""
         import time
+        from modal_audio_debug import log_orpheus_event, AudioDebugSession
         
-        print(f"Generating streaming speech for text: '{text[:50]}...' with voice: {voice}")
-        
-        try:
-            start_time = time.monotonic()
-            first_token_time = None
+        # Use Modal-compatible debugging
+        with AudioDebugSession(f"orpheus_generation_{int(time.time())}") as session:
+            log_orpheus_event("generation_start", {
+                "text_length": len(text),
+                "text_preview": text[:100] + "..." if len(text) > 100 else text,
+                "voice": voice
+            })
             
-            # Generate speech tokens using the Orpheus model
-            syn_tokens = self.model.generate_speech(
-                prompt=text,
-                voice=voice,
-            )
-            
-            chunk_counter = 0
-            
-            # Stream raw audio chunks as they're generated
-            for audio_chunk in syn_tokens:
-                chunk_counter += 1
+            try:
+                start_time = time.monotonic()
+                first_token_time = None
                 
-                # Log time to first token
-                if first_token_time is None:
-                    first_token_time = time.monotonic()
-                    ttft = first_token_time - start_time
-                    print(f"Time to first token: {ttft:.3f}s")
+                # Generate speech tokens using the Orpheus model
+                syn_tokens = self.model.generate_speech(
+                    prompt=text,
+                    voice=voice,
+                )
                 
-                # Return raw audio data (no WAV headers per chunk)
-                yield audio_chunk
-            
-            end_time = time.monotonic()
-            generation_time = end_time - start_time
-            
-            print(f"Completed streaming generation in {generation_time:.2f}s ({chunk_counter} chunks)")
-            
-        except Exception as e:
-            print(f"Error generating streaming speech: {e}")
-            raise
+                chunk_counter = 0
+                total_bytes = 0
+                total_samples = 0
+                
+                # Stream raw audio chunks as they're generated
+                for audio_chunk in syn_tokens:
+                    chunk_counter += 1
+                    chunk_bytes = len(audio_chunk)
+                    chunk_samples = chunk_bytes // 2  # 16-bit PCM = 2 bytes per sample
+                    total_bytes += chunk_bytes
+                    total_samples += chunk_samples
+                    
+                    # Log time to first token
+                    if first_token_time is None:
+                        first_token_time = time.monotonic()
+                        ttft = first_token_time - start_time
+                        log_orpheus_event("first_token", {"ttft_seconds": ttft})
+                    
+                    log_orpheus_event("chunk_generated", {
+                        "chunk_number": chunk_counter,
+                        "chunk_bytes": chunk_bytes,
+                        "chunk_samples": chunk_samples,
+                        "total_bytes": total_bytes,
+                        "total_samples": total_samples
+                    })
+                    
+                    # Return raw audio data (no WAV headers per chunk)
+                    yield audio_chunk
+                
+                end_time = time.monotonic()
+                generation_time = end_time - start_time
+                audio_duration = total_samples / 24000.0  # 24kHz sample rate
+                rtf = audio_duration / generation_time if generation_time > 0 else 0
+                
+                log_orpheus_event("generation_complete", {
+                    "total_chunks": chunk_counter,
+                    "total_bytes": total_bytes,
+                    "total_samples": total_samples,
+                    "audio_duration": audio_duration,
+                    "generation_time": generation_time,
+                    "rtf": rtf
+                })
+                
+            except Exception as e:
+                log_orpheus_event("generation_error", {
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                })
+                import traceback
+                traceback.print_exc()
+                raise
     
     # Remove FastAPI/WebSocket endpoints - we'll use direct function calls instead
+
+
+# Add debug endpoints to the Orpheus app
+from modal_audio_debug import ModalAudioDebugger
+debug_stats_endpoint, reset_debug_endpoint = ModalAudioDebugger.create_debug_endpoint(orpheus_tts_app)
 
 
 @orpheus_tts_app.local_entrypoint()

@@ -209,46 +209,64 @@ class Conversation:
             logger.warning(f"TTS is None, cannot start TTS loop for conversation {self.conversation_id}")
             return
             
-        logger.info(f"Starting TTS loop for conversation {self.conversation_id} with TTS type: {type(self.tts).__name__}")
+        logger.info(f"=== CONVERSATION_TTS_LOOP_START ===")
+        logger.info(f"[CONVERSATION_TTS] Starting TTS loop for conversation {self.conversation_id}")
+        logger.info(f"[CONVERSATION_TTS] TTS type: {type(self.tts).__name__}")
         output_queue = self.output_queue
         
         try:
             audio_started = None
             message_count = 0
+            total_samples_processed = 0
+            total_samples_to_output = 0
             
-            logger.info(f"Beginning TTS message iteration for conversation {self.conversation_id}")
+            logger.info(f"[CONVERSATION_TTS] Beginning TTS message iteration")
 
             async for message in self.tts:
                 if self.shutdown_event.is_set():
-                    logger.info(f"Shutdown event set, breaking TTS loop for conversation {self.conversation_id}")
+                    logger.info(f"[CONVERSATION_TTS] Shutdown event set, breaking TTS loop")
                     break
                     
                 message_count += 1
-                logger.info(f"Received TTS message #{message_count}: {type(message).__name__}")
+                logger.info(f"=== CONVERSATION_TTS_MESSAGE_RECEIVED ===")
+                logger.info(f"[CONVERSATION_TTS] Received TTS message #{message_count}: {type(message).__name__}")
 
                 # Check for interruption
                 if len(self.chatbot.chat_history) > generating_message_i:
-                    logger.info("Response interrupted, breaking TTS loop")
+                    logger.info("[CONVERSATION_TTS] Response interrupted, breaking TTS loop")
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
+                    message_samples = len(message.pcm)
+                    total_samples_processed += message_samples
+                    
+                    logger.info(f"=== CONVERSATION_TTS_AUDIO_PROCESSING ===")
+                    logger.info(f"[CONVERSATION_TTS] Processing TTSAudioMessage")
+                    logger.info(f"[CONVERSATION_TTS] Message samples: {message_samples}")
+                    logger.info(f"[CONVERSATION_TTS] Total samples processed: {total_samples_processed}")
+                    
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
 
                     audio = np.array(message.pcm, dtype=np.float32)
+                    total_samples_to_output += len(audio)
                     
                     # Output as tuple for FastRTC compatibility
-                    logger.info(f"Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz")
+                    logger.info(f"=== CONVERSATION_TTS_TO_OUTPUT_QUEUE ===")
+                    logger.info(f"[CONVERSATION_TTS] Putting audio data to output queue")
+                    logger.info(f"[CONVERSATION_TTS] Audio samples: {len(audio)}")
+                    logger.info(f"[CONVERSATION_TTS] Sample rate: {SAMPLE_RATE}Hz")
+                    logger.info(f"[CONVERSATION_TTS] Total samples to output so far: {total_samples_to_output}")
+                    
                     await output_queue.put((SAMPLE_RATE, audio))
 
                     if audio_started is None:
                         audio_started = self.n_samples_received / SAMPLE_RATE
-                        logger.info("First audio message received and queued to output")
+                        logger.info("[CONVERSATION_TTS] First audio message received and queued to output")
 
                 elif isinstance(message, TTSTextMessage):
-                    logger.info(f"Processing TTSTextMessage: {message.text}")
+                    logger.info(f"[CONVERSATION_TTS] Processing TTSTextMessage: {message.text}")
                     await output_queue.put(ora.ResponseTextDelta(delta=message.text))
                     await self._add_chat_message_delta(
                         message.text,
@@ -256,16 +274,26 @@ class Conversation:
                         generating_message_i=generating_message_i,
                     )
                 else:
-                    logger.warning("Got unexpected message from TTS: %s", type(message).__name__)
+                    logger.warning("[CONVERSATION_TTS] Got unexpected message from TTS: %s", type(message).__name__)
 
         except websockets.ConnectionClosedError as e:
-            logger.error(f"TTS CONNECTION CLOSED WITH ERROR: {e}")
+            logger.error(f"[CONVERSATION_TTS] TTS CONNECTION CLOSED WITH ERROR: {e}")
         except Exception as e:
-            logger.error(f"TTS loop error for conversation {self.conversation_id}: {type(e).__name__}: {e}")
+            logger.error(f"=== CONVERSATION_TTS_LOOP_ERROR ===")
+            logger.error(f"[CONVERSATION_TTS] TTS loop error: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
 
-        logger.info("TTS loop ended, cleaning up")
+        audio_duration_processed = total_samples_processed / SAMPLE_RATE
+        audio_duration_to_output = total_samples_to_output / SAMPLE_RATE
+        
+        logger.info("=== CONVERSATION_TTS_LOOP_END ===")
+        logger.info(f"[CONVERSATION_TTS] TTS loop ended, cleaning up")
+        logger.info(f"[CONVERSATION_TTS] Total messages processed: {message_count}")
+        logger.info(f"[CONVERSATION_TTS] Total samples processed: {total_samples_processed}")
+        logger.info(f"[CONVERSATION_TTS] Total samples to output: {total_samples_to_output}")
+        logger.info(f"[CONVERSATION_TTS] Audio duration processed: {audio_duration_processed:.2f}s")
+        logger.info(f"[CONVERSATION_TTS] Audio duration to output: {audio_duration_to_output:.2f}s")
         
         # Push some silence to flush the Opus state
         logger.info("Pushing silence to flush Opus state")

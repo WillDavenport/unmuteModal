@@ -550,7 +550,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
     async def _stream_audio_from_modal(self, text: str) -> None:
         """Stream audio chunks from Modal function and queue them."""
         try:
-            logger.info(f"Starting Modal streaming generation for: '{text[:50]}...'")
+            from modal_audio_debug import log_backend_event
+            
+            log_backend_event("stream_start", {
+                "text_length": len(text),
+                "text_preview": text[:100] + "..." if len(text) > 100 else text
+            })
             
             # Call the Modal function with streaming
             def process_stream():
@@ -564,18 +569,26 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         voice=self.voice
                     ):
                         chunk_count += 1
-                        logger.debug(f"Received raw chunk {chunk_count}: {len(audio_chunk)} bytes")
+                        log_backend_event("chunk_received", {
+                            "chunk_number": chunk_count,
+                            "chunk_bytes": len(audio_chunk)
+                        })
                         yield audio_chunk
                     
-                    logger.info(f"Modal generator completed with {chunk_count} chunks")
+                    log_backend_event("modal_complete", {
+                        "total_chunks": chunk_count
+                    })
                 except Exception as e:
-                    logger.error(f"Error in Modal generator: {e}")
+                    logger.error(f"[BACKEND_TTS] Error in Modal generator: {e}")
                     raise
             
             # Process chunks as they come from the generator
             chunk_index = 0
+            total_samples_queued = 0
+            
             for audio_chunk in process_stream():
                 if self.shutdown_complete.is_set():
+                    logger.warning(f"[BACKEND_TTS] Shutdown detected, stopping processing")
                     break
                 
                 chunk_index += 1
@@ -584,7 +597,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 try:
                     # Ensure buffer size is a multiple of 2 bytes (int16)
                     if len(audio_chunk) % 2 != 0:
-                        logger.warning(f"PCM buffer size {len(audio_chunk)} is not a multiple of 2, padding with zero")
+                        logger.warning(f"[BACKEND_TTS] PCM buffer size {len(audio_chunk)} is not a multiple of 2, padding with zero")
                         audio_chunk = audio_chunk + b'\x00'
                     
                     audio_data = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
@@ -593,7 +606,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         self.waiting_first_audio = False
                         ttft = self.time_since_request_sent.time()
                         mt.TTS_TTFT.observe(ttft)
-                        logger.info("Time to first audio from Orpheus Modal: %.1f ms", ttft * 1000)
+                        logger.info(f"[BACKEND_TTS] Time to first audio from Orpheus Modal: {ttft * 1000:.1f} ms")
                     
                     # Create TTS audio message
                     audio_message = TTSAudioMessage(
@@ -602,6 +615,7 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     )
                     
                     self.received_samples += len(audio_data)
+                    total_samples_queued += len(audio_data)
                     mt.TTS_RECV_FRAMES.inc()
                     
                     if self.recorder is not None:
@@ -615,25 +629,38 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Queue the audio message
                     await self.audio_queue.put(audio_message)
                     
-                    logger.info(f"Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()})")
+                    log_backend_event("chunk_queued", {
+                        "chunk_number": chunk_index,
+                        "chunk_samples": len(audio_data),
+                        "queue_size": self.audio_queue.qsize(),
+                        "total_samples_queued": total_samples_queued
+                    })
                     
                     # Add a small delay to allow other async tasks to run
                     await asyncio.sleep(0.001)
                     
                 except ValueError as e:
-                    logger.error(f"Failed to convert Orpheus Modal PCM bytes to float array: {e}")
+                    logger.error(f"[BACKEND_TTS] Failed to convert Orpheus Modal PCM bytes to float array: {e}")
                     continue
                     
-            logger.info(f"Completed Modal streaming generation with {chunk_index} chunks")
+            audio_duration = total_samples_queued / 24000.0  # 24kHz sample rate
+            logger.info(f"=== BACKEND_TTS_STREAM_COMPLETE ===")
+            logger.info(f"[BACKEND_TTS] Completed Modal streaming generation")
+            logger.info(f"[BACKEND_TTS] Total chunks processed: {chunk_index}")
+            logger.info(f"[BACKEND_TTS] Total samples queued: {total_samples_queued}")
+            logger.info(f"[BACKEND_TTS] Audio duration: {audio_duration:.2f}s")
+            logger.info(f"[BACKEND_TTS] Final queue size: {self.audio_queue.qsize()}")
             
         except Exception as e:
-            logger.error(f"Error in Modal streaming generation: {e}")
+            logger.error(f"=== BACKEND_TTS_STREAM_ERROR ===")
+            logger.error(f"[BACKEND_TTS] Error in Modal streaming generation: {e}")
             import traceback
             traceback.print_exc()
             # Put an error marker in the queue to signal completion
             await self.audio_queue.put(None)
         finally:
             # Signal completion
+            logger.info(f"[BACKEND_TTS] Signaling stream completion (putting None in queue)")
             await self.audio_queue.put(None)
             self.current_generation_task = None
 
@@ -698,12 +725,17 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         if self.modal_function is None:
             raise RuntimeError("Orpheus Modal function not connected")
             
-        logger.info("Starting Orpheus Modal message iteration")
+        logger.info("=== BACKEND_TTS_ITERATION_START ===")
+        logger.info("[BACKEND_TTS] Starting Orpheus Modal message iteration")
+        
+        message_count = 0
+        total_samples_yielded = 0
         
         try:
             # Process messages from the audio queue
             while True:
                 if self.shutdown_complete.is_set():
+                    logger.info("[BACKEND_TTS] Shutdown detected, breaking iteration")
                     break
                     
                 try:
@@ -712,30 +744,47 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                     # None indicates end of stream
                     if message is None:
-                        logger.info("Received end of stream marker, breaking iteration")
+                        logger.info("=== BACKEND_TTS_END_OF_STREAM ===")
+                        logger.info("[BACKEND_TTS] Received end of stream marker, breaking iteration")
                         break
                         
-                    self.received_samples_yielded += len(message.pcm)
-                    logger.debug(f"Yielding audio message with {len(message.pcm)} samples")
+                    message_count += 1
+                    message_samples = len(message.pcm)
+                    self.received_samples_yielded += message_samples
+                    total_samples_yielded += message_samples
+                    
+                    log_backend_event("message_yielded", {
+                        "message_number": message_count,
+                        "message_samples": message_samples,
+                        "queue_size": self.audio_queue.qsize(),
+                        "total_samples_yielded": total_samples_yielded
+                    })
+                    
                     yield message
                     
                 except asyncio.TimeoutError:
                     # Check if we should continue waiting
                     if self.current_generation_task is None:
-                        logger.info("No generation task active, breaking iteration")
+                        logger.warning("[BACKEND_TTS] No generation task active, breaking iteration")
                         break
                     elif self.current_generation_task.done():
-                        logger.info("Generation task completed, breaking iteration")
+                        logger.info("[BACKEND_TTS] Generation task completed, breaking iteration")
                         break
                     else:
                         # Generation is still running, continue waiting
-                        logger.debug("Generation task still running, continuing to wait for audio")
+                        logger.debug("[BACKEND_TTS] Generation task still running, continuing to wait for audio")
                         continue
                     
         except Exception as e:
-            logger.error(f"Orpheus Modal iteration error: {type(e).__name__}: {e}")
+            logger.error(f"=== BACKEND_TTS_ITERATION_ERROR ===")
+            logger.error(f"[BACKEND_TTS] Orpheus Modal iteration error: {type(e).__name__}: {e}")
             raise
         finally:
-            logger.info("Orpheus Modal message iteration completed")
+            audio_duration = total_samples_yielded / 24000.0  # 24kHz sample rate
+            logger.info("=== BACKEND_TTS_ITERATION_COMPLETE ===")
+            logger.info(f"[BACKEND_TTS] Orpheus Modal message iteration completed")
+            logger.info(f"[BACKEND_TTS] Total messages yielded: {message_count}")
+            logger.info(f"[BACKEND_TTS] Total samples yielded: {total_samples_yielded}")
+            logger.info(f"[BACKEND_TTS] Audio duration yielded: {audio_duration:.2f}s")
             # Don't automatically shutdown - keep the Modal function connection available
             # for subsequent TTS generations. Shutdown will be called explicitly when needed.
