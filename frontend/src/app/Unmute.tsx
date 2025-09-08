@@ -194,6 +194,16 @@ const Unmute = () => {
         },
         [opus.buffer]
       );
+    } else if (data.type === "response.audio.start") {
+      console.log(`=== FRONTEND_AUDIO_DEBUG: Audio started for response: ${data.response_id} ===`);
+      // Audio start marker - could be used for UI feedback
+    } else if (data.type === "response.interrupted") {
+      console.log(`=== FRONTEND_AUDIO_DEBUG: Audio interrupted: ${data.reason} ===`);
+      // Flush the audio worklet buffers immediately
+      const ap = audioProcessor.current;
+      if (ap) {
+        ap.outputWorklet.port.postMessage({ type: "flush" });
+      }
     } else if (data.type === "unmute.additional_outputs") {
       setDebugDict(data.args.debug_dict);
     } else if (data.type === "error") {
@@ -236,6 +246,8 @@ const Unmute = () => {
         "response.text.delta",
         "response.text.done",
         "response.audio.done",
+        "response.audio.start", // New control message
+        "response.interrupted", // New control message
         "conversation.item.input_audio_transcription.delta",
         "input_audio_buffer.speech_stopped",
         "input_audio_buffer.speech_started",

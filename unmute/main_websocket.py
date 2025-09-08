@@ -527,6 +527,13 @@ async def emit_loop(
                 
                 logger.info(f"=== AUDIO_DEBUG: Sending ResponseAudioDelta to websocket: {len(to_emit.delta)} base64 chars (~{estimated_opus_bytes} opus bytes) ===")
                 await websocket.send_text(to_emit.model_dump_json())
+            elif isinstance(to_emit, (ora.ResponseAudioStart, ora.ResponseInterrupted)):
+                # Handle new control messages
+                logger.info(f"=== AUDIO_DEBUG: Sending control message to websocket: {to_emit.type} ===")
+                await websocket.send_text(to_emit.model_dump_json())
+            else:
+                # Handle all other server events normally
+                await websocket.send_text(to_emit.model_dump_json())
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):

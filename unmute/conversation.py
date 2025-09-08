@@ -30,7 +30,8 @@ from unmute.recorder import Recorder
 from unmute.service_discovery import find_instance
 from unmute.stt.speech_to_text import SpeechToText, STTMarkerMessage
 from unmute.timer import Stopwatch
-from unmute.tts.text_to_speech import TextToSpeech, TTSAudioMessage, TTSTextMessage, OrpheusTextToSpeech
+from unmute.tts.text_to_speech import TextToSpeech, TTSAudioMessage, TTSTextMessage, OrpheusTextToSpeech, SimplifiedOrpheusTextToSpeech, SimplifiedTTSMessage
+from unmute.simplified_tts_config import should_use_simplified_tts
 from unmute.kyutai_constants import (
     RECORDINGS_DIR, 
     SAMPLE_RATE, 
@@ -62,7 +63,7 @@ class Conversation:
         
         # Service connections
         self.stt: SpeechToText | None = None
-        self.tts: TextToSpeech | OrpheusTextToSpeech | None = None
+        self.tts: TextToSpeech | OrpheusTextToSpeech | SimplifiedOrpheusTextToSpeech | None = None
         self.chatbot = Chatbot()
         self.openai_client = get_openai_client()
         
@@ -137,24 +138,41 @@ class Conversation:
             raise
 
     async def _init_tts(self, generating_message_i: int):
-        """Initialize Orpheus TTS websocket connection."""
-        logger.info(f"Initializing Orpheus TTS for conversation {self.conversation_id}")
+        """Initialize TTS connection (simplified or legacy)."""
+        use_simplified = should_use_simplified_tts()
+        tts_type = "Simplified Orpheus" if use_simplified else "Orpheus"
+        logger.info(f"Initializing {tts_type} TTS for conversation {self.conversation_id}")
+        
         try:
-            factory = partial(
-                OrpheusTextToSpeech,
-                recorder=self.recorder,
-                get_time=lambda: self.n_samples_received / SAMPLE_RATE,
-            )
-            self.tts = await find_instance("tts", factory)
-            logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
-            
-            # Start TTS task
-            self.tts_task = asyncio.create_task(
-                self._tts_loop(generating_message_i), name=f"orpheus_tts_loop_{self.conversation_id}"
-            )
+            if use_simplified:
+                factory = partial(
+                    SimplifiedOrpheusTextToSpeech,
+                    recorder=self.recorder,
+                    get_time=lambda: self.n_samples_received / SAMPLE_RATE,
+                )
+                self.tts = await find_instance("tts", factory)
+                logger.info(f"Simplified Orpheus TTS connection established for conversation {self.conversation_id}")
+                
+                # Start simplified TTS task
+                self.tts_task = asyncio.create_task(
+                    self._simplified_tts_loop(generating_message_i), name=f"simplified_tts_loop_{self.conversation_id}"
+                )
+            else:
+                factory = partial(
+                    OrpheusTextToSpeech,
+                    recorder=self.recorder,
+                    get_time=lambda: self.n_samples_received / SAMPLE_RATE,
+                )
+                self.tts = await find_instance("tts", factory)
+                logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
+                
+                # Start legacy TTS task
+                self.tts_task = asyncio.create_task(
+                    self._tts_loop(generating_message_i), name=f"orpheus_tts_loop_{self.conversation_id}"
+                )
             
         except Exception as e:
-            logger.error(f"Failed to connect to Orpheus TTS service: {e}")
+            logger.error(f"Failed to connect to {tts_type} TTS service: {e}")
             raise
 
     async def _stt_loop(self):
@@ -303,6 +321,82 @@ class Conversation:
         await asyncio.sleep(1)
         await self._check_for_bot_goodbye()
         self.waiting_for_user_start_time = self.n_samples_received / SAMPLE_RATE
+
+    async def _simplified_tts_loop(self, generating_message_i: int):
+        """Simplified TTS processing loop for the new pipeline."""
+        if not self.tts:
+            logger.warning(f"TTS is None, cannot start simplified TTS loop for conversation {self.conversation_id}")
+            return
+            
+        logger.info(f"Starting simplified TTS loop for conversation {self.conversation_id}")
+        output_queue = self.output_queue
+        
+        try:
+            async for message in self.tts:
+                if self.shutdown_event.is_set():
+                    logger.info("Shutdown event set, breaking simplified TTS loop")
+                    break
+                
+                # Check for interruption
+                if len(self.chatbot.chat_history) > generating_message_i:
+                    logger.info("Response interrupted by new message, interrupting TTS")
+                    if hasattr(self.tts, 'interrupt'):
+                        await self.tts.interrupt("new_message")
+                    break
+
+                if isinstance(message, SimplifiedTTSMessage):
+                    if message.type == "audio_delta":
+                        # Send audio delta directly to WebSocket
+                        await output_queue.put(
+                            ora.ResponseAudioDelta(delta=message.delta)
+                        )
+                        logger.debug(f"Sent audio delta: {len(message.delta)} base64 chars")
+                        
+                    elif message.type == "audio_start":
+                        # Send audio start marker
+                        await output_queue.put(
+                            ora.ResponseAudioStart(response_id=message.response_id)
+                        )
+                        logger.info(f"Audio started for response: {message.response_id}")
+                        
+                    elif message.type == "audio_end":
+                        # Send audio done marker
+                        await output_queue.put(
+                            ora.ResponseAudioDone()
+                        )
+                        logger.info(f"Audio completed for response: {message.response_id}")
+                        break  # End of response
+                        
+                    elif message.type == "interrupted":
+                        # Send interrupt marker
+                        await output_queue.put(
+                            ora.ResponseInterrupted(reason=message.reason)
+                        )
+                        logger.info(f"TTS interrupted: {message.reason}")
+                        break  # End due to interrupt
+                        
+                    elif message.type == "error":
+                        # Send error
+                        await output_queue.put(
+                            ora.Error(message=f"TTS error: {message.message}")
+                        )
+                        logger.error(f"TTS error: {message.message}")
+                        break  # End due to error
+
+        except Exception as e:
+            logger.error(f"Simplified TTS loop error for conversation {self.conversation_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            logger.info(f"Simplified TTS loop completed for conversation {self.conversation_id}")
+            
+            # Send final updates
+            await self.output_queue.put(self._get_gradio_update())
+            
+            # Signal turn completion
+            await asyncio.sleep(1)
+            await self._check_for_bot_goodbye()
+            self.waiting_for_user_start_time = self.n_samples_received / SAMPLE_RATE
         logger.info("TTS loop cleanup completed")
 
     async def _generate_response(self):
@@ -488,6 +582,11 @@ class Conversation:
         )
 
         await self.output_queue.put(ora.UnmuteInterruptedByVAD())
+        
+        # Interrupt TTS if using simplified version
+        if self.tts and hasattr(self.tts, 'interrupt'):
+            logger.info("Interrupting simplified TTS")
+            await self.tts.interrupt("vad_interrupt")
         
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():

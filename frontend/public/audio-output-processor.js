@@ -8,7 +8,7 @@ function asSamples(mili) {
   return Math.round((mili * sampleRate) / 1000);
 }
 
-const DEFAULT_MAX_BUFFER_MS = 60 * 1000;
+const DEFAULT_MAX_BUFFER_MS = 120; // Reduced from 60 seconds to 120ms as per proposal
 
 const debug = (...args) => {
   // console.debug(...args);
@@ -19,13 +19,13 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
     super();
     debug("AudioOutputProcessor created", currentFrame, sampleRate);
 
-    // Buffer length definitions
+    // Buffer length definitions (reduced for simplified pipeline)
     const frameSize = asSamples(80);
     // initialBufferSamples: we wait to have at least that many samples before starting to play
-    this.initialBufferSamples = 1 * frameSize;
+    this.initialBufferSamples = 0.5 * frameSize; // Reduced from 1x to 0.5x for faster start
     // once we have enough samples, we further wait that long before starting to play.
     // This allows to have buffer lengths that are not a multiple of frameSize.
-    this.partialBufferSamples = asSamples(10);
+    this.partialBufferSamples = asSamples(5); // Reduced from 10ms to 5ms
     // If the buffer length goes over that many, we will drop the oldest packets until
     // we reach back initialBufferSamples + partialBufferSamples.
     this.maxBufferSamples = asSamples(DEFAULT_MAX_BUFFER_MS);
@@ -42,6 +42,11 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
       if (event.data.type == "reset") {
         debug("Reset audio processor state.");
         this.initState();
+        return;
+      }
+      if (event.data.type == "flush") {
+        debug("Flush audio processor buffers.");
+        this.flush();
         return;
       }
       let frame = event.data.frame;
@@ -146,6 +151,15 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
 
   resetStart() {
     this.started = false;
+  }
+
+  flush() {
+    // Clear all buffered frames immediately for interrupt handling
+    debug("Flushing audio buffers - clearing", this.frames.length, "frames");
+    this.frames = [];
+    this.offsetInFirstBuffer = 0;
+    this.resetStart();
+    // Keep timing state but clear audio
   }
 
   start() {
