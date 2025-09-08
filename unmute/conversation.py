@@ -280,7 +280,7 @@ class Conversation:
 
         logger.info("TTS loop ended, cleaning up")
         
-        Push some silence to flush the Opus state
+        # Push some silence to flush the Opus state
         logger.info("Pushing silence to flush Opus state")
         await output_queue.put(
             (SAMPLE_RATE, np.zeros(SAMPLES_PER_FRAME, dtype=np.float32))
