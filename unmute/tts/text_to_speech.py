@@ -550,9 +550,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
     async def _stream_audio_from_modal(self, text: str) -> None:
         """Stream audio chunks from Modal function and queue them."""
         try:
-            logger.info(f"=== BACKEND_TTS_STREAM_START ===")
-            logger.info(f"[BACKEND_TTS] Starting Modal streaming generation for: '{text[:100]}...'")
-            logger.info(f"[BACKEND_TTS] Text length: {len(text)} characters")
+            from modal_audio_debug import log_backend_event
+            
+            log_backend_event("stream_start", {
+                "text_length": len(text),
+                "text_preview": text[:100] + "..." if len(text) > 100 else text
+            })
             
             # Call the Modal function with streaming
             def process_stream():
@@ -566,12 +569,15 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                         voice=self.voice
                     ):
                         chunk_count += 1
-                        logger.info(f"=== BACKEND_TTS_RAW_CHUNK_RECEIVED ===")
-                        logger.info(f"[BACKEND_TTS] Received raw chunk #{chunk_count}: {len(audio_chunk)} bytes")
+                        log_backend_event("chunk_received", {
+                            "chunk_number": chunk_count,
+                            "chunk_bytes": len(audio_chunk)
+                        })
                         yield audio_chunk
                     
-                    logger.info(f"=== BACKEND_TTS_MODAL_COMPLETE ===")
-                    logger.info(f"[BACKEND_TTS] Modal generator completed with {chunk_count} chunks")
+                    log_backend_event("modal_complete", {
+                        "total_chunks": chunk_count
+                    })
                 except Exception as e:
                     logger.error(f"[BACKEND_TTS] Error in Modal generator: {e}")
                     raise
@@ -623,11 +629,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Queue the audio message
                     await self.audio_queue.put(audio_message)
                     
-                    logger.info(f"=== BACKEND_TTS_CHUNK_QUEUED ===")
-                    logger.info(f"[BACKEND_TTS] Queued audio chunk #{chunk_index}")
-                    logger.info(f"[BACKEND_TTS] Chunk samples: {len(audio_data)}")
-                    logger.info(f"[BACKEND_TTS] Queue size: {self.audio_queue.qsize()}")
-                    logger.info(f"[BACKEND_TTS] Total samples queued: {total_samples_queued}")
+                    log_backend_event("chunk_queued", {
+                        "chunk_number": chunk_index,
+                        "chunk_samples": len(audio_data),
+                        "queue_size": self.audio_queue.qsize(),
+                        "total_samples_queued": total_samples_queued
+                    })
                     
                     # Add a small delay to allow other async tasks to run
                     await asyncio.sleep(0.001)
@@ -746,11 +753,12 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     self.received_samples_yielded += message_samples
                     total_samples_yielded += message_samples
                     
-                    logger.info("=== BACKEND_TTS_MESSAGE_YIELDED ===")
-                    logger.info(f"[BACKEND_TTS] Yielding audio message #{message_count}")
-                    logger.info(f"[BACKEND_TTS] Message samples: {message_samples}")
-                    logger.info(f"[BACKEND_TTS] Queue size after get: {self.audio_queue.qsize()}")
-                    logger.info(f"[BACKEND_TTS] Total samples yielded: {total_samples_yielded}")
+                    log_backend_event("message_yielded", {
+                        "message_number": message_count,
+                        "message_samples": message_samples,
+                        "queue_size": self.audio_queue.qsize(),
+                        "total_samples_yielded": total_samples_yielded
+                    })
                     
                     yield message
                     
