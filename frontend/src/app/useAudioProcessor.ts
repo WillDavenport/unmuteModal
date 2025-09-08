@@ -59,14 +59,26 @@ export const useAudioProcessor = (
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       decoder.onmessage = (event: MessageEvent<any>) => {
         if (!event.data) {
+          console.warn(`[FRONTEND_DECODER] Received empty message from decoder worker`);
           return;
         }
+        
         const frame = event.data[0];
+        console.log(`=== FRONTEND_DECODER_OUTPUT ===`);
+        console.log(`[FRONTEND_DECODER] Received decoded audio frame`);
+        console.log(`[FRONTEND_DECODER] Frame length: ${frame ? frame.length : 'null'}`);
+        console.log(`[FRONTEND_DECODER] Mic duration: ${micDuration}`);
+        
+        console.log(`=== FRONTEND_TO_AUDIO_WORKLET ===`);
+        console.log(`[FRONTEND_DECODER] Sending frame to audio worklet`);
+        
         outputWorklet.port.postMessage({
           frame: frame,
           type: "audio",
           micDuration: micDuration,
         });
+        
+        console.log(`[FRONTEND_DECODER] Frame sent to audio worklet`);
       };
       decoder.postMessage({
         command: "init",

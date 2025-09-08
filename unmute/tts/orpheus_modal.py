@@ -134,7 +134,9 @@ class OrpheusTTS:
         """Generate speech from text with streaming output (raw audio data)"""
         import time
         
-        print(f"Generating streaming speech for text: '{text[:50]}...' with voice: {voice}")
+        print(f"=== ORPHEUS_GENERATION_START ===")
+        print(f"[ORPHEUS] Starting speech generation for text: '{text[:100]}...' (voice: {voice})")
+        print(f"[ORPHEUS] Text length: {len(text)} characters")
         
         try:
             start_time = time.monotonic()
@@ -147,27 +149,49 @@ class OrpheusTTS:
             )
             
             chunk_counter = 0
+            total_bytes = 0
+            total_samples = 0
             
             # Stream raw audio chunks as they're generated
             for audio_chunk in syn_tokens:
                 chunk_counter += 1
+                chunk_bytes = len(audio_chunk)
+                chunk_samples = chunk_bytes // 2  # 16-bit PCM = 2 bytes per sample
+                total_bytes += chunk_bytes
+                total_samples += chunk_samples
                 
                 # Log time to first token
                 if first_token_time is None:
                     first_token_time = time.monotonic()
                     ttft = first_token_time - start_time
-                    print(f"Time to first token: {ttft:.3f}s")
+                    print(f"[ORPHEUS] Time to first token: {ttft:.3f}s")
+                
+                print(f"=== ORPHEUS_CHUNK_GENERATED ===")
+                print(f"[ORPHEUS] Generated chunk #{chunk_counter}: {chunk_bytes} bytes, {chunk_samples} samples")
+                print(f"[ORPHEUS] Running totals: {total_bytes} bytes, {total_samples} samples")
                 
                 # Return raw audio data (no WAV headers per chunk)
                 yield audio_chunk
             
             end_time = time.monotonic()
             generation_time = end_time - start_time
+            audio_duration = total_samples / 24000.0  # 24kHz sample rate
+            rtf = audio_duration / generation_time if generation_time > 0 else 0
             
-            print(f"Completed streaming generation in {generation_time:.2f}s ({chunk_counter} chunks)")
+            print(f"=== ORPHEUS_GENERATION_COMPLETE ===")
+            print(f"[ORPHEUS] Generation completed successfully")
+            print(f"[ORPHEUS] Total chunks generated: {chunk_counter}")
+            print(f"[ORPHEUS] Total bytes: {total_bytes}")
+            print(f"[ORPHEUS] Total samples: {total_samples}")
+            print(f"[ORPHEUS] Audio duration: {audio_duration:.2f}s")
+            print(f"[ORPHEUS] Generation time: {generation_time:.2f}s")
+            print(f"[ORPHEUS] Real-time factor (RTF): {rtf:.2f}")
             
         except Exception as e:
-            print(f"Error generating streaming speech: {e}")
+            print(f"=== ORPHEUS_GENERATION_ERROR ===")
+            print(f"[ORPHEUS] Error during speech generation: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
     # Remove FastAPI/WebSocket endpoints - we'll use direct function calls instead
