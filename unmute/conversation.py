@@ -232,7 +232,7 @@ class Conversation:
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
+                    logger.info(f"=== CONVERSATION TTS: Processing TTSAudioMessage with {len(message.pcm)} samples ===")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
@@ -240,12 +240,13 @@ class Conversation:
                     audio = np.array(message.pcm, dtype=np.float32)
                     
                     # Output as tuple for FastRTC compatibility
-                    logger.info(f"Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz")
+                    logger.info(f"=== CONVERSATION TTS: Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz ===")
                     await output_queue.put((SAMPLE_RATE, audio))
+                    logger.info(f"=== CONVERSATION TTS: Successfully queued audio to output_queue ===")
 
                     if audio_started is None:
                         audio_started = self.n_samples_received / SAMPLE_RATE
-                        logger.info("First audio message received and queued to output")
+                        logger.info("=== CONVERSATION TTS: First audio message received and queued to output ===")
 
                 elif isinstance(message, TTSTextMessage):
                     logger.info(f"Processing TTSTextMessage: {message.text}")

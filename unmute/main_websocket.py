@@ -492,19 +492,23 @@ async def emit_loop(
                 # Handle audio tuple: (sample_rate, audio_data)
                 try:
                     _sr, audio = emitted_by_handler
+                    logger.info(f"=== WEBSOCKET EMIT: Received audio tuple: sample_rate={_sr}, audio_length={len(audio)} ===")
                     audio = audio_to_float32(audio)
+                    logger.info(f"=== WEBSOCKET EMIT: Converted to float32, calling opus_writer.append_pcm ===")
                     opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
                     # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
                     if opus_bytes:
-                        logger.info(f"Sending audio to realtime websocket: {len(opus_bytes)} opus bytes")
+                        logger.info(f"=== WEBSOCKET EMIT: Got opus bytes from encoder: {len(opus_bytes)} bytes ===")
+                        logger.info(f"=== WEBSOCKET EMIT: Sending audio to realtime websocket: {len(opus_bytes)} opus bytes ===")
                         to_emit = ora.ResponseAudioDelta(
                             delta=base64.b64encode(opus_bytes).decode("utf-8"),
                         )
+                        logger.info(f"=== WEBSOCKET EMIT: Created ResponseAudioDelta with base64 delta of length {len(to_emit.delta)} ===")
                     else:
-                        logger.warning(f"No audio to send to realtime websocket")
+                        logger.warning(f"=== WEBSOCKET EMIT: No opus bytes from encoder, skipping ===")
                         continue
                 except (TypeError, ValueError) as e:
-                    logger.error(f"Failed to unpack emitted_by_handler: {type(emitted_by_handler)=}, {emitted_by_handler=}, error: {e}")
+                    logger.error(f"=== WEBSOCKET EMIT: Failed to unpack emitted_by_handler: {type(emitted_by_handler)=}, {emitted_by_handler=}, error: {e} ===")
                     # Skip this iteration if we can't handle the data
                     continue
         except Exception as e:
@@ -518,7 +522,9 @@ async def emit_loop(
 
         try:
             if isinstance(to_emit, ora.ResponseAudioDelta):
+                logger.info(f"=== WEBSOCKET EMIT: Sending ResponseAudioDelta to frontend via WebSocket ===")
                 await websocket.send_text(to_emit.model_dump_json())
+                logger.info(f"=== WEBSOCKET EMIT: Successfully sent ResponseAudioDelta to frontend ===")
         except (WebSocketDisconnect, RuntimeError) as e:
             if isinstance(e, RuntimeError):
                 if "Unexpected ASGI message 'websocket.send'" in str(e):

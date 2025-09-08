@@ -179,10 +179,22 @@ const Unmute = () => {
     const data = JSON.parse(lastMessage.data);
     if (data.type === "response.audio.delta") {
       const opus = base64DecodeOpus(data.delta);
-      console.log(`=== FRONTEND: Received audio delta, opus size: ${opus.length} bytes ===`);
+      const receivedTime = new Date().toLocaleTimeString('en-US', { 
+        hour12: false, 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit', 
+        fractionalSecondDigits: 3 
+      });
+      console.log(`=== FRONTEND: Received audio delta at ${receivedTime}, opus size: ${opus.length} bytes, base64 length: ${data.delta.length} ===`);
+      
       const ap = audioProcessor.current;
-      if (!ap) return;
+      if (!ap) {
+        console.error(`=== FRONTEND: Audio processor not available, cannot decode audio ===`);
+        return;
+      }
 
+      console.log(`=== FRONTEND: Sending opus data to decoder worker ===`);
       ap.decoder.postMessage(
         {
           command: "decode",
@@ -190,6 +202,7 @@ const Unmute = () => {
         },
         [opus.buffer]
       );
+      console.log(`=== FRONTEND: Successfully sent opus data to decoder worker ===`);
     } else if (data.type === "unmute.additional_outputs") {
       setDebugDict(data.args.debug_dict);
     } else if (data.type === "error") {
