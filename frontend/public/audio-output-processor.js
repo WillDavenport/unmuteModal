@@ -8,7 +8,7 @@ function asSamples(mili) {
   return Math.round((mili * sampleRate) / 1000);
 }
 
-const DEFAULT_MAX_BUFFER_MS = 30 * 1000;
+const DEFAULT_MAX_BUFFER_MS = 60 * 1000;
 
 const debug = (...args) => {
   // console.debug(...args);
@@ -65,6 +65,7 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
           asMs(this.currentSamples()),
           asMs(this.totalMaxBufferSamples())
         );
+        console.warn("Dropping packets", asMs(this.currentSamples()), asMs(this.totalMaxBufferSamples()));
         const target = this.initialBufferSamples + this.partialBufferSamples;
         while (
           this.currentSamples() >

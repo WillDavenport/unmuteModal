@@ -41,7 +41,7 @@ from unmute import metrics as mt
 import numpy as np
 
 # Constants from unmute_handler
-USER_SILENCE_TIMEOUT = 7.0
+USER_SILENCE_TIMEOUT = 25.0
 FIRST_MESSAGE_TEMPERATURE = 0.7
 FURTHER_MESSAGES_TEMPERATURE = 0.3
 UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 3
@@ -267,7 +267,7 @@ class Conversation:
 
         logger.info("TTS loop ended, cleaning up")
         
-        # Push some silence to flush the Opus state
+        Push some silence to flush the Opus state
         logger.info("Pushing silence to flush Opus state")
         await output_queue.put(
             (SAMPLE_RATE, np.zeros(SAMPLES_PER_FRAME, dtype=np.float32))
@@ -285,7 +285,7 @@ class Conversation:
 
         # Signal that the turn is over by adding an empty message
         logger.info("Adding empty user message to signal turn end")
-        await self._add_chat_message_delta("", "user")
+        # await self._add_chat_message_delta("", "user")
 
         await asyncio.sleep(1)
         await self._check_for_bot_goodbye()
@@ -463,6 +463,7 @@ class Conversation:
 
         if self._clear_queue is not None:
             # Clear any audio queued up by FastRTC's emit().
+            logger.info("Clearing FastRTC audio queue")
             self._clear_queue()
             
         logger.info("Clearing TTS output queue because bot was interrupted")
@@ -477,13 +478,16 @@ class Conversation:
         
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():
+            logger.info("Cancelling TTS task")
             self.tts_task.cancel()
             
         # Cancel current LLM task if running  
         if self.llm_task and not self.llm_task.done():
+            logger.info("Cancelling LLM task")
             self.llm_task.cancel()
             
         # Reset events
+        logger.info("Resetting STT and LLM finished events")
         self.stt_finished_event.clear()
         self.llm_finished_event.clear()
 
@@ -594,6 +598,7 @@ class Conversation:
 
     def set_clear_queue_callback(self, clear_queue_fn):
         """Set the callback to clear FastRTC's audio queue."""
+        logger.info("Setting clear queue callback")
         self._clear_queue = clear_queue_fn
 
     async def cleanup(self):
