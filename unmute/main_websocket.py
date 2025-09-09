@@ -496,7 +496,6 @@ async def emit_loop(
                     opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
                     # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
                     if opus_bytes:
-                        logger.info(f"Sending audio to realtime websocket: {len(opus_bytes)} opus bytes")
                         to_emit = ora.ResponseAudioDelta(
                             delta=base64.b64encode(opus_bytes).decode("utf-8"),
                         )

@@ -41,7 +41,7 @@ from unmute import metrics as mt
 import numpy as np
 
 # Constants from unmute_handler
-USER_SILENCE_TIMEOUT = 7.0
+USER_SILENCE_TIMEOUT = 25.0
 FIRST_MESSAGE_TEMPERATURE = 0.7
 FURTHER_MESSAGES_TEMPERATURE = 0.3
 UNINTERRUPTIBLE_BY_VAD_TIME_SEC = 3
@@ -224,7 +224,6 @@ class Conversation:
                     break
                     
                 message_count += 1
-                logger.info(f"Received TTS message #{message_count}: {type(message).__name__}")
 
                 # Check for interruption
                 if len(self.chatbot.chat_history) > generating_message_i:
@@ -232,7 +231,6 @@ class Conversation:
                     break
 
                 if isinstance(message, TTSAudioMessage):
-                    logger.info(f"Processing TTSAudioMessage with {len(message.pcm)} samples")
                     t = self.tts_output_stopwatch.stop()
                     if t is not None:
                         self.debug_dict["timing"]["tts_audio"] = t
@@ -240,7 +238,6 @@ class Conversation:
                     audio = np.array(message.pcm, dtype=np.float32)
                     
                     # Output as tuple for FastRTC compatibility
-                    logger.info(f"Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz")
                     await output_queue.put((SAMPLE_RATE, audio))
 
                     if audio_started is None:
