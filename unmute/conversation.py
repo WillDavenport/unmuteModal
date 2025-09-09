@@ -346,6 +346,13 @@ class Conversation:
 
         messages = self.chatbot.preprocessed_messages()
         logger.info(f"Preprocessed {len(messages)} messages for LLM")
+        
+        # Safety check: don't call LLM if we only have system messages
+        # Wait for actual user input before generating responses
+        non_system_messages = [msg for msg in messages if msg["role"] != "system"]
+        if not non_system_messages:
+            logger.info("No user messages found, skipping LLM generation")
+            return
 
         self.tts_output_stopwatch = Stopwatch(autostart=False)
 
