@@ -25,6 +25,7 @@ from unmute.timer import Stopwatch
 from unmute.audio_debug import get_audio_debug_tracker
 from unmute.tts.realtime_queue import RealtimeQueue
 from unmute.websocket_utils import WebsocketState
+from unmute.wav_debug import accumulate_debug_audio_async, finalize_debug_stage_async
 
 logger = getLogger(__name__)
 
@@ -543,10 +544,19 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.warning("Cannot send text - Orpheus Modal service shutting down")
             return
             
-        # If there's an ongoing generation, clean it up first
+        # If there's an ongoing generation, wait for it to complete naturally
         if self.current_generation_task and not self.current_generation_task.done():
-            logger.info("Stopping previous generation before starting new one")
-            await self.shutdown(full_shutdown=False)
+            logger.info("Waiting for previous generation to complete before starting new one")
+            try:
+                # Wait up to 10 seconds for the current generation to complete
+                await asyncio.wait_for(self.current_generation_task, timeout=10.0)
+                logger.info("Previous generation completed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Previous generation timed out, cancelling it")
+                await self.shutdown(full_shutdown=False)
+            except Exception as e:
+                logger.warning(f"Previous generation failed: {e}")
+                await self.shutdown(full_shutdown=False)
             
         text = prepare_text_for_tts(text)
         if not text.strip():
@@ -617,7 +627,10 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             # Process chunks as they come from the generator
             chunk_index = 0
             for audio_chunk in process_stream():
-                if self.shutdown_complete.is_set():
+                # Don't break on shutdown_complete during active generation
+                # Only break if the current generation task was cancelled
+                if self.current_generation_task and self.current_generation_task.cancelled():
+                    logger.info("Generation task cancelled, stopping audio stream processing")
                     break
                 
                 chunk_index += 1
@@ -667,6 +680,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Track in global debug tracker
                     self.audio_debug_tracker.record_audio_message_queued(len(audio_data))
                     
+                    # Accumulate audio for consolidated WAV file
+                    await accumulate_debug_audio_async(
+                        audio_data, SAMPLE_RATE, "tts_audio_queue", "orpheus_modal"
+                    )
+                    
                     logger.info(f"=== AUDIO_DEBUG: Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()}) ===")
                     logger.info(f"=== AUDIO_DEBUG: Total stats - Modal chunks: {self.debug_stats['modal_chunks_received']}, Queued messages: {self.debug_stats['audio_messages_queued']}, Bytes: {self.debug_stats['bytes_from_modal']}, Samples: {self.debug_stats['samples_processed']} ===")
                     
@@ -675,9 +693,23 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                 except ValueError as e:
                     logger.error(f"Failed to convert Orpheus Modal PCM bytes to float array: {e}")
-                    continue
+                    logger.error(f"Audio chunk details: length={len(audio_chunk)}, type={type(audio_chunk)}")
+                    # Don't continue - this could indicate a serious issue that would cause audio truncation
+                    # Instead, try to pad the chunk if it's just a length issue
+                    if len(audio_chunk) % 2 != 0:
+                        logger.warning("Attempting to pad audio chunk and retry conversion")
+                        try:
+                            padded_chunk = audio_chunk + b'\x00'
+                            audio_data = np.frombuffer(padded_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                            self.debug_stats["samples_processed"] += len(audio_data)
+                        except Exception as retry_error:
+                            logger.error(f"Retry failed: {retry_error}, skipping chunk")
+                            continue
+                    else:
+                        continue
                     
             logger.info(f"Completed Modal streaming generation with {chunk_index} chunks")
+            logger.info(f"=== AUDIO_DEBUG: Final generation stats - Total bytes: {self.debug_stats['bytes_from_modal']}, Total samples: {self.debug_stats['samples_processed']}, Expected duration: {self.debug_stats['samples_processed'] / SAMPLE_RATE:.2f}s ===")
             
         except Exception as e:
             logger.error(f"Error in Modal streaming generation: {e}")
@@ -774,6 +806,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Track in global debug tracker
                     self.audio_debug_tracker.record_audio_message_yielded(len(message.pcm))
                     
+                    # Accumulate audio for consolidated WAV file
+                    await accumulate_debug_audio_async(
+                        message.pcm, SAMPLE_RATE, "tts_yielded", "orpheus_modal"
+                    )
+                    
                     logger.info(f"=== AUDIO_DEBUG: Yielding audio message with {len(message.pcm)} samples (yielded count: {self.debug_stats['audio_messages_yielded']}) ===")
                     yield message
                     
@@ -794,6 +831,10 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             logger.error(f"Orpheus Modal iteration error: {type(e).__name__}: {e}")
             raise
         finally:
+            # Finalize accumulated debug audio
+            await finalize_debug_stage_async("tts_audio_queue", "orpheus_modal")
+            await finalize_debug_stage_async("tts_yielded", "orpheus_modal")
+            
             logger.info("Orpheus Modal message iteration completed")
             # Don't automatically shutdown - keep the Modal function connection available
             # for subsequent TTS generations. Shutdown will be called explicitly when needed.

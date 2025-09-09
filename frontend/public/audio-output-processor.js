@@ -14,6 +14,142 @@ const debug = (...args) => {
   // console.debug(...args);
 };
 
+// Debug configuration - check for debug flag in URL params
+const DEBUG_WAV_ENABLED = true;
+
+// Audio accumulation for consolidated WAV files
+let audioBuffers = new Map(); // stage -> array of audio chunks
+let bufferSampleRates = new Map(); // stage -> sample rate
+let bufferStartTimes = new Map(); // stage -> start timestamp
+
+// Audio accumulation functions
+function accumulateAudio(audioData, sampleRate, stage) {
+  if (!DEBUG_WAV_ENABLED) return;
+  
+  try {
+    if (!audioBuffers.has(stage)) {
+      audioBuffers.set(stage, []);
+      bufferSampleRates.set(stage, sampleRate);
+      bufferStartTimes.set(stage, getTimestamp());
+      console.log(`=== FRONTEND_WAV_DEBUG: Started accumulating audio for ${stage} ===`);
+    }
+    
+    // Copy audio data to avoid reference issues
+    const audioCopy = new Float32Array(audioData.length);
+    audioCopy.set(audioData);
+    audioBuffers.get(stage).push(audioCopy);
+    
+    const totalSamples = audioBuffers.get(stage).reduce((sum, chunk) => sum + chunk.length, 0);
+    const durationSec = totalSamples / sampleRate;
+    console.log(`=== FRONTEND_WAV_DEBUG: Accumulated ${audioData.length} samples for ${stage}, total: ${totalSamples} samples (${durationSec.toFixed(2)}s) ===`);
+    
+  } catch (error) {
+    console.error(`Failed to accumulate audio data for ${stage}:`, error);
+  }
+}
+
+function finalizeStage(stage) {
+  if (!DEBUG_WAV_ENABLED) return;
+  
+  if (!audioBuffers.has(stage) || audioBuffers.get(stage).length === 0) {
+    console.log(`=== FRONTEND_WAV_DEBUG: No audio data accumulated for ${stage} ===`);
+    return;
+  }
+  
+  try {
+    const chunks = audioBuffers.get(stage);
+    const sampleRate = bufferSampleRates.get(stage);
+    const startTime = bufferStartTimes.get(stage);
+    
+    // Calculate total length
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    
+    // Concatenate all chunks
+    const consolidatedAudio = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      consolidatedAudio.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // Create consolidated WAV file
+    const filename = `audio-processor-${stage}-${startTime}.wav`;
+    createConsolidatedWavFile(consolidatedAudio, sampleRate, filename);
+    
+    // Clear buffers
+    audioBuffers.delete(stage);
+    bufferSampleRates.delete(stage);
+    bufferStartTimes.delete(stage);
+    
+    const durationSec = totalLength / sampleRate;
+    console.log(`=== FRONTEND_WAV_DEBUG: Finalized ${stage} with ${totalLength} samples (${durationSec.toFixed(2)}s) -> ${filename} ===`);
+    
+  } catch (error) {
+    console.error(`Failed to finalize audio for ${stage}:`, error);
+  }
+}
+
+// WAV file creation utilities for debugging
+function createConsolidatedWavFile(audioData, sampleRate, filename) {
+  if (!DEBUG_WAV_ENABLED) return;
+  
+  try {
+    // Convert Float32Array to Int16Array for WAV
+    const int16Array = new Int16Array(audioData.length);
+    for (let i = 0; i < audioData.length; i++) {
+      // Clamp to [-1, 1] and convert to 16-bit
+      const sample = Math.max(-1, Math.min(1, audioData[i]));
+      int16Array[i] = sample * 32767;
+    }
+    
+    // Create WAV header
+    const buffer = new ArrayBuffer(44 + int16Array.length * 2);
+    const view = new DataView(buffer);
+    
+    // WAV header
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+    
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + int16Array.length * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM format
+    view.setUint16(20, 1, true);  // PCM
+    view.setUint16(22, 1, true);  // Mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); // Byte rate
+    view.setUint16(32, 2, true);  // Block align
+    view.setUint16(34, 16, true); // Bits per sample
+    writeString(36, 'data');
+    view.setUint32(40, int16Array.length * 2, true);
+    
+    // Copy audio data
+    const audioView = new Int16Array(buffer, 44);
+    audioView.set(int16Array);
+    
+    // Send WAV data to main thread for file creation (AudioWorklet can't create Blobs)
+    this.port.postMessage({
+      type: 'debug-wav',
+      buffer: buffer,
+      filename: filename,
+      samples: audioData.length
+    });
+    
+    console.log(`=== FRONTEND_WAV_DEBUG: Prepared consolidated WAV data for ${filename} with ${audioData.length} samples ===`);
+  } catch (error) {
+    console.error(`Failed to prepare consolidated WAV debug data for ${filename}:`, error);
+  }
+}
+
+function getTimestamp() {
+  const now = new Date();
+  return now.toISOString().replace(/[:.]/g, '-').slice(0, -1); // Remove milliseconds dot
+}
+
 class AudioOutputProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -41,10 +177,36 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (event) => {
       if (event.data.type == "reset") {
         debug("Reset audio processor state.");
+        
+        // Finalize any accumulated debug audio before reset
+        if (DEBUG_WAV_ENABLED) {
+          finalizeStage("received");
+          finalizeStage("output");
+        }
+        
         this.initState();
         return;
       }
+      
+      if (event.data.type == "finalize-debug") {
+        debug("Finalizing debug audio stages.");
+        
+        // Finalize any accumulated debug audio
+        if (DEBUG_WAV_ENABLED) {
+          finalizeStage("received");
+          finalizeStage("output");
+        }
+        
+        return;
+      }
+      
       let frame = event.data.frame;
+      
+      // Accumulate received frames for consolidated WAV file
+      if (DEBUG_WAV_ENABLED && frame && frame.length > 0) {
+        accumulateAudio(frame, sampleRate, "received");
+      }
+      
       this.frames.push(frame);
       if (this.currentSamples() >= this.initialBufferSamples && !this.started) {
         this.start();
@@ -231,6 +393,17 @@ class AudioOutputProcessor extends AudioWorkletProcessor {
         output[i] *= (out_idx - i) / out_idx;
       }
     }
+    
+    // Accumulate processed output audio for consolidated WAV file
+    if (DEBUG_WAV_ENABLED && out_idx > 0 && anyAudio) {
+      // Create a copy of the relevant portion of the output buffer
+      const outputCopy = new Float32Array(out_idx);
+      for (let i = 0; i < out_idx; i++) {
+        outputCopy[i] = output[i];
+      }
+      accumulateAudio(outputCopy, sampleRate, "output");
+    }
+    
     this.totalAudioPlayed += output.length / sampleRate;
     this.actualAudioPlayed += out_idx / sampleRate;
     this.timeInStream += out_idx / sampleRate;

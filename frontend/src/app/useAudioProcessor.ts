@@ -21,6 +21,7 @@ export interface AudioProcessor {
   inputAnalyser: AnalyserNode;
   outputAnalyser: AnalyserNode;
   mediaStreamDestination: MediaStreamAudioDestinationNode;
+  finalizeDebugStages: () => void;
 }
 
 export const useAudioProcessor = (
@@ -52,6 +53,29 @@ export const useAudioProcessor = (
       const outputAnalyser = audioContext.createAnalyser();
       outputAnalyser.fftSize = 2048;
       outputWorklet.connect(outputAnalyser);
+
+      // Handle debug WAV messages from the audio worklet
+      outputWorklet.port.onmessage = (event: MessageEvent) => {
+        if (event.data.type === 'debug-wav') {
+          try {
+            // Create WAV file download in main thread where Blob is available
+            const blob = new Blob([event.data.buffer], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = event.data.filename;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            console.log(`=== FRONTEND_WAV_DEBUG: Downloaded WAV file: ${event.data.filename} with ${event.data.samples} samples ===`);
+          } catch (error) {
+            console.error(`Failed to create WAV debug file ${event.data.filename}:`, error);
+          }
+        }
+      };
 
       const decoder = new Worker("/decoderWorker.min.js");
       let micDuration = 0;
@@ -131,6 +155,9 @@ export const useAudioProcessor = (
         inputAnalyser,
         outputAnalyser,
         mediaStreamDestination,
+        finalizeDebugStages: () => {
+          outputWorklet.port.postMessage({ type: 'finalize-debug' });
+        },
       };
       // Resume the audio context if it was suspended
       audioProcessorRef.current.audioContext.resume();
@@ -143,8 +170,11 @@ export const useAudioProcessor = (
 
   const shutdownAudio = useCallback(() => {
     if (audioProcessorRef.current) {
-      const { audioContext, opusRecorder, outputWorklet } =
+      const { audioContext, opusRecorder, outputWorklet, finalizeDebugStages } =
         audioProcessorRef.current;
+      
+      // Finalize any accumulated debug audio before shutdown
+      finalizeDebugStages();
 
       // Disconnect all nodes
       outputWorklet.disconnect();

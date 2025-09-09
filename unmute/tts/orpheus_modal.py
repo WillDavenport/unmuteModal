@@ -5,6 +5,7 @@ Modal entrypoint for Orpheus TTS using the official orpheus-speech package
 import modal
 import os
 import asyncio
+import numpy as np
 from typing import AsyncGenerator, Iterator
 
 # Create Modal app
@@ -20,6 +21,7 @@ orpheus_image = (
         "uvicorn",         # ASGI server
         "websockets",      # For streaming support
         "pydantic",        # For request models
+        "numpy>=1.24.0",   # For WAV debug functionality
     ])
     .env({"HF_HOME": "/cache/huggingface"})
 )
@@ -27,12 +29,36 @@ orpheus_image = (
 # Create volume for model storage and cache
 model_volume = modal.Volume.from_name("orpheus-models")
 
+# Debug audio volume for WAV debug files
+debug_audio_volume = modal.Volume.from_name("debug-audio-volume", create_if_missing=True)
+
+def create_wav_file(pcm_data: np.ndarray, sample_rate: int, filepath: str) -> None:
+    """Create a WAV file from PCM float32 data."""
+    import wave
+    
+    # Ensure it's float32
+    if pcm_data.dtype != np.float32:
+        pcm_data = pcm_data.astype(np.float32)
+    
+    # Clamp values to valid range and convert to int16
+    pcm_data = np.clip(pcm_data, -1.0, 1.0)
+    pcm_int16 = (pcm_data * 32767).astype(np.int16)
+    
+    # Write WAV file
+    with wave.open(filepath, 'wb') as wav_file:
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 2 bytes per sample (int16)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_int16.tobytes())
+
+
 @orpheus_tts_app.cls(
     image=orpheus_image,
     gpu="H100",
     timeout=10 * 60,  # 10 minutes
     volumes={
         "/cache": model_volume,
+        "/debug-audio": debug_audio_volume,
     },
     secrets=[
         modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"]),
@@ -55,6 +81,10 @@ class OrpheusTTS:
         # Set HuggingFace token for authenticated model access
         if "HF_TOKEN" in os.environ:
             os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+        
+        # Enable Modal volume for WAV debug files
+        os.environ["USE_MODAL_VOLUME"] = "true"
+        os.environ["DEBUG_WAV_ENABLED"] = "true"
         
         # Initialize the Orpheus model
         model_name = os.environ.get("ORPHEUS_MODEL_NAME", "canopylabs/orpheus-tts-0.1-finetune-prod")
@@ -87,10 +117,12 @@ class OrpheusTTS:
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
+                max_tokens=24000,
             )
             
             # Create WAV file in memory
             audio_buffer = io.BytesIO()
+            accumulated_audio = []  # Store all chunks for WAV debug file
             
             with wave.open(audio_buffer, "wb") as wf:
                 wf.setnchannels(1)  # Mono
@@ -110,6 +142,10 @@ class OrpheusTTS:
                         ttft = first_token_time - start_time
                         print(f"Time to first token: {ttft:.3f}s")
                     
+                    # Accumulate audio for debug WAV file
+                    if os.getenv("DEBUG_WAV_ENABLED", "false").lower() == "true":
+                        accumulated_audio.append(audio_chunk)
+                    
                     frame_count = len(audio_chunk) // (wf.getsampwidth() * wf.getnchannels())
                     total_frames += frame_count
                     wf.writeframes(audio_chunk)
@@ -120,6 +156,35 @@ class OrpheusTTS:
             generation_time = end_time - start_time
             
             print(f"Generated {duration:.2f}s of audio in {generation_time:.2f}s ({chunk_counter} chunks)")
+            
+            # Create consolidated WAV debug file
+            if os.getenv("DEBUG_WAV_ENABLED", "false").lower() == "true" and accumulated_audio:
+                try:
+                    from datetime import datetime
+                    
+                    # Concatenate all audio chunks
+                    consolidated_audio_bytes = b''.join(accumulated_audio)
+                    
+                    # Convert to numpy array (assuming 16-bit PCM at 24kHz)
+                    audio_array = np.frombuffer(consolidated_audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # Generate debug filename with timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
+                    debug_filename = f"orpheus_modal_nonstream_{timestamp}.wav"
+                    debug_filepath = f"/debug-audio/{debug_filename}"
+                    
+                    # Create WAV file
+                    create_wav_file(audio_array, 24000, debug_filepath)
+                    
+                    # Commit to Modal volume
+                    debug_audio_volume.commit()
+                    
+                    total_samples = len(audio_array)
+                    duration_sec = total_samples / 24000
+                    print(f"=== WAV_DEBUG: Created consolidated Orpheus WAV file: {debug_filename} with {total_samples} samples ({duration_sec:.2f}s) ===")
+                    
+                except Exception as e:
+                    print(f"Failed to create Orpheus debug WAV file: {e}")
             
             # Return the WAV file bytes
             audio_buffer.seek(0)
@@ -133,6 +198,7 @@ class OrpheusTTS:
     def generate_speech_stream(self, text: str, voice: str = "tara") -> Iterator[bytes]:
         """Generate speech from text with streaming output (raw audio data)"""
         import time
+        from datetime import datetime
         
         print(f"Generating streaming speech for text: '{text[:50]}...' with voice: {voice}")
         
@@ -144,9 +210,11 @@ class OrpheusTTS:
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
+                max_tokens=24000,
             )
             
             chunk_counter = 0
+            accumulated_audio = []  # Store all chunks for WAV debug file
             
             # Stream raw audio chunks as they're generated
             for audio_chunk in syn_tokens:
@@ -158,6 +226,10 @@ class OrpheusTTS:
                     ttft = first_token_time - start_time
                     print(f"Time to first token: {ttft:.3f}s")
                 
+                # Accumulate audio for debug WAV file
+                if os.getenv("DEBUG_WAV_ENABLED", "false").lower() == "true":
+                    accumulated_audio.append(audio_chunk)
+                
                 # Return raw audio data (no WAV headers per chunk)
                 yield audio_chunk
             
@@ -165,6 +237,33 @@ class OrpheusTTS:
             generation_time = end_time - start_time
             
             print(f"Completed streaming generation in {generation_time:.2f}s ({chunk_counter} chunks)")
+            
+            # Create consolidated WAV debug file
+            if os.getenv("DEBUG_WAV_ENABLED", "false").lower() == "true" and accumulated_audio:
+                try:
+                    # Concatenate all audio chunks
+                    consolidated_audio_bytes = b''.join(accumulated_audio)
+                    
+                    # Convert to numpy array (assuming 16-bit PCM at 24kHz)
+                    audio_array = np.frombuffer(consolidated_audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # Generate debug filename with timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
+                    debug_filename = f"orpheus_modal_complete_{timestamp}.wav"
+                    debug_filepath = f"/debug-audio/{debug_filename}"
+                    
+                    # Create WAV file
+                    create_wav_file(audio_array, 24000, debug_filepath)
+                    
+                    # Commit to Modal volume
+                    debug_audio_volume.commit()
+                    
+                    total_samples = len(audio_array)
+                    duration_sec = total_samples / 24000
+                    print(f"=== WAV_DEBUG: Created consolidated Orpheus WAV file: {debug_filename} with {total_samples} samples ({duration_sec:.2f}s) ===")
+                    
+                except Exception as e:
+                    print(f"Failed to create Orpheus debug WAV file: {e}")
             
         except Exception as e:
             print(f"Error generating streaming speech: {e}")
@@ -179,8 +278,8 @@ def test_orpheus_tts():
     print("Testing Orpheus TTS Service...")
     
     # Test texts - similar length for fair comparison
-    test_text_1 = "This is a test of the Orpheus TTS service streaming functionality in our Modal deployment."
-    test_text_2 = "Here we are testing the second generation to see if subsequent calls are faster than the first."
+    test_text_1 = "I went to this insane costume party dressed as a devil, fishnets already ripped before I even made it through the door. There was this couple there, two girls dressed as angels, and they did not leave me alone all night. They were dancing on me, grabbing my ass, whispering in my ear like they already decided what they were gonna do with me. They finally pulled me into a bedroom upstairs. The second the door shut, one pushed me down on the bed and slid her fingers inside me while the other started licking my clit. They kept switching back and forth, like they’d practiced on each other a hundred times before. I was moaning so loud I knew people outside could hear. Then they flipped me on my stomach one girl eating my pussy from behind while the other had her tongue deep in my ass. I completely lost it. My whole body was shaking, I came so hard into the pillow I thought I was gonna pass out, and they didn’t even stop. They took turns eating me everywhere, their fingers curling inside me until I couldn’t even hold myself up. When I stumbled back into the party, hair ruined, thighs sticky, tights shredded, everyone knew something had happened. I just grabbed another drink and tried not to blush."
+    test_text_2 = "When I entered college I came from a super religious background and I was still a virgin. But the thing is that I hated being a virgin and I wanted to lose it as soon as possible. My roommate and her bf were kind of open so she really wanted my first experience to be with them. I reluctantly agreed to this and my cherry was popped within the week lol. But thats not where I became a stupid slut. See my roommate and her bf knew I was this naive rural girl who and they actually tried to turn me into a slut. He would invite his friends over and ny roommate would encourage me to hit on them and it would lead to sex. This kept happening that I just became used to the idea of having sex casually with friends and I thought everyone else was doing the same. I mustve regularly hooked up with 12 guys throughout college just whenever we felt like it and I thought I was really popular. Well after college we kind of went separate ways but last week I messaged one of my guy so called friends and he responded drunk saying hey cum dump Kat, you still down? I was kind of surprised at this and inquired further. Basically I found out that I was just a dumb slut that all these guys used to drain their nuts and the other people in the group did not do nearly as much sexually."
     
     print(f"Text 1 length: {len(test_text_1)} characters")
     print(f"Text 2 length: {len(test_text_2)} characters")

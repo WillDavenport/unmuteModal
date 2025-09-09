@@ -48,6 +48,7 @@ from unmute.timer import Stopwatch
 from unmute.conversation_handler import ConversationUnmuteHandler
 from unmute.conversation import ConversationManager
 from unmute.audio_debug import get_audio_debug_tracker
+from unmute.wav_debug import accumulate_debug_audio_async, finalize_debug_stage_async
 
 app = FastAPI()
 
@@ -303,6 +304,9 @@ async def _run_route(websocket: WebSocket, handler: ConversationUnmuteHandler):
             )
             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
     finally:
+        # Finalize accumulated debug audio for websocket stage
+        await finalize_debug_stage_async("websocket_emit", "main_websocket")
+        
         await handler.cleanup()
         logger.info("websocket_route() finished")
 
@@ -494,6 +498,12 @@ async def emit_loop(
                 try:
                     _sr, audio = emitted_by_handler
                     audio = audio_to_float32(audio)
+                    
+                    # Accumulate audio for consolidated WAV file
+                    await accumulate_debug_audio_async(
+                        audio, _sr, "websocket_emit", "main_websocket"
+                    )
+                    
                     opus_bytes = await asyncio.to_thread(opus_writer.append_pcm, audio)
                     # Due to buffering/chunking, Opus doesn't necessarily output something on every PCM added
                     if opus_bytes:

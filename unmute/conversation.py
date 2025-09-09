@@ -38,6 +38,7 @@ from unmute.kyutai_constants import (
     FRAME_TIME_SEC,
 )
 from unmute import metrics as mt
+from unmute.wav_debug import accumulate_debug_audio_async, finalize_debug_stage_async
 import numpy as np
 
 # Constants from unmute_handler
@@ -248,6 +249,11 @@ class Conversation:
 
                     audio = np.array(message.pcm, dtype=np.float32)
                     
+                    # Accumulate audio for consolidated WAV file
+                    await accumulate_debug_audio_async(
+                        audio, SAMPLE_RATE, "output_queue", self.conversation_id
+                    )
+                    
                     # Output as tuple for FastRTC compatibility
                     logger.info(f"=== AUDIO_DEBUG: Putting audio data to output queue: {len(audio)} samples at {SAMPLE_RATE}Hz (output_queue size: {output_queue.qsize()}) ===")
                     await output_queue.put((SAMPLE_RATE, audio))
@@ -302,6 +308,9 @@ class Conversation:
 
         await asyncio.sleep(1)
         await self._check_for_bot_goodbye()
+        # Finalize accumulated debug audio for this conversation
+        await finalize_debug_stage_async("output_queue", self.conversation_id)
+        
         self.waiting_for_user_start_time = self.n_samples_received / SAMPLE_RATE
         logger.info("TTS loop cleanup completed")
 

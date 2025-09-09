@@ -164,6 +164,9 @@ vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 # Cache volume for Rust binaries (used by STT service)
 rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache", create_if_missing=True)
 
+# Debug audio volume for WAV debug files
+debug_audio_volume = modal.Volume.from_name("debug-audio-volume", create_if_missing=True)
+
 # TTS volumes are now handled by the separate Orpheus TTS Modal app
 
 # Model configuration for Mistral
@@ -887,6 +890,9 @@ class LLMService:
 @app.cls(
     cpu=2,
     image=orchestrator_image,
+    volumes={
+        "/debug-audio": debug_audio_volume,
+    },
     secrets=secrets,
     min_containers=int(os.environ.get("MIN_CONTAINERS", "0")),
     scaledown_window=600,  # 10 minutes - prevent scaling during long conversations
@@ -931,9 +937,13 @@ class OrchestratorService:
         # Set longer timeout for Modal services which can take time to cold start
         os.environ["KYUTAI_SERVICE_TIMEOUT_SEC"] = "150.0"
         
+        # Enable Modal volume for WAV debug files
+        os.environ["USE_MODAL_VOLUME"] = "true"
+        
         print(f"Orchestrator setup complete - STT: {os.environ['KYUTAI_STT_URL']}")
         print(f"Orchestrator setup complete - TTS: {os.environ['KYUTAI_TTS_URL']}")
         print(f"Orchestrator setup complete - LLM: {os.environ['KYUTAI_LLM_URL']}")
+        print(f"Orchestrator setup complete - WAV Debug: Modal volume enabled")
         
         print("Orchestrator setup complete")
     
