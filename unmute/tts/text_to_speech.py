@@ -615,8 +615,6 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Queue the audio message
                     await self.audio_queue.put(audio_message)
                     
-                    logger.info(f"Queued audio chunk {chunk_index} with {len(audio_data)} samples to audio_queue (queue size: {self.audio_queue.qsize()})")
-                    
                     # Add a small delay to allow other async tasks to run
                     await asyncio.sleep(0.001)
                     
