@@ -529,6 +529,9 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         self.time_since_request_sent = Stopwatch(autostart=True)
         self.waiting_first_audio = True
         
+        # Reset shutdown state to allow new iteration
+        self.shutdown_complete.clear()
+        
         # Only increment sessions for the first generation
         if not hasattr(self, '_session_started') or not self._session_started:
             mt.TTS_SESSIONS.inc()
@@ -575,7 +578,9 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             # Process chunks as they come from the generator
             chunk_index = 0
             for audio_chunk in process_stream():
+                # Check for cancellation more frequently
                 if self.shutdown_complete.is_set():
+                    logger.info(f"Stopping Modal streaming due to shutdown (processed {chunk_index} chunks)")
                     break
                 
                 chunk_index += 1
@@ -614,6 +619,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                     # Queue the audio message
                     await self.audio_queue.put(audio_message)
+                    
+                    # Check for cancellation again after queuing
+                    if self.shutdown_complete.is_set():
+                        logger.info(f"Stopping Modal streaming after queuing chunk {chunk_index}")
+                        break
                     
                     # Add a small delay to allow other async tasks to run
                     await asyncio.sleep(0.001)
@@ -669,12 +679,15 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             self.current_generation_task = None
             self.waiting_first_audio = True
             
-            # Clear the audio queue
+            # Clear the audio queue and add end-of-stream marker to break iteration
             while not self.audio_queue.empty():
                 try:
                     self.audio_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            
+            # Add end-of-stream marker to break the __aiter__ loop
+            await self.audio_queue.put(None)
 
             if full_shutdown:
                 mt.TTS_ACTIVE_SESSIONS.dec()
@@ -686,7 +699,10 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 self.modal_function = None
                 logger.info("Orpheus Modal TTS fully shut down")
             else:
-                logger.info("Orpheus Modal TTS generation cleaned up, connection maintained")
+                # For partial shutdown (interruption), temporarily set shutdown to break iteration
+                # but don't fully shutdown the connection
+                self.shutdown_complete.set()
+                logger.info("Orpheus Modal TTS generation interrupted, connection maintained")
 
     async def __aiter__(self) -> AsyncIterator[TTSMessage]:
         """Iterate over TTS messages from Orpheus Modal service.
@@ -702,15 +718,21 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             # Process messages from the audio queue
             while True:
                 if self.shutdown_complete.is_set():
+                    logger.info("Shutdown complete event set, breaking iteration")
                     break
                     
                 try:
-                    # Wait for audio messages with a longer timeout to handle generation startup
-                    message = await asyncio.wait_for(self.audio_queue.get(), timeout=10.0)
+                    # Use a shorter timeout to check for interruption more frequently
+                    message = await asyncio.wait_for(self.audio_queue.get(), timeout=1.0)
                     
                     # None indicates end of stream
                     if message is None:
                         logger.info("Received end of stream marker, breaking iteration")
+                        break
+                        
+                    # Check for shutdown again before yielding
+                    if self.shutdown_complete.is_set():
+                        logger.info("Shutdown detected before yielding message, breaking iteration")
                         break
                         
                     self.received_samples_yielded += len(message.pcm)
@@ -719,7 +741,10 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                 except asyncio.TimeoutError:
                     # Check if we should continue waiting
-                    if self.current_generation_task is None:
+                    if self.shutdown_complete.is_set():
+                        logger.info("Shutdown detected during timeout, breaking iteration")
+                        break
+                    elif self.current_generation_task is None:
                         logger.info("No generation task active, breaking iteration")
                         break
                     elif self.current_generation_task.done():
