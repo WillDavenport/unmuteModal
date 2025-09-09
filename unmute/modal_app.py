@@ -718,7 +718,7 @@ class LLMService:
         import os
         
         # Import constants from module level
-        MODEL_NAME = "mistralai/Mistral-Small-24B-Instruct-2501"
+        MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
         
         app = FastAPI(title="LLM Service", version="1.0.0")
         

@@ -34,17 +34,8 @@ def preprocess_messages_for_llm(
         else:
             output.append(message)
 
-    def role_at(index: int) -> str | None:
-        if index >= len(output):
-            return None
-        return output[index]["role"]
-
-    if role_at(0) == "system" and role_at(1) in [None, "assistant"]:
-        # Some LLMs, like Gemma, get confused if the assistant message goes before user
-        # messages, so add a dummy user message.
-        output = [output[0]] + [{"role": "user", "content": "Hello."}] + output[1:]
-
-    for message in chat_history:
+    # Handle silence markers in user messages
+    for message in output:
         if (
             message["role"] == "user"
             and message["content"].startswith(USER_SILENCE_MARKER)
@@ -57,6 +48,8 @@ def preprocess_messages_for_llm(
             # the LLM
             message["content"] = message["content"][len(USER_SILENCE_MARKER) :]
 
+    # If we only have a system message, that's fine - don't inject dummy messages
+    # The LLM should wait for actual user input
     return output
 
 

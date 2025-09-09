@@ -116,14 +116,8 @@ class ConversationUnmuteHandler(AsyncStreamHandler):
                 await self.conversation._generate_response()
             return
 
-        # Handle initial response generation
-        if (
-            len(self.conversation.chatbot.chat_history) == 1
-            # Wait until the instructions are updated. A bit hacky
-            and self.conversation.chatbot.get_instructions() is not None
-        ):
-            logger.info("Generating initial response.")
-            await self.conversation._generate_response()
+        # Remove automatic initial response generation - wait for real user input
+        # The system should only respond after receiving actual user audio/text input
 
         # Handle audio input override for testing
         if self.audio_input_override is not None:
