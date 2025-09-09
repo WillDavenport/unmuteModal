@@ -57,32 +57,32 @@ async def _resolve(hostname: str) -> list[str]:
 
 async def get_instances(service_name: str) -> list[str]:
     url = SERVICES[service_name]
-    print(f"=== SERVICE_DISCOVERY: Getting instances for {service_name}, base URL: {url} ===")
+    logger.info(f"=== SERVICE_DISCOVERY: Getting instances for {service_name}, base URL: {url} ===")
     protocol, remaining = url.split("://", 1)
     
     # For secure protocols (wss, https) OR Modal services, don't resolve to IP addresses
     # to avoid SSL certificate validation issues and Modal routing problems
     if protocol in ("wss", "https") or "modal.run" in url:
-        print(f"=== SERVICE_DISCOVERY: Using secure protocol {protocol} or Modal service, returning original URL ===")
+        logger.info(f"=== SERVICE_DISCOVERY: Using secure protocol {protocol} or Modal service, returning original URL ===")
         return [url]
     
     # Handle URLs with and without explicit ports for non-secure protocols
     if ":" in remaining:
         hostname, port = remaining.split(":", 1)
-        print(f"=== SERVICE_DISCOVERY: Resolving hostname {hostname} with port {port} ===")
+        logger.info(f"=== SERVICE_DISCOVERY: Resolving hostname {hostname} with port {port} ===")
         ips = list(await _resolve(hostname))
         random.shuffle(ips)
         result = [f"{protocol}://{ip}:{port}" for ip in ips]
-        print(f"=== SERVICE_DISCOVERY: Resolved to {len(ips)} IPs: {result} ===")
+        logger.info(f"=== SERVICE_DISCOVERY: Resolved to {len(ips)} IPs: {result} ===")
         return result
     else:
         # No explicit port in URL (e.g., local services)
         hostname = remaining
-        print(f"=== SERVICE_DISCOVERY: Resolving hostname {hostname} (no port) ===")
+        logger.info(f"=== SERVICE_DISCOVERY: Resolving hostname {hostname} (no port) ===")
         ips = list(await _resolve(hostname))
         random.shuffle(ips)
         result = [f"{protocol}://{ip}" for ip in ips]
-        print(f"=== SERVICE_DISCOVERY: Resolved to {len(ips)} IPs: {result} ===")
+        logger.info(f"=== SERVICE_DISCOVERY: Resolved to {len(ips)} IPs: {result} ===")
         return result
 
 
@@ -98,30 +98,30 @@ async def find_instance(
     timeout_sec: float | None = None,  # Use get_service_discovery_timeout() by default
     max_trials: int = 3,
 ) -> S:
-    print(f"=== SERVICE_DISCOVERY: Finding instance for {service_name} ===")
+    logger.info(f"=== SERVICE_DISCOVERY: Finding instance for {service_name} ===")
     # Use the environment-configurable timeout if not specified
     if timeout_sec is None:
         from unmute.kyutai_constants import get_service_discovery_timeout
         timeout_sec = get_service_discovery_timeout()
     
-    print(f"=== SERVICE_DISCOVERY: Using timeout {timeout_sec}s for {service_name} ===")
+    logger.info(f"=== SERVICE_DISCOVERY: Using timeout {timeout_sec}s for {service_name} ===")
     stopwatch = Stopwatch()
     instances = await get_instances(service_name)
-    print(f"=== SERVICE_DISCOVERY: Found {len(instances)} instances for {service_name}: {instances} ===")
+    logger.info(f"=== SERVICE_DISCOVERY: Found {len(instances)} instances for {service_name}: {instances} ===")
     max_trials = min(len(instances), max_trials)
     for instance in instances:
         client = client_factory(instance)
-        print(f"=== SERVICE_DISCOVERY: [{service_name}] Trying to connect to {instance} ===")
+        logger.info(f"=== SERVICE_DISCOVERY: [{service_name}] Trying to connect to {instance} ===")
         logger.debug(f"[{service_name}]Trying to connect to {instance}")
         pingwatch = Stopwatch()
         try:
             async with asyncio.timeout(timeout_sec):
-                print(f"=== SERVICE_DISCOVERY: [{service_name}] Starting up client for {instance} ===")
+                logger.info(f"=== SERVICE_DISCOVERY: [{service_name}] Starting up client for {instance} ===")
                 await client.start_up()
-                print(f"=== SERVICE_DISCOVERY: [{service_name}] Successfully connected to {instance} ===")
+                logger.info(f"=== SERVICE_DISCOVERY: [{service_name}] Successfully connected to {instance} ===")
         except Exception as exc:
             elapsed = pingwatch.time()
-            print(f"=== SERVICE_DISCOVERY: [{service_name}] Failed to connect to {instance}: {exc} (took {elapsed*1000:.1f}ms) ===")
+            logger.info(f"=== SERVICE_DISCOVERY: [{service_name}] Failed to connect to {instance}: {exc} (took {elapsed*1000:.1f}ms) ===")
             max_trials -= 1
             
             # Enhanced TTS-specific logging for debugging server shutdowns
