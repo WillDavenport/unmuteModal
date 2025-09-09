@@ -5,6 +5,7 @@ Modal entrypoint for Orpheus TTS using the official orpheus-speech package
 import modal
 import os
 import asyncio
+import uuid
 from typing import AsyncGenerator, Iterator
 
 # Create Modal app
@@ -83,11 +84,13 @@ class OrpheusTTS:
             start_time = time.monotonic()
             first_token_time = None
             
-            # Generate speech tokens using the Orpheus model
+            # Generate speech tokens using the Orpheus model with unique request ID
+            request_id = f"req-{uuid.uuid4()}"
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
                 max_tokens=96000,
+                request_id=request_id,
             )
             
             # Create WAV file in memory
@@ -141,11 +144,13 @@ class OrpheusTTS:
             start_time = time.monotonic()
             first_token_time = None
             
-            # Generate speech tokens using the Orpheus model
+            # Generate speech tokens using the Orpheus model with unique request ID
+            request_id = f"req-{uuid.uuid4()}"
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
                 max_tokens=96000,
+                request_id=request_id,
             )
             
             chunk_counter = 0
