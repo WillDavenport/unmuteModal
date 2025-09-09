@@ -87,6 +87,7 @@ class OrpheusTTS:
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
+                max_tokens=96000,
             )
             
             # Create WAV file in memory
@@ -144,6 +145,7 @@ class OrpheusTTS:
             syn_tokens = self.model.generate_speech(
                 prompt=text,
                 voice=voice,
+                max_tokens=96000,
             )
             
             chunk_counter = 0
