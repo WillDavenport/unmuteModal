@@ -140,13 +140,18 @@ class Conversation:
         """Initialize Orpheus TTS websocket connection."""
         logger.info(f"Initializing Orpheus TTS for conversation {self.conversation_id}")
         try:
-            factory = partial(
-                OrpheusTextToSpeech,
-                recorder=self.recorder,
-                get_time=lambda: self.n_samples_received / SAMPLE_RATE,
-            )
-            self.tts = await find_instance("tts", factory)
-            logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
+            # If we already have a TTS instance, check if we can reuse it
+            if self.tts and not self.tts.shutdown_complete.is_set():
+                logger.info("Reusing existing TTS connection")
+            else:
+                # Create a new TTS instance
+                factory = partial(
+                    OrpheusTextToSpeech,
+                    recorder=self.recorder,
+                    get_time=lambda: self.n_samples_received / SAMPLE_RATE,
+                )
+                self.tts = await find_instance("tts", factory)
+                logger.info(f"Orpheus TTS connection established for conversation {self.conversation_id}")
             
             # Start TTS task
             self.tts_task = asyncio.create_task(
@@ -482,6 +487,10 @@ class Conversation:
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():
             self.tts_task.cancel()
+            
+        # Stop the TTS service generation
+        if self.tts:
+            await self.tts.shutdown(full_shutdown=False)
             
         # Cancel current LLM task if running  
         if self.llm_task and not self.llm_task.done():
