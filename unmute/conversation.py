@@ -333,8 +333,8 @@ class Conversation:
             self.llm_finished_event.set()
 
     async def _stream_llm_to_tts(self, generating_message_i: int):
-        """Generate complete LLM response and send to Orpheus TTS service."""
-        logger.info(f"Generating complete LLM response for Orpheus TTS (conversation {self.conversation_id})")
+        """Stream LLM response to TTS with sentence-based flushing."""
+        logger.info(f"Starting streaming LLM response to Orpheus TTS (conversation {self.conversation_id})")
         
         llm_stopwatch = Stopwatch()
         llm = VLLMStream(
@@ -360,17 +360,48 @@ class Conversation:
         mt.VLLM_REQUEST_LENGTH.observe(num_words_sent)
         mt.VLLM_ACTIVE_SESSIONS.inc()
 
+        # Initialize streaming TTS
+        if self.tts is not None and hasattr(self.tts, 'start_streaming_mode'):
+            await self.tts.start_streaming_mode()
+            self.tts_output_stopwatch.start_if_not_started()
+
+        # Buffer for accumulating tokens before flushing to TTS
+        token_buffer = ""
+        last_flush_time = None
+        FLUSH_TIME_THRESHOLD_MS = 120  # 120ms threshold
+        MIN_CHARS_FOR_BOUNDARY_FLUSH = 40  # Minimum chars before checking boundaries
+        SENTENCE_BOUNDARIES = {'.', '!', '?'}
+        CLAUSE_BOUNDARIES = {',', ';', ':'}
+        
+        async def flush_buffer_to_tts():
+            """Flush accumulated buffer to TTS and reset."""
+            nonlocal token_buffer, last_flush_time
+            if token_buffer.strip() and self.tts is not None:
+                logger.info(f"Flushing buffer to TTS: '{token_buffer.strip()}'")
+                if hasattr(self.tts, 'send_text_chunk'):
+                    await self.tts.send_text_chunk(token_buffer.strip())
+                else:
+                    # Fallback for non-streaming TTS
+                    await self.tts.send_complete_text(token_buffer.strip())
+                token_buffer = ""
+                last_flush_time = asyncio.get_event_loop().time()
+
         try:
-            logger.info("Starting LLM chat completion stream")
+            logger.info("Starting streaming LLM chat completion")
             
-            # Collect the entire response before sending to TTS
             async for delta in rechunk_to_words(llm.chat_completion(messages)):
+                if last_flush_time is None:
+                    last_flush_time = asyncio.get_event_loop().time()
+
+                current_time = asyncio.get_event_loop().time()
+                
                 await self.output_queue.put(
                     ora.UnmuteResponseTextDeltaReady(delta=delta)
                 )
 
                 mt.VLLM_RECV_WORDS.inc()
                 response_words.append(delta)
+                token_buffer += delta
 
                 if time_to_first_token is None:
                     time_to_first_token = llm_stopwatch.time()
@@ -378,33 +409,58 @@ class Conversation:
                     mt.VLLM_TTFT.observe(time_to_first_token)
                     logger.info("First token received: %s. Time to first token: %s", delta, time_to_first_token)
 
+                # Check for interruption
                 if len(self.chatbot.chat_history) > generating_message_i:
                     logger.info("Response interrupted, breaking LLM loop")
                     break  # We've been interrupted
 
                 assert isinstance(delta, str)
 
-            # Send complete response to Orpheus TTS
+                # Determine if we should flush the buffer
+                should_flush = False
+                time_since_last_flush = (current_time - last_flush_time) * 1000  # Convert to ms
+                
+                # Time-based flush (≥120ms since last flush)
+                if time_since_last_flush >= FLUSH_TIME_THRESHOLD_MS:
+                    should_flush = True
+                    logger.debug(f"Time-based flush triggered: {time_since_last_flush:.1f}ms since last flush")
+                
+                # Boundary-based flush (sentence or clause boundaries after ≥60 chars)
+                elif len(token_buffer) >= MIN_CHARS_FOR_BOUNDARY_FLUSH:
+                    # Check for sentence boundaries (. ! ?)
+                    if any(boundary in delta for boundary in SENTENCE_BOUNDARIES):
+                        should_flush = True
+                        logger.debug(f"Sentence boundary flush triggered: '{delta}' in buffer of {len(token_buffer)} chars")
+                    # Check for clause boundaries (, ; :) only if we have substantial content
+                    elif len(token_buffer) >= MIN_CHARS_FOR_BOUNDARY_FLUSH and any(boundary in delta for boundary in CLAUSE_BOUNDARIES):
+                        should_flush = True
+                        logger.debug(f"Clause boundary flush triggered: '{delta}' in buffer of {len(token_buffer)} chars")
+                
+                if should_flush:
+                    await flush_buffer_to_tts()
+
+            # Flush any remaining content in the buffer
+            if token_buffer.strip():
+                logger.info("Flushing final buffer content to TTS")
+                await flush_buffer_to_tts()
+
+            # Signal end of streaming to TTS
+            if self.tts is not None and hasattr(self.tts, 'end_streaming'):
+                await self.tts.end_streaming()
+
+            # Send completion events
             complete_response = "".join(response_words)
-            logger.info(f"LLM generation completed with {len(response_words)} words. Sending complete text to Orpheus TTS.")
-            logger.info("Complete LLM response: %s", complete_response)
+            logger.info(f"LLM streaming completed with {len(response_words)} words. Total response: '{complete_response}'")
 
             await self.output_queue.put(
                 ora.ResponseTextDone(text=complete_response)
             )
-
-            # Send the complete text to Orpheus TTS for audio generation
-            if self.tts is not None and complete_response.strip():
-                logger.info("Sending complete response to Orpheus TTS")
-                self.tts_output_stopwatch.start_if_not_started()
-                await self.tts.send_complete_text(complete_response)
-            else:
-                if not complete_response.strip():
-                    logger.warning("Empty response, not sending to TTS")
-                else:
-                    logger.warning("TTS is None, cannot send response")
                 
         except asyncio.CancelledError:
+            logger.info("LLM streaming cancelled - ending TTS streaming gracefully")
+            # End streaming gracefully on interruption
+            if self.tts is not None and hasattr(self.tts, 'end_streaming'):
+                await self.tts.end_streaming()
             mt.VLLM_INTERRUPTS.inc()
             raise
         except Exception:
@@ -412,7 +468,7 @@ class Conversation:
                 mt.VLLM_HARD_ERRORS.inc()
             raise
         finally:
-            logger.info("End of VLLM, after %d words.", len(response_words))
+            logger.info("End of streaming VLLM, after %d words.", len(response_words))
             mt.VLLM_ACTIVE_SESSIONS.dec()
             mt.VLLM_REPLY_LENGTH.observe(len(response_words))
             mt.VLLM_GEN_DURATION.observe(llm_stopwatch.time())
@@ -471,6 +527,11 @@ class Conversation:
         )
 
         await self.output_queue.put(ora.UnmuteInterruptedByVAD())
+        
+        # Gracefully end streaming TTS if active
+        if self.tts is not None and hasattr(self.tts, 'end_streaming'):
+            logger.info("Gracefully ending TTS streaming due to interruption")
+            await self.tts.end_streaming()
         
         # Cancel current TTS task if running
         if self.tts_task and not self.tts_task.done():

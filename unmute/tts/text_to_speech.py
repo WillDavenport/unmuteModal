@@ -466,6 +466,11 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         # Queue for audio chunks from streaming generation
         self.audio_queue: asyncio.Queue[TTSMessage] = asyncio.Queue()
         
+        # Streaming text management
+        self.text_queue: asyncio.Queue[str | None] = asyncio.Queue()  # None signals end of stream
+        self.streaming_processor_task: asyncio.Task | None = None
+        self.is_streaming_mode = False
+        
         logger.info("Initialized OrpheusTextToSpeech with voice: tara")
 
     def state(self) -> WebsocketState:
@@ -546,6 +551,147 @@ class OrpheusTextToSpeech(ServiceWithStartup):
         except Exception as e:
             logger.error(f"Failed to send text to Orpheus Modal: {e}")
             raise
+    
+    async def start_streaming_mode(self) -> None:
+        """Start streaming mode for incremental text input."""
+        if self.modal_function is None:
+            logger.error("Cannot start streaming - Orpheus Modal function not connected")
+            return
+            
+        if self.shutdown_lock.locked():
+            logger.warning("Cannot start streaming - Orpheus Modal service shutting down")
+            return
+            
+        # If there's an ongoing generation, clean it up first
+        if self.current_generation_task and not self.current_generation_task.done():
+            logger.info("Stopping previous generation before starting streaming mode")
+            await self.shutdown(full_shutdown=False)
+        
+        logger.info("Starting Orpheus TTS streaming mode")
+        
+        # Reset state for new streaming session
+        self.time_since_request_sent = Stopwatch(autostart=True)
+        self.waiting_first_audio = True
+        self.is_streaming_mode = True
+        
+        # Clear text queue
+        while not self.text_queue.empty():
+            try:
+                self.text_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        
+        # Only increment sessions for the first generation
+        if not hasattr(self, '_session_started') or not self._session_started:
+            mt.TTS_SESSIONS.inc()
+            mt.TTS_ACTIVE_SESSIONS.inc()
+            self._session_started = True
+        
+        try:
+            # Start the streaming processor task
+            self.streaming_processor_task = asyncio.create_task(
+                self._process_streaming_text()
+            )
+            
+            logger.info("Orpheus TTS streaming mode started successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to start streaming mode: {e}")
+            raise
+    
+    async def send_text_chunk(self, text: str) -> None:
+        """Send a text chunk for streaming TTS generation."""
+        if not self.is_streaming_mode:
+            logger.warning("send_text_chunk called but not in streaming mode - starting streaming mode")
+            await self.start_streaming_mode()
+            
+        if self.shutdown_lock.locked():
+            logger.warning("Cannot send text chunk - Orpheus Modal service shutting down")
+            return
+            
+        text = prepare_text_for_tts(text)
+        if text.strip():
+            logger.debug(f"Queuing text chunk: '{text}'")
+            await self.text_queue.put(text)
+        else:
+            logger.debug("Skipping empty text chunk after preprocessing")
+    
+    async def end_streaming(self) -> None:
+        """Signal end of streaming text input."""
+        if not self.is_streaming_mode:
+            logger.warning("end_streaming called but not in streaming mode")
+            return
+            
+        logger.info("Ending Orpheus TTS streaming mode")
+        await self.text_queue.put(None)  # Signal end of stream to text processor
+        
+        # Wait for streaming processor to complete
+        if self.streaming_processor_task and not self.streaming_processor_task.done():
+            try:
+                await self.streaming_processor_task
+            except Exception as e:
+                logger.warning(f"Error waiting for streaming processor to complete: {e}")
+        
+        # Put a final end marker in the audio queue to signal complete end of streaming
+        class StreamEndMarker:
+            pass
+        
+        await self.audio_queue.put(StreamEndMarker())
+        
+    async def _process_streaming_text(self) -> None:
+        """Process streaming text chunks sequentially to avoid concurrent TTS calls."""
+        try:
+            logger.info("Starting streaming text processor")
+            
+            while True:
+                try:
+                    # Wait for text chunks
+                    text_chunk = await self.text_queue.get()
+                    
+                    # None signals end of stream
+                    if text_chunk is None:
+                        logger.info("Received end of stream signal")
+                        break
+                    
+                    # Process each text chunk immediately for better streaming
+                    if text_chunk.strip():
+                        logger.info(f"Processing text chunk for TTS: '{text_chunk}'")
+                        
+                        # Wait for any current generation to complete before starting new one
+                        if self.current_generation_task and not self.current_generation_task.done():
+                            try:
+                                await self.current_generation_task
+                            except Exception as e:
+                                logger.warning(f"Previous generation task failed: {e}")
+                        
+                        # Start audio generation for this chunk
+                        self.current_generation_task = asyncio.create_task(
+                            self._stream_audio_from_modal(text_chunk)
+                        )
+                        
+                except asyncio.CancelledError:
+                    logger.info("Streaming text processor cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in streaming text processor: {e}")
+                    break
+            
+            # Wait for final generation to complete
+            if self.current_generation_task and not self.current_generation_task.done():
+                try:
+                    await self.current_generation_task
+                except Exception as e:
+                    logger.warning(f"Final generation task failed: {e}")
+            
+            logger.info("Streaming text processor completed")
+            
+        except Exception as e:
+            logger.error(f"Error in streaming text processor: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.is_streaming_mode = False
+            self.streaming_processor_task = None
     
     async def _stream_audio_from_modal(self, text: str) -> None:
         """Stream audio chunks from Modal function and queue them."""
@@ -636,9 +782,13 @@ class OrpheusTextToSpeech(ServiceWithStartup):
             self.current_generation_task = None
 
     async def send(self, message: str) -> None:
-        """Legacy method for compatibility - redirects to send_complete_text."""
-        logger.warning("send() method called on OrpheusTextToSpeech - redirecting to send_complete_text()")
-        await self.send_complete_text(message)
+        """Legacy method for compatibility - redirects based on streaming mode."""
+        if self.is_streaming_mode:
+            logger.debug("send() method called in streaming mode - redirecting to send_text_chunk()")
+            await self.send_text_chunk(message)
+        else:
+            logger.debug("send() method called in non-streaming mode - redirecting to send_complete_text()")
+            await self.send_complete_text(message)
 
     def queue_eos(self) -> None:
         """Legacy method for compatibility - not needed with Orpheus Modal."""
@@ -657,6 +807,14 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 
             logger.info(f"Shutting down Orpheus Modal TTS (full_shutdown={full_shutdown})")
             
+            # Cancel streaming processor task
+            if self.streaming_processor_task and not self.streaming_processor_task.done():
+                self.streaming_processor_task.cancel()
+                try:
+                    await self.streaming_processor_task
+                except asyncio.CancelledError:
+                    pass
+            
             # Cancel any ongoing generation task
             if self.current_generation_task and not self.current_generation_task.done():
                 self.current_generation_task.cancel()
@@ -665,14 +823,24 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                 except asyncio.CancelledError:
                     pass
             
+            # No need to cancel chunk tasks since we process them sequentially
+            
             # Reset generation state
             self.current_generation_task = None
+            self.streaming_processor_task = None
+            self.is_streaming_mode = False
             self.waiting_first_audio = True
             
-            # Clear the audio queue
+            # Clear the queues
             while not self.audio_queue.empty():
                 try:
                     self.audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                    
+            while not self.text_queue.empty():
+                try:
+                    self.text_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
@@ -708,9 +876,21 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     # Wait for audio messages with a longer timeout to handle generation startup
                     message = await asyncio.wait_for(self.audio_queue.get(), timeout=10.0)
                     
-                    # None indicates end of stream
+                    # None indicates end of a generation chunk
                     if message is None:
-                        logger.info("Received end of stream marker, breaking iteration")
+                        if self.is_streaming_mode:
+                            # In streaming mode, None just means end of current chunk
+                            # Continue waiting for more chunks unless streaming has ended
+                            logger.debug("Received chunk end marker in streaming mode, continuing to wait")
+                            continue
+                        else:
+                            # In non-streaming mode, None means end of entire stream
+                            logger.info("Received end of stream marker, breaking iteration")
+                            break
+                    
+                    # Check for final stream end marker
+                    if hasattr(message, '__class__') and message.__class__.__name__ == 'StreamEndMarker':
+                        logger.info("Received final stream end marker, breaking iteration")
                         break
                         
                     self.received_samples_yielded += len(message.pcm)
@@ -719,16 +899,27 @@ class OrpheusTextToSpeech(ServiceWithStartup):
                     
                 except asyncio.TimeoutError:
                     # Check if we should continue waiting
-                    if self.current_generation_task is None:
-                        logger.info("No generation task active, breaking iteration")
-                        break
-                    elif self.current_generation_task.done():
-                        logger.info("Generation task completed, breaking iteration")
-                        break
+                    if not self.is_streaming_mode:
+                        # Non-streaming mode - check current generation task
+                        if self.current_generation_task is None:
+                            logger.info("No generation task active, breaking iteration")
+                            break
+                        elif self.current_generation_task.done():
+                            logger.info("Generation task completed, breaking iteration")
+                            break
+                        else:
+                            # Generation is still running, continue waiting
+                            logger.debug("Generation task still running, continuing to wait for audio")
+                            continue
                     else:
-                        # Generation is still running, continue waiting
-                        logger.debug("Generation task still running, continuing to wait for audio")
-                        continue
+                        # Streaming mode - check if streaming processor is still active
+                        if self.streaming_processor_task is None or self.streaming_processor_task.done():
+                            logger.info("Streaming processor finished, breaking iteration")
+                            break
+                        else:
+                            # Streaming is still active, continue waiting
+                            logger.debug("Streaming processor still active, continuing to wait for audio")
+                            continue
                     
         except Exception as e:
             logger.error(f"Orpheus Modal iteration error: {type(e).__name__}: {e}")
