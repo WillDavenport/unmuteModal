@@ -22,26 +22,19 @@ class Chatbot:
         if not self.chat_history:
             return "waiting_for_user"
 
-        # Find the last non-system message to determine state
-        last_non_system_message = None
-        for message in reversed(self.chat_history):
-            if message["role"] != "system":
-                last_non_system_message = message
-                break
-        
-        if last_non_system_message is None:
-            # Only system messages exist, wait for user
-            return "waiting_for_user"
-        
-        if last_non_system_message["role"] == "assistant":
+        last_message = self.chat_history[-1]
+        if last_message["role"] == "assistant":
             return "bot_speaking"
-        elif last_non_system_message["role"] == "user":
-            if last_non_system_message["content"].strip() != "":
+        elif last_message["role"] == "user":
+            if last_message["content"].strip() != "":
                 return "user_speaking"
             else:
+                # Or do we want "user_speaking" here?
                 return "waiting_for_user"
+        elif last_message["role"] == "system":
+            return "waiting_for_user"
         else:
-            raise RuntimeError(f"Unknown role: {last_non_system_message['role']}")
+            raise RuntimeError(f"Unknown role: {last_message['role']}")
 
     async def add_chat_message_delta(
         self,
@@ -83,8 +76,19 @@ class Chatbot:
             return last_message == ""  # new message if `last_message` was empty
 
     def preprocessed_messages(self):
-        # Always use the full chat history, don't inject dummy messages
-        messages = self.chat_history
+        if len(self.chat_history) > 2:
+            messages = self.chat_history
+        else:
+            assert len(self.chat_history) >= 1
+            assert self.chat_history[0]["role"] == "system"
+
+            messages = [
+                self.chat_history[0],
+                # Some models, like Gemma, don't like it when there is no user message
+                # so we add one.
+                {"role": "user", "content": "Hello!"},
+            ]
+
         messages = preprocess_messages_for_llm(messages)
         return messages
 
