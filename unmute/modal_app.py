@@ -126,18 +126,60 @@ stt_image = (
     .add_local_file("voices.yaml", "/root/voices.yaml")
 )
 
-# TTS is now handled by the separate Orpheus TTS Modal app (orpheus_modal.py)
-# No separate TTS image needed in this app
+# TTS in orpheus_modal.py
 
-# LLM image: additional deps first, then local files
+# LLM image: Use NVIDIA CUDA image for flashinfer compilation support
+cuda_version = "12.2.2"  # Compatible with Modal's driver version
+flavor = "devel"  # includes full CUDA toolkit with nvcc
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
 llm_image = (
-    base_deps_image
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
+    .entrypoint([])  # remove verbose logging by base image on entry
+    .apt_install("git", "curl", "ffmpeg", "libsndfile1", "build-essential")
+    .env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",  # Faster downloads from Hugging Face
+        "HF_HOME": CACHE_DIR,
+    })
     .pip_install(
+        # Core FastAPI and web dependencies
+        "fastapi[standard]>=0.115.12",
+        "pydantic>=2.0.0",
+        "ruamel-yaml>=0.18.10",
+        
+        # Audio processing dependencies
+        "librosa>=0.10.0",
+        "torchaudio>=2.1.0",
+        "soundfile>=0.12.0",
+        
+        # WebRTC and streaming dependencies
+        "fastrtc==0.0.23",
+        "sphn>=0.2.0",
+        "websockets>=12.0",
+        
+        # Utility dependencies
+        "msgpack>=1.1.0",
+        "msgpack-types>=0.5.0",
+        "tqdm>=4.66.0",
+        "numpy>=1.24.0",
+        "redis>=5.0.0",  # Required by unmute.cache
+        
+        # Monitoring dependencies
+        "prometheus-fastapi-instrumentator==7.1.0",
+        "prometheus-client==0.21.0",
+        
+        # LLM and API dependencies
+        "mistralai>=1.5.1",
+        "openai>=1.70.0",
+        
+        # LLM inference dependencies
         "huggingface_hub[hf_transfer]==0.32.0",
         "hf_transfer==0.1.8",  # Pin specific version for stability
         "vllm==0.9.1",
         "torch>=2.1.0",
         "transformers>=4.51.1",
+        "flashinfer-python",  # Now has access to nvcc for compilation
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # faster model transfers
     .env({"VLLM_USE_V1": "1"})  # use V1 engine for better performance
@@ -169,7 +211,7 @@ rust_binaries_volume = modal.Volume.from_name("rust-binaries-cache", create_if_m
 # Model configuration for Mistral
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 MODEL_REVISION = "main"  # Pin to specific revision when available
-FAST_BOOT = True  # Set to False for better performance if you have persistent replicas
+FAST_BOOT = False  # Change from True to False for better performance
 
 # Modal secrets for API keys and auth tokens - following Modal best practices
 secrets = [
@@ -594,7 +636,7 @@ dim = 6
 # The orchestrator service below is configured to use the Orpheus TTS endpoints
 
 @app.cls(
-    gpu="L40S",
+    gpu="H100",
     image=llm_image,
     volumes={
         "/models": models_volume,
