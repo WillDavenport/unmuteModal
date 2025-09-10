@@ -1059,6 +1059,7 @@ class OrchestratorService:
             from unmute.conversation_handler import ConversationUnmuteHandler
             from unmute.conversation import ConversationManager
             from unmute.main_websocket import receive_loop, emit_loop, debug_running_tasks, _get_health, _report_websocket_exception
+            from unmute.exceptions import WebSocketClosedError
             import unmute.openai_realtime_api_events as ora
             from fastapi import status
             
@@ -1092,16 +1093,26 @@ class OrchestratorService:
                         logger.debug("Handler context entered, calling start_up")
                         await handler.start_up()
                         logger.info("Handler start_up completed, creating task group")
-                        async with asyncio.TaskGroup() as tg:
-                            tg.create_task(
-                                receive_loop(websocket, handler, emit_queue), name="receive_loop()"
-                            )
-                            tg.create_task(
-                                emit_loop(websocket, handler, emit_queue), name="emit_loop()"
-                            )
-                            # No quest_manager.wait() needed with new conversation architecture
-                            tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
-                            logger.debug("All tasks created, task group running")
+                        try:
+                            async with asyncio.TaskGroup() as tg:
+                                tg.create_task(
+                                    receive_loop(websocket, handler, emit_queue), name="receive_loop()"
+                                )
+                                tg.create_task(
+                                    emit_loop(websocket, handler, emit_queue), name="emit_loop()"
+                                )
+                                # No quest_manager.wait() needed with new conversation architecture
+                                tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
+                                logger.debug("All tasks created, task group running")
+                        except* WebSocketClosedError as exc_group:
+                            # Handle WebSocket disconnections gracefully
+                            print(f"=== ORCHESTRATOR: WebSocket disconnected in TaskGroup, cleaning up gracefully ===")
+                            logger.info("TaskGroup handled WebSocket disconnection")
+                        except* Exception as exc_group:
+                            # Handle other exceptions that may occur in the TaskGroup
+                            print(f"=== ORCHESTRATOR: TaskGroup exception: {exc_group.exceptions} ===")
+                            # Re-raise non-WebSocket exceptions
+                            raise
                 except Exception as handler_exc:
                     print(f"=== ORCHESTRATOR: Exception in handler context: {handler_exc} ===")
                     raise

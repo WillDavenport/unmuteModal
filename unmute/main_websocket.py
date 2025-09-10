@@ -301,6 +301,12 @@ async def _run_route(websocket: WebSocket, handler: ConversationUnmuteHandler):
                 emit_loop(websocket, handler, emit_queue), name="emit_loop()"
             )
             tg.create_task(debug_running_tasks(), name="debug_running_tasks()")
+    except* WebSocketClosedError:
+        # Handle WebSocket disconnections gracefully
+        logger.info("TaskGroup handled WebSocket disconnection in main_websocket")
+    except* Exception:
+        # Re-raise other exceptions
+        raise
     finally:
         await handler.cleanup()
         logger.info("websocket_route() finished")
